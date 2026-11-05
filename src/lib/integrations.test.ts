@@ -96,11 +96,19 @@ describe("customReady", () => {
     expect(customReady({ ...hook, url: undefined })).toBe(false);
     expect(customReady({ ...hook, enabled: false })).toBe(false);
   });
-  it("url scheme needs a scheme with ://", () => {
+  it("url scheme needs a statically valid scheme", () => {
     const scheme = { id: "b", name: "s", kind: "urlScheme" as const, enabled: true };
     expect(customReady({ ...scheme, scheme: "obsidian://new" })).toBe(true);
+    // dynamic template — the prefix contains a token, validated in Rust
+    expect(customReady({ ...scheme, scheme: "obsidian://new?name=[title]" })).toBe(true);
+    // rejected shapes
     expect(customReady({ ...scheme, scheme: "obsidian" })).toBe(false);
     expect(customReady({ ...scheme })).toBe(false);
+    expect(customReady({ ...scheme, scheme: "javascript://alert(1)" })).toBe(false);
+    expect(customReady({ ...scheme, scheme: "file:///etc" })).toBe(false);
+    expect(customReady({ ...scheme, scheme: "x://" })).toBe(false);
+    expect(customReady({ ...scheme, scheme: "://x" })).toBe(false);
+    expect(customReady({ ...scheme, scheme: "a b://x" })).toBe(false);
   });
 });
 

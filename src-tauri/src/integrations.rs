@@ -106,12 +106,12 @@ async fn dispatch(
     ctx: &ArticleContext,
 ) -> AppResult<Option<String>> {
     match kind {
-        "cubox" => cubox(client, config, ctx).await,
-        "readwise" => readwise(client, config, ctx).await,
+        "cubox" => cubox(client, config, use_ai_summary, ctx).await,
+        "readwise" => readwise(client, config, use_ai_summary, ctx).await,
         "instapaper" => instapaper(client, config, ctx).await,
         "outline" => outline(client, config, ctx).await,
         "readeck" => readeck(client, config, ctx).await,
-        "zotero" => zotero(client, config, ctx).await,
+        "zotero" => zotero(client, config, use_ai_summary, ctx).await,
         "obsidian" => obsidian(config, use_ai_summary, ctx).await,
         "webhook" => webhook(client, config, use_ai_summary, ctx).await,
         "urlScheme" => url_scheme(app, config, use_ai_summary, ctx),
@@ -319,24 +319,36 @@ pub(crate) fn replace_placeholders(
     ctx: &PlaceholderContext<'_>,
     mode: TokenMode,
 ) -> String {
-    let mut out = template.to_string();
-    for token in PLACEHOLDER_TOKENS {
-        if !out.contains(token) {
-            continue;
-        }
-        let value = token_value(ctx, token);
-        let escaped = match mode {
-            TokenMode::Url => url_encode(value),
-            TokenMode::Raw => value.to_string(),
-            TokenMode::Json { json_body } => {
-                if json_body {
-                    json_escape(value)
-                } else {
-                    value.to_string()
-                }
+    let escape = |value: &str| match mode {
+        TokenMode::Url => url_encode(value),
+        TokenMode::Raw => value.to_string(),
+        TokenMode::Json { json_body } => {
+            if json_body {
+                json_escape(value)
+            } else {
+                value.to_string()
             }
-        };
-        out = out.replace(token, &escaped);
+        }
+    };
+    // Single left-to-right scan: each token is replaced once and its escaped
+    // value is appended without being rescanned, so article content that
+    // itself contains a literal token (a title like "use [summary] here")
+    // can never be re-expanded into another field's slot.
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    'scan: while !rest.is_empty() {
+        for token in PLACEHOLDER_TOKENS {
+            if let Some(after) = rest.strip_prefix(token) {
+                out.push_str(&escape(token_value(ctx, token)));
+                rest = after;
+                continue 'scan;
+            }
+        }
+        // No token starts here — copy one character and move on. Tokens are
+        // ASCII, so the scan only ever matches at char boundaries.
+        let ch = rest.chars().next().expect("non-empty checked above");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
     }
     out
 }
@@ -450,6 +462,23 @@ fn json_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Pick the Outline collection whose name matches (case-insensitive) from a
+/// `collections.list` response — the items live under `data`, but the bare
+/// array shape is accepted too.
+fn outline_collection_id(v: &Value, name: &str) -> Option<String> {
+    let items = v.get("data").unwrap_or(v).as_array()?;
+    items
+        .iter()
+        .filter_map(|c| {
+            let id = c.get("id").and_then(Value::as_str)?;
+            let cname = c.get("name").and_then(Value::as_str)?;
+            Some((cname, id))
+        })
+        .find(|(cname, _)| cname.eq_ignore_ascii_case(name))
+        .map(|(_, id)| id.to_string())
+        .filter(|id| !id.is_empty())
+}
+
 /// A missing credential — the settings UI marks which fields are required,
 /// so a generic localized message is enough here.
 fn require<'a>(value: &'a Option<String>, _what: &str) -> AppResult<&'a str> {
@@ -466,6 +495,7 @@ fn require<'a>(value: &'a Option<String>, _what: &str) -> AppResult<&'a str> {
 async fn cubox(
     client: &Client,
     config: &IntegrationConfig,
+    use_ai_summary: bool,
     ctx: &ArticleContext,
 ) -> AppResult<Option<String>> {
     let api_url = require(&config.api_url, "Cubox API URL")?;
@@ -477,7 +507,7 @@ async fn cubox(
                 "type": "url",
                 "content": ctx.url,
                 "title": ctx.title,
-                "description": ctx.description_with(true),
+                "description": ctx.description_with(use_ai_summary),
                 "tags": [],
                 "folder": "",
             })),
@@ -490,6 +520,7 @@ async fn cubox(
 async fn readwise(
     client: &Client,
     config: &IntegrationConfig,
+    use_ai_summary: bool,
     ctx: &ArticleContext,
 ) -> AppResult<Option<String>> {
     let token = require(&config.token, "Readwise token")?;
@@ -502,7 +533,10 @@ async fn readwise(
     if !ctx.author.is_empty() {
         body.insert("author".into(), json!(ctx.author));
     }
-    body.insert("summary".into(), json!(ctx.description_with(true)));
+    body.insert(
+        "summary".into(),
+        json!(ctx.description_with(use_ai_summary)),
+    );
     if let Some(published) = ctx.published_at.as_deref() {
         body.insert("published_date".into(), json!(published));
     }
@@ -564,18 +598,20 @@ async fn outline(
     let collection_id = match is_uuid_like(collection) {
         true => collection.to_string(),
         false => {
+            // `collections.info` only accepts a UUID id, so a collection
+            // *name* is resolved through `collections.list`, which filters by
+            // a free-form `query`; the exact match (case-insensitive) then
+            // happens client-side.
             let body = finish(
                 client
-                    .post(format!("{endpoint}/collections.info"))
+                    .post(format!("{endpoint}/collections.list"))
                     .header(CONTENT_TYPE, "application/json")
                     .bearer_auth(token)
-                    .json(&json!({ "id": collection })),
+                    .json(&json!({ "query": collection })),
             )
             .await?;
             parse_json(&body)
-                .as_ref()
-                .and_then(|v| json_field(v, "id"))
-                .map(String::from)
+                .and_then(|v| outline_collection_id(&v, collection))
                 .ok_or_else(|| AppError::other("could not resolve the Outline collection name"))?
         }
     };
@@ -657,6 +693,7 @@ async fn readeck(
 async fn zotero(
     client: &Client,
     config: &IntegrationConfig,
+    use_ai_summary: bool,
     ctx: &ArticleContext,
 ) -> AppResult<Option<String>> {
     let user_id = require(&config.user_id, "Zotero user id")?;
@@ -676,7 +713,7 @@ async fn zotero(
         .as_deref()
         .and_then(naive_iso)
         .unwrap_or_default();
-    finish(
+    let body = finish(
         client
             .post(format!("https://api.zotero.org/users/{user_id}/items"))
             .header(CONTENT_TYPE, "application/json")
@@ -685,7 +722,7 @@ async fn zotero(
                 "itemType": "webpage",
                 "title": ctx.title,
                 "creators": creators,
-                "abstractNote": ctx.description,
+                "abstractNote": ctx.description_with(use_ai_summary),
                 "websiteTitle": ctx.title,
                 "websiteType": "",
                 "date": date,
@@ -701,7 +738,33 @@ async fn zotero(
             }])),
     )
     .await?;
+    // Zotero answers 200 even when individual items fail — the write
+    // endpoint reports them in the response's `failed` object. Anything but
+    // a parseable response counts as a failed send too.
+    let value =
+        parse_json(&body).ok_or_else(|| AppError::other("Zotero returned a non-JSON response"))?;
+    if let Some(message) = zotero_failure(&value) {
+        return Err(AppError::other(format!(
+            "Zotero rejected the item: {message}"
+        )));
+    }
     Ok(None)
+}
+
+/// The message of the first per-item failure in a Zotero write response.
+fn zotero_failure(v: &Value) -> Option<String> {
+    let failed = v.get("failed")?.as_object()?;
+    (!failed.is_empty()).then(|| {
+        failed
+            .values()
+            .find_map(|e| {
+                e.get("message")
+                    .or_else(|| e.get("error"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "unknown error".to_string())
+    })
 }
 
 /// Obsidian — write the note into the vault directory (desktop-local file
@@ -714,13 +777,20 @@ async fn obsidian(
     let vault = require(&config.vault_path, "Obsidian vault path")?;
     let base = obsidian_note_stem(&ctx.title, ctx.published_at.as_deref().unwrap_or(""));
     let path = std::path::Path::new(vault).join(format!("{base}.md"));
-    if path.exists() {
-        return Err(AppError::code("obsidianNoteExists"));
-    }
     let content = obsidian_note(ctx, use_ai_summary);
     tauri::async_runtime::spawn_blocking(move || {
-        std::fs::write(&path, content)
-            .map_err(|e| AppError::other(format!("could not write the note: {e}")))
+        // Atomic create: `create_new` refuses an existing file outright, so
+        // two processes saving the same-named note concurrently can never
+        // overwrite each other (an `exists()` pre-check would race).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => AppError::code("obsidianNoteExists"),
+                _ => AppError::other(format!("could not write the note: {e}")),
+            })
     })
     .await
     .map_err(|e| AppError::other(format!("note task: {e}")))??;
@@ -978,6 +1048,26 @@ mod tests {
             TokenMode::Json { json_body: false },
         );
         assert_eq!(out, "title=Hello \"world\"");
+    }
+
+    #[test]
+    fn placeholders_not_reexpanded_from_values() {
+        // A title that itself contains a literal token must survive verbatim
+        // — the single-pass scan never rescans substituted content.
+        let title = String::from("Read [summary] and [url] now");
+        let c = PlaceholderContext {
+            title: &title,
+            ..ctx()
+        };
+        assert_eq!(replace_placeholders("[title]", &c, TokenMode::Raw), title);
+        // Inside a JSON body the inserted brackets must not open another
+        // field's slot either.
+        let out = replace_placeholders(
+            "{\"t\":\"[title]\"}",
+            &c,
+            TokenMode::Json { json_body: true },
+        );
+        assert_eq!(out, "{\"t\":\"Read [summary] and [url] now\"}");
     }
 
     #[test]

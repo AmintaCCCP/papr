@@ -147,6 +147,38 @@ export const PLACEHOLDERS: { token: string; descKey: string }[] = [
 /** The HTTP methods a webhook may declare (mirrors the Rust allowlist). */
 export const WEBHOOK_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 
+/** Scheme families the OS handler must never open (mirrors the Rust
+ *  blocklist in integrations.rs). */
+const BLOCKED_SCHEMES = [
+  "data",
+  "file",
+  "blob",
+  "javascript",
+  "vbscript",
+  "jar",
+  "view-source",
+  "ms-msdt",
+  "search-ms",
+  "smb",
+];
+
+/**
+ * Static (pre-substitution) check that a scheme template can produce a
+ * runnable URL: a syntactically valid, non-blocklisted scheme and a non-empty
+ * remainder. A `[token]` inside the scheme prefix marks a dynamic template —
+ * what it expands to can only be validated by the Rust side after
+ * substitution, so it is accepted here. Mirrors `validate_scheme_url`.
+ */
+export function schemeStaticallyValid(scheme: string): boolean {
+  const idx = scheme.indexOf("://");
+  if (idx < 1) return false; // no "://" or an empty scheme
+  const prefix = scheme.slice(0, idx);
+  if (prefix.includes("[")) return true; // dynamic — validated in Rust
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*$/.test(prefix)) return false;
+  if (scheme.slice(idx + 3).length === 0) return false;
+  return !BLOCKED_SCHEMES.includes(prefix.toLowerCase());
+}
+
 const emptyBuiltin = (): BuiltinConfig => ({ enabled: false });
 
 /** Default configuration — everything off, no customs. */
@@ -280,12 +312,13 @@ export function builtinReady(key: BuiltinKey, cfg: BuiltinConfig): boolean {
 }
 
 /** A custom integration is usable when enabled and its kind's template is
- *  complete (webhook needs method + URL; a scheme needs its scheme). */
+ *  complete (webhook needs method + URL; a scheme must pass the static
+ *  scheme rules — the final substituted URL is validated in Rust). */
 export function customReady(c: CustomIntegration): boolean {
   if (!c.enabled) return false;
   return c.kind === "webhook"
     ? !!(c.method && c.url)
-    : !!c.scheme && c.scheme.includes("://");
+    : !!c.scheme && schemeStaticallyValid(c.scheme);
 }
 
 /** What the reader toolbar needs to render and run one integration. */

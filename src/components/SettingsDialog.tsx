@@ -23,6 +23,7 @@ import {
   builtinReady,
   newIntegrationId,
   parseIntegrations,
+  schemeStaticallyValid,
   type BuiltinConfig,
   type BuiltinKey,
   type CustomIntegration,
@@ -1585,7 +1586,7 @@ function CustomEditor({
     name.trim().length > 0 &&
     (kind === "webhook"
       ? url.trim().length > 0 && method.length > 0
-      : scheme.trim().includes("://"));
+      : schemeStaticallyValid(scheme.trim()));
 
   const save = () => {
     if (!valid) return;
