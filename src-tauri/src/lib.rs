@@ -10,6 +10,9 @@ pub use papr_core::{ai, db, error, extraction, ingestion, models, opml, sanitize
 
 mod backing;
 mod commands;
+// Article integrations — Cubox / Readwise / Instapaper / Outline / Readeck /
+// Zotero / Obsidian plus custom webhook + URL-scheme senders.
+mod integrations;
 mod notify;
 mod page_view;
 // The tauri-coupled refresh scheduler (progress channels, AppHandle) — built on
@@ -318,6 +321,7 @@ pub fn run() {
             commands::update_highlight_note,
             commands::set_highlight_color,
             commands::delete_highlight,
+            integrations::run_integration,
             page_view::open_page_view,
             page_view::set_page_view_bounds,
             page_view::set_page_view_visible,

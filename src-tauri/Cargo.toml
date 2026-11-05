@@ -59,7 +59,8 @@ rusqlite_migration = "1"
 
 # ingestion
 feed-rs = "2"
-reqwest = { version = "0.12", features = ["gzip", "brotli", "json"] }
+# `multipart` backs the Readeck integration's form upload (see integrations.rs).
+reqwest = { version = "0.12", features = ["gzip", "brotli", "json", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 scraper = "0.21"
 ego-tree = "0.9"  # scraper's DOM tree type — walked directly for text extraction
@@ -93,6 +94,11 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
 log = "0.4"
+# integrations: HTML→Markdown for Outline / Obsidian, Basic auth for
+# Instapaper, encodeURIComponent-style templating for custom webhooks.
+htmd = "0.5.6"
+base64 = "0.23.1"
+percent-encoding = "2.3.2"
 
 # macOS-only: used in setup() to turn off the WKWebview's opaque white backing
 # (wry only does this under its `transparent` feature, which we don't enable),
