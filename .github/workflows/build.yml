@@ -58,7 +58,9 @@ jobs:
               exit 1
               ;;
           esac
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          # Job outputs are single-line only — compact whichever branch above
+          # produced the matrix (the pretty-printed `all` literal spans lines).
+          echo "matrix=$(echo "$matrix" | jq -c .)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
