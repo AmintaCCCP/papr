@@ -12,7 +12,10 @@ export type IconName =
   | "chevron-right" | "globe" | "focus" | "arrow-down" | "arrow-up"
   | "eye" | "eye-off" | "trash" | "mute" | "pin" | "x" | "command"
   | "copy" | "list" | "grid" | "text" | "alert" | "papr"
-  | "play" | "pause" | "skip-back" | "skip-fwd" | "headphones";
+  | "play" | "pause" | "skip-back" | "skip-fwd" | "headphones"
+  // integrations
+  | "box" | "book" | "book-open" | "doc" | "info" | "flask" | "gem"
+  | "link" | "terminal";
 
 interface Props {
   name: IconName;
@@ -147,6 +150,25 @@ export default function Icon({
       return <svg {...p}><path d="M4 14v-2a8 8 0 0 1 16 0v2" /><rect x="2.5" y="13" width="4.5" height="7" rx="2.2" /><rect x="17" y="13" width="4.5" height="7" rx="2.2" /></svg>;
     case "papr":
       return <svg {...p}><path d="M6 3h7l5 5v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" /><path d="M13 3v4a1 1 0 0 0 1 1h4" /><path d="M8 13.5a3.5 3.5 0 0 1 3.5 3.5M8 11a6 6 0 0 1 6 6" /><circle cx="8" cy="17" r="1.1" fill={color} stroke="none" /></svg>;
+    // ── integrations ──
+    case "box":
+      return <svg {...p}><path d="M21 8.2v7.6a2 2 0 0 1-1.05 1.76l-7 3.9a2 2 0 0 1-1.9 0l-7-3.9A2 2 0 0 1 3 15.8V8.2a2 2 0 0 1 1.05-1.76l7-3.9a2 2 0 0 1 1.9 0l7 3.9A2 2 0 0 1 21 8.2z" /><path d="m3.4 7.4 8.6 4.8 8.6-4.8M12 21.5v-9.3" /></svg>;
+    case "book":
+      return <svg {...p}><path d="M4 19.5V5a2 2 0 0 1 2-2h14v16H6a2 2 0 0 0-2 1.5z" /><path d="M20 17H6a2 2 0 0 0-2 2.5" /><path d="M9 7.5h7" /></svg>;
+    case "book-open":
+      return <svg {...p}><path d="M12 7.2c-1.5-1.7-3.7-2.6-6-2.6-.7 0-1.4.06-2 .2v13.8c.6-.14 1.3-.2 2-.2 2.3 0 4.5.9 6 2.6 1.5-1.7 3.7-2.6 6-2.6.7 0 1.4.06 2 .2V4.8c-.6-.14-1.3-.2-2-.2-2.3 0-4.5.9-6 2.6z" /><path d="M12 7.2V21" /></svg>;
+    case "doc":
+      return <svg {...p}><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" /><path d="M14 3v5h5" /><path d="M9 13.5h6M9 17h4" /></svg>;
+    case "info":
+      return <svg {...p}><circle cx="12" cy="12" r="9" /><path d="M12 11v5" /><circle cx="12" cy="8" r="0.6" fill={color} stroke="none" /></svg>;
+    case "flask":
+      return <svg {...p}><path d="M9.5 3h5M10.5 3v5.3L5.6 17.1A3 3 0 0 0 8.3 21.5h7.4a3 3 0 0 0 2.7-4.4L13.5 8.3V3" /><path d="M7.3 14.5h9.4" /></svg>;
+    case "gem":
+      return <svg {...p}><path d="M7 3.5h10l3.5 5.5L12 20.5 3.5 9z" /><path d="M3.5 9h17M9.4 9 12 20.5 14.6 9M7 3.5 9.4 9M17 3.5 14.6 9" /></svg>;
+    case "link":
+      return <svg {...p}><path d="M10.2 13.8a4 4 0 0 0 5.6.4l3-3a4 4 0 0 0-5.6-5.7l-1.6 1.6" /><path d="M13.8 10.2a4 4 0 0 0-5.6-.4l-3 3a4 4 0 0 0 5.6 5.7l1.6-1.6" /></svg>;
+    case "terminal":
+      return <svg {...p}><path d="m4.5 17 6-5-6-5" /><path d="M12.5 19h7" /></svg>;
     default:
       return null;
   }

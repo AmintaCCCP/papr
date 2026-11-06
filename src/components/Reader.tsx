@@ -14,6 +14,12 @@ import { fullDate } from "../lib/feedMeta";
 import { isMac } from "../lib/platform";
 import { reportError, toast } from "../toast";
 import { tagColor } from "../lib/tagColors";
+import { errorText } from "../lib/errors";
+import {
+  activeIntegrations,
+  parseIntegrations,
+  type ActiveIntegration,
+} from "../lib/integrations";
 import type { ArticleDetail } from "../types";
 import Icon from "./Icon";
 import TagPicker from "./TagPicker";
@@ -241,6 +247,52 @@ export default function Reader({ onToast }: Props) {
     enabled: id != null,
   });
   const a: ArticleDetail | undefined = article.data;
+
+  // Enabled integrations — the toolbar renders one button each. The raw
+  // settings blob is shared with the settings dialog's query key, so an edit
+  // there updates these buttons without an extra fetch.
+  const integrationsQ = useQuery({
+    queryKey: ["integrations"],
+    queryFn: () => api.getSetting("integrations"),
+  });
+  const integrationSettings = useMemo(
+    () => parseIntegrations(integrationsQ.data ?? null),
+    [integrationsQ.data],
+  );
+  const integrations = useMemo(
+    () => activeIntegrations(integrationSettings),
+    [integrationSettings],
+  );
+  const useAiSummary = integrationSettings.useAiSummary;
+  // The one integration currently sending — its button spins and the rest
+  // pause, so two sends can't race the article switch beneath them. The ref
+  // guard also closes the double-click race before the state round-trips.
+  const [runningIntegration, setRunningIntegration] = useState<string | null>(null);
+  const runningRef = useRef<string | null>(null);
+  const runIntegration = async (item: ActiveIntegration, articleId: number) => {
+    if (runningRef.current) return;
+    runningRef.current = item.id;
+    setRunningIntegration(item.id);
+    const label = item.nameKey ? t(item.nameKey) : item.name;
+    try {
+      const out = await api.runIntegration({
+        kind: item.kind,
+        useAiSummary,
+        config: item.config,
+        articleId,
+      });
+      toast.show(
+        out.url
+          ? t("reader.integrationDoneWithLink", { name: label, url: out.url })
+          : t("reader.integrationDone", { name: label }),
+      );
+    } catch (e) {
+      toast.error(`${label}: ${errorText(e)}`);
+    } finally {
+      runningRef.current = null;
+      setRunningIntegration(null);
+    }
+  };
 
   // Feed list, so the article's source feed can be checked for its per-feed
   // auto-translate flag. Shared cache key with the sidebar — no extra fetch.
@@ -882,6 +934,25 @@ export default function Reader({ onToast }: Props) {
         >
           <Icon name="share" size={16} />
         </button>
+        {/* One button per enabled, fully-configured integration — the same
+            "each integration is a toolbar action" arrangement the article
+            actions bar uses. Built-ins render their localized name; customs
+            render the user's own label. */}
+        {integrations.map((item) => {
+          const label = item.nameKey ? t(item.nameKey) : item.name;
+          return (
+            <button
+              key={item.id}
+              className={`tb-btn ${runningIntegration === item.id ? "spinning" : ""}`}
+              title={t("reader.tbIntegration", { name: label })}
+              aria-label={t("reader.tbIntegration", { name: label })}
+              disabled={!a.url || runningIntegration != null}
+              onClick={() => void runIntegration(item, a.id)}
+            >
+              <Icon name={item.icon} size={16} />
+            </button>
+          );
+        })}
         <button
           className={`tb-btn ${showTranslation ? "on" : ""}`}
           title={t("reader.tbTranslate")}

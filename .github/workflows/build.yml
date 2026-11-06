@@ -1,0 +1,136 @@
+name: Build
+
+# On-demand desktop packaging: builds the Tauri bundles (dmg/app, msi/nsis,
+# AppImage/deb) for the chosen platform and uploads them as workflow
+# artifacts. No release is created — dispatch it to verify packaging works
+# or to grab an installable build of any branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Which desktop targets to package
+        type: choice
+        default: all
+        options:
+          - all
+          - macos
+          - linux
+          - windows
+
+jobs:
+  # Resolve the picker into the matrix legs. Kept as its own job because the
+  # selection must happen before matrix expansion; the leg list mirrors the
+  # Release workflow's build targets.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        # Via env, not inline interpolation, so no value from the dispatch
+        # payload can break out into shell syntax.
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          all='[
+            {"platform":"macos-latest","target":"aarch64-apple-darwin"},
+            {"platform":"macos-latest","target":"x86_64-apple-darwin"},
+            {"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"},
+            {"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}
+          ]'
+          case "$PLATFORMS" in
+            macos)
+              matrix=$(echo "$all" | jq -c '[.[] | select(.platform | startswith("macos"))]')
+              ;;
+            linux)
+              matrix='[{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]'
+              ;;
+            windows)
+              matrix='[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}]'
+              ;;
+            all)
+              matrix=$all
+              ;;
+            *)
+              echo "::error::unknown platform selection: $PLATFORMS"
+              exit 1
+              ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # No tagName / releaseName — tauri-action builds the bundles and stops
+      # there; no GitHub release is created or touched.
+      - name: Build desktop bundles
+        id: build
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing — the bundle config enables createUpdaterArtifacts,
+          # so the build refuses to run without this key. Passing it here means
+          # test builds sign exactly like release builds do.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS code signing + notarization — empty values are simply
+          # ignored by tauri-action on runners/secrets where they are absent,
+          # yielding ad-hoc (unsigned) local-test builds.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          args: ${{ matrix.platform == 'macos-latest' && format('--target {0}', matrix.target) || '' }}
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: papr-desktop-${{ matrix.target }}
+          path: ${{ steps.build.outputs.artifactPaths }}
+          if-no-files-found: error

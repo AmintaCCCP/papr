@@ -1,5 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { cloneElement, isValidElement, useEffect, useRef, useState } from "react";
+import {
+  cloneElement,
+  isValidElement,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -8,6 +15,20 @@ import { useUi, READER_BOUNDS, type OpenMode } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { LANGUAGES, setLanguage, type Language } from "../i18n";
+import {
+  BUILTIN_KEYS,
+  BUILTIN_META,
+  PLACEHOLDERS,
+  WEBHOOK_METHODS,
+  builtinReady,
+  newIntegrationId,
+  parseIntegrations,
+  schemeStaticallyValid,
+  type BuiltinConfig,
+  type BuiltinKey,
+  type CustomIntegration,
+  type IntegrationSettings,
+} from "../lib/integrations";
 import { feedHost } from "../lib/feedMeta";
 import { modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
@@ -37,6 +58,7 @@ const SECTIONS: { id: string; labelKey: string; icon: IconName }[] = [
   { id: "subscriptions", labelKey: "settings.nav.subscriptions", icon: "rss" },
   { id: "filters", labelKey: "settings.nav.filters", icon: "mute" },
   { id: "sync", labelKey: "settings.nav.sync", icon: "refresh" },
+  { id: "integrations", labelKey: "settings.nav.integrations", icon: "link" },
   { id: "shortcuts", labelKey: "settings.nav.shortcuts", icon: "command" },
   { id: "notifications", labelKey: "settings.nav.notifications", icon: "inbox" },
   { id: "advanced", labelKey: "settings.nav.advanced", icon: "sort" },
@@ -97,6 +119,7 @@ export default function SettingsDialog({
     subscriptions: t("settings.sub.subscriptions", { count: feedCount }),
     filters: t("settings.sub.filters"),
     sync: t("settings.sub.sync"),
+    integrations: t("settings.sub.integrations"),
     shortcuts: t("settings.sub.shortcuts"),
     notifications: t("settings.sub.notifications"),
     advanced: t("settings.sub.advanced"),
@@ -164,6 +187,7 @@ export default function SettingsDialog({
               <FiltersSection feeds={feeds.data ?? []} onToast={onToast} />
             )}
             {section === "sync" && <SyncSection onToast={onToast} />}
+            {section === "integrations" && <IntegrationsSection />}
             {section === "shortcuts" && <ShortcutsSection />}
             {section === "notifications" && <NotificationsSection />}
             {section === "advanced" && <AdvancedSection onToast={onToast} />}
@@ -1241,6 +1265,480 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
         ))}
       </div>
     </>
+  );
+}
+
+/* ── integrations ────────────────────────────────────────── */
+// Save-it-somewhere services (Cubox, Readwise, …) plus user-defined webhook /
+// URL-scheme integrations. Configuration persists as one JSON blob under the
+// `integrations` setting; the Rust side executes each run.
+
+/** Which credential fields each built-in kind needs, in display order. Only
+ *  string fields — `enabled` is the card's toggle, never a form field. */
+type BuiltinField = Exclude<keyof BuiltinConfig, "enabled">;
+const BUILTIN_FIELDS: Record<
+  BuiltinKey,
+  { key: BuiltinField; password?: boolean }[]
+> = {
+  cubox: [{ key: "apiUrl" }],
+  readwise: [{ key: "token", password: true }],
+  instapaper: [{ key: "username" }, { key: "password", password: true }],
+  outline: [{ key: "endpoint" }, { key: "token", password: true }, { key: "collection" }],
+  readeck: [{ key: "endpoint" }, { key: "token", password: true }],
+  zotero: [{ key: "userId" }, { key: "token", password: true }],
+  obsidian: [{ key: "vaultPath" }],
+};
+
+function IntegrationsSection() {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const settingsQ = useQuery({
+    queryKey: ["integrations"],
+    queryFn: () => api.getSetting("integrations"),
+  });
+  const settings = useMemo(
+    () => parseIntegrations(settingsQ.data ?? null),
+    [settingsQ.data],
+  );
+  // `null` = list view, "new" = the add form, a CustomIntegration = editing it.
+  const [editing, setEditing] = useState<CustomIntegration | "new" | null>(null);
+  const [deleting, setDeleting] = useState<CustomIntegration | null>(null);
+
+  /** Persist a new blob. The query cache is patched optimistically first, so
+   *  edits that land before the refetch compose instead of clobbering. */
+  const update = (next: IntegrationSettings) => {
+    const blob = JSON.stringify(next);
+    qc.setQueryData(["integrations"], blob);
+    api
+      .setSetting("integrations", blob)
+      .then(() => qc.invalidateQueries({ queryKey: ["integrations"] }))
+      .catch((e) => {
+        reportError(e);
+        qc.invalidateQueries({ queryKey: ["integrations"] });
+      });
+  };
+  const setBuiltin = (key: BuiltinKey, cfg: BuiltinConfig) =>
+    update({ ...settings, builtins: { ...settings.builtins, [key]: cfg } });
+
+  const saveCustom = (c: CustomIntegration) => {
+    const exists = settings.customs.some((x) => x.id === c.id);
+    update({
+      ...settings,
+      customs: exists
+        ? settings.customs.map((x) => (x.id === c.id ? c : x))
+        : [...settings.customs, c],
+    });
+    setEditing(null);
+  };
+
+  return (
+    <>
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.integrations.general")}</h3>
+        <p className="settings-group-desc">{t("settings.integrations.intro")}</p>
+        <Row
+          label={t("settings.integrations.useAiSummary")}
+          desc={t("settings.integrations.useAiSummaryDesc")}
+        >
+          <Toggle
+            checked={settings.useAiSummary}
+            onChange={(v) => update({ ...settings, useAiSummary: v })}
+          />
+        </Row>
+      </div>
+
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.integrations.builtins")}</h3>
+        {BUILTIN_KEYS.map((key) => (
+          <BuiltinCard
+            key={key}
+            idKey={key}
+            cfg={settings.builtins[key]}
+            onChange={(cfg) => setBuiltin(key, cfg)}
+          />
+        ))}
+      </div>
+
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.integrations.customTitle")}</h3>
+        {editing === "new" && (
+          <CustomEditor
+            custom={null}
+            onCancel={() => setEditing(null)}
+            onSave={saveCustom}
+          />
+        )}
+        {settings.customs.length === 0 && editing !== "new" && (
+          <div style={{ padding: "14px 4px", fontSize: 13, color: "var(--muted)" }}>
+            {t("settings.integrations.customEmpty")}
+          </div>
+        )}
+        {settings.customs.map((c) =>
+          editing !== "new" &&
+          typeof editing === "object" &&
+          editing?.id === c.id ? (
+            <CustomEditor
+              key={c.id}
+              custom={c}
+              onCancel={() => setEditing(null)}
+              onSave={saveCustom}
+            />
+          ) : (
+            <div className="rule-row" key={c.id}>
+              <Toggle
+                checked={c.enabled}
+                onChange={(v) =>
+                  update({
+                    ...settings,
+                    customs: settings.customs.map((x) =>
+                      x.id === c.id ? { ...x, enabled: v } : x,
+                    ),
+                  })
+                }
+                aria-label={c.name}
+              />
+              <div className="rule-text" style={{ opacity: c.enabled ? 1 : 0.5 }}>
+                <div className="rule-name">{c.name || t("settings.integrations.untitled")}</div>
+                <div className="rule-summary">
+                  {c.kind === "webhook"
+                    ? `${c.method ?? "POST"} · ${c.url ?? "—"}`
+                    : c.scheme || "—"}
+                </div>
+              </div>
+              <div className="actions">
+                <button
+                  className="icon-btn"
+                  title={t("common.rename")}
+                  onClick={() => setEditing(c)}
+                >
+                  <Icon name="settings" size={13} />
+                </button>
+                <button
+                  className="icon-btn"
+                  title={t("common.delete")}
+                  onClick={() => setDeleting(c)}
+                >
+                  <Icon name="trash" size={13} />
+                </button>
+              </div>
+            </div>
+          ),
+        )}
+        {editing !== "new" && (
+          <button
+            className="s-btn primary"
+            style={{ marginTop: 12 }}
+            onClick={() => setEditing("new")}
+          >
+            <Icon name="plus" size={12} /> {t("settings.integrations.addCustom")}
+          </button>
+        )}
+      </div>
+
+      {deleting && (
+        <ConfirmDialog
+          title={t("settings.integrations.deleteTitle")}
+          message={t("settings.integrations.deleteMessage", {
+            name: deleting.name || t("settings.integrations.untitled"),
+          })}
+          confirmLabel={t("common.delete")}
+          onConfirm={() => {
+            update({
+              ...settings,
+              customs: settings.customs.filter((x) => x.id !== deleting.id),
+            });
+            // A deleted editor must not resurrect its subject on save.
+            setEditing((e) =>
+              typeof e === "object" && e?.id === deleting.id ? null : e,
+            );
+            setDeleting(null);
+          }}
+          onClose={() => setDeleting(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/** One built-in service card with its expandable credentials form. */
+function BuiltinCard({
+  idKey,
+  cfg,
+  onChange,
+}: {
+  idKey: BuiltinKey;
+  cfg: BuiltinConfig;
+  onChange: (cfg: BuiltinConfig) => void;
+}) {
+  const { t } = useTranslation();
+  const meta = BUILTIN_META[idKey];
+  const ready = builtinReady(idKey, cfg);
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="integ-card">
+      <div className="s-service">
+        <div className="logo" style={{ background: meta.color }}>
+          <Icon name={meta.icon} size={17} />
+        </div>
+        <div className="info">
+          <div className="title">{t(meta.nameKey)}</div>
+          <div className="desc">{t(meta.descKey)}</div>
+        </div>
+        <span className={`status ${ready ? "on" : ""}`}>
+          {t(
+            ready
+              ? "settings.integrations.configured"
+              : "settings.integrations.notConfigured",
+          )}
+        </span>
+        <button
+          className="icon-btn"
+          title={t("settings.integrations.configure")}
+          aria-expanded={open}
+          onClick={() => setOpen((o) => !o)}
+        >
+          <Icon name="settings" size={13} />
+        </button>
+        <Toggle
+          checked={cfg.enabled}
+          onChange={(v) => onChange({ ...cfg, enabled: v })}
+          aria-label={t(meta.nameKey)}
+        />
+      </div>
+      {open && (
+        <div className="integ-fields">
+          {BUILTIN_FIELDS[idKey].map((f) => (
+            <IntegTextField
+              key={f.key}
+              label={t(`settings.integrations.field.${f.key}`)}
+              password={f.password}
+              value={cfg[f.key]}
+              onCommit={(v) => onChange({ ...cfg, [f.key]: v || undefined })}
+            />
+          ))}
+          <p className="integ-hint">{t(`settings.integrations.${idKey}Hint`)}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A credential field: local draft, committed on blur / Enter. The input
+ *  nests inside its `<label>` so assistive tech names the field. */
+function IntegTextField({
+  label,
+  value,
+  password,
+  onCommit,
+}: {
+  label: string;
+  value: string | undefined;
+  password?: boolean;
+  onCommit: (v: string) => void;
+}) {
+  const [draft, setDraft] = useState(value ?? "");
+  useEffect(() => setDraft(value ?? ""), [value]);
+  const commit = () => {
+    const trimmed = draft.trim();
+    if (trimmed !== (value ?? "")) onCommit(trimmed);
+  };
+  return (
+    <label className="integ-field">
+      <span>{label}</span>
+      <input
+        className="s-text-input"
+        type={password ? "password" : "text"}
+        {...NO_AUTOCORRECT}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+        }}
+      />
+    </label>
+  );
+}
+
+/** Create/edit form for a custom webhook or URL-scheme integration. */
+function CustomEditor({
+  custom,
+  onCancel,
+  onSave,
+}: {
+  custom: CustomIntegration | null;
+  onCancel: () => void;
+  onSave: (c: CustomIntegration) => void;
+}) {
+  const { t } = useTranslation();
+  const [name, setName] = useState(custom?.name ?? "");
+  const [kind, setKind] = useState<CustomIntegration["kind"]>(custom?.kind ?? "webhook");
+  const [method, setMethod] = useState(custom?.method ?? "POST");
+  const [url, setUrl] = useState(custom?.url ?? "");
+  const [body, setBody] = useState(custom?.body ?? "");
+  const [scheme, setScheme] = useState(custom?.scheme ?? "");
+  // Header rows as an ordered list — a plain record loses insertion order.
+  const [headers, setHeaders] = useState<{ k: string; v: string }[]>(
+    Object.entries(custom?.headers ?? {}).map(([k, v]) => ({ k, v })),
+  );
+
+  const valid =
+    name.trim().length > 0 &&
+    (kind === "webhook"
+      ? url.trim().length > 0 && method.length > 0
+      : schemeStaticallyValid(scheme.trim()));
+
+  const save = () => {
+    if (!valid) return;
+    const cleanedHeaders: Record<string, string> = {};
+    for (const { k, v } of headers) {
+      const key = k.trim();
+      if (key) cleanedHeaders[key] = v;
+    }
+    onSave({
+      id: custom?.id ?? newIntegrationId(),
+      name: name.trim(),
+      kind,
+      enabled: custom?.enabled ?? true,
+      ...(kind === "webhook"
+        ? {
+            method,
+            url: url.trim(),
+            headers: cleanedHeaders,
+            body: body.trim() || undefined,
+          }
+        : { scheme: scheme.trim() }),
+    });
+  };
+
+  return (
+    <div className="rule-card integ-editor">
+      <input
+        className="rule-input"
+        {...NO_AUTOCORRECT}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder={t("settings.integrations.namePlaceholder")}
+      />
+      <div className="integ-kind" role="group" aria-label={t("settings.integrations.kind")}>
+        <button
+          type="button"
+          className={kind === "webhook" ? "on" : ""}
+          aria-pressed={kind === "webhook"}
+          onClick={() => setKind("webhook")}
+        >
+          <Icon name="link" size={12} /> {t("settings.integrations.kindWebhook")}
+        </button>
+        <button
+          type="button"
+          className={kind === "urlScheme" ? "on" : ""}
+          aria-pressed={kind === "urlScheme"}
+          onClick={() => setKind("urlScheme")}
+        >
+          <Icon name="terminal" size={12} /> {t("settings.integrations.kindUrlScheme")}
+        </button>
+      </div>
+      {kind === "webhook" ? (
+        <>
+          <div className="integ-row">
+            <select
+              className="s-select"
+              value={method}
+              aria-label={t("settings.integrations.methodLabel")}
+              onChange={(e) => setMethod(e.target.value)}
+            >
+              {WEBHOOK_METHODS.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+            <input
+              className="rule-input"
+              {...NO_AUTOCORRECT}
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://example.com/hook"
+            />
+          </div>
+          {headers.map((h, i) => (
+            <div className="integ-row" key={i}>
+              <input
+                className="rule-input"
+                {...NO_AUTOCORRECT}
+                value={h.k}
+                aria-label={t("settings.integrations.headerKey")}
+                placeholder="X-Auth"
+                onChange={(e) =>
+                  setHeaders(headers.map((x, j) => (j === i ? { ...x, k: e.target.value } : x)))
+                }
+              />
+              <input
+                className="rule-input"
+                {...NO_AUTOCORRECT}
+                value={h.v}
+                aria-label={t("settings.integrations.headerValue")}
+                placeholder="…"
+                onChange={(e) =>
+                  setHeaders(headers.map((x, j) => (j === i ? { ...x, v: e.target.value } : x)))
+                }
+              />
+              <button
+                className="icon-btn"
+                title={t("settings.integrations.removeHeader")}
+                onClick={() => setHeaders(headers.filter((_, j) => j !== i))}
+              >
+                <Icon name="x" size={12} />
+              </button>
+            </div>
+          ))}
+          <button
+            className="s-btn"
+            style={{ alignSelf: "flex-start" }}
+            onClick={() => setHeaders([...headers, { k: "", v: "" }])}
+          >
+            <Icon name="plus" size={12} /> {t("settings.integrations.addHeader")}
+          </button>
+          <textarea
+            className="rule-input integ-body"
+            {...NO_AUTOCORRECT}
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            placeholder={'{"title": "[title]", "url": "[url]"}'}
+            rows={4}
+          />
+        </>
+      ) : (
+        <input
+          className="rule-input"
+          {...NO_AUTOCORRECT}
+          value={scheme}
+          onChange={(e) => setScheme(e.target.value)}
+          placeholder="obsidian://new?vault=MyVault&name=[title]&content=[content_markdown]"
+        />
+      )}
+      <div className="integ-placeholders">
+        <div className="integ-placeholders-title">
+          {t("settings.integrations.placeholdersTitle")}
+        </div>
+        <div className="integ-ph-grid">
+          {PLACEHOLDERS.map((p) => (
+            <div className="integ-ph" key={p.token}>
+              <code>{p.token}</code>
+              <span>{t(p.descKey)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="rule-card-actions">
+        <button className="s-btn" onClick={onCancel}>
+          {t("common.cancel")}
+        </button>
+        <button className="s-btn primary" onClick={save} disabled={!valid}>
+          {t("common.save")}
+        </button>
+      </div>
+    </div>
   );
 }
 

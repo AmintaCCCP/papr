@@ -212,7 +212,10 @@
     "lightboxClose": "关闭",
     "lightboxPrev": "上一张",
     "lightboxNext": "下一张",
-    "lightboxHint": "滚动缩放 · 拖拽平移"
+    "lightboxHint": "滚动缩放 · 拖拽平移",
+    "tbIntegration": "发送到 {{name}}",
+    "integrationDone": "已保存到 {{name}}",
+    "integrationDoneWithLink": "已保存到 {{name}} — {{url}}"
   },
   "settings": {
     "title": "设置",
@@ -224,6 +227,7 @@
       "subscriptions": "订阅",
       "filters": "过滤规则",
       "sync": "同步",
+      "integrations": "集成",
       "shortcuts": "快捷键",
       "notifications": "通知",
       "advanced": "高级",
@@ -236,6 +240,7 @@
       "subscriptions": "{{count}} 个订阅源",
       "filters": "针对新文章的关键词规则",
       "sync": "云端同步与第三方服务",
+      "integrations": "把文章保存到常用服务",
       "shortcuts": "键盘快捷键",
       "notifications": "新文章提醒与角标",
       "advanced": "缓存、网络、实验功能",
@@ -410,6 +415,87 @@
       "connected": "已连接",
       "disconnected": "已断开",
       "syncDone": "同步完成 · 已对齐 {{count}} 篇文章状态"
+    },
+    "integrations": {
+      "general": "通用",
+      "intro": "把正在阅读的文章一键保存到收藏服务，或发送到自定义的 Webhook——每个已启用的集成在工具栏上都有一个按钮。",
+      "useAiSummary": "AI 总结作为描述",
+      "useAiSummaryDesc": "开启后，集成会以文章的 AI 总结作为描述发送，而非正文提取的描述。",
+      "builtins": "内置集成",
+      "customTitle": "自定义集成",
+      "addCustom": "添加集成",
+      "customEmpty": "还没有自定义集成——添加一个 Webhook 或 URL Scheme。",
+      "untitled": "未命名集成",
+      "configured": "已配置",
+      "notConfigured": "未配置",
+      "configure": "配置",
+      "deleteTitle": "删除集成",
+      "deleteMessage": "确定删除「{{name}}」？工具栏上的对应按钮也会一并移除。",
+      "namePlaceholder": "集成名称",
+      "kind": "类型",
+      "kindWebhook": "Webhook",
+      "kindUrlScheme": "URL Scheme",
+      "methodLabel": "请求方法",
+      "headerKey": "Header 名称",
+      "headerValue": "Header 值",
+      "addHeader": "添加 Header",
+      "removeHeader": "移除 Header",
+      "placeholdersTitle": "模板占位符",
+      "ph": {
+        "title": "文章标题",
+        "url": "文章链接",
+        "contentHtml": "正文 HTML",
+        "contentMarkdown": "正文 Markdown",
+        "summary": "AI 总结（若上方开关开启），否则为正文描述",
+        "description": "由正文提取的描述",
+        "author": "作者",
+        "publishedAt": "发布时间（ISO 8601）"
+      },
+      "field": {
+        "apiUrl": "Cubox API 地址",
+        "token": "Token",
+        "username": "用户名",
+        "password": "密码",
+        "endpoint": "服务地址",
+        "collection": "集合",
+        "userId": "用户 ID",
+        "vaultPath": "Vault 路径"
+      },
+      "cubox": {
+        "name": "Cubox",
+        "desc": "保存到 Cubox"
+      },
+      "cuboxHint": "粘贴 Cubox「偏好设置 → 扩展中心和自动化 → API 扩展」中的个人 API 地址。",
+      "readwise": {
+        "name": "Readwise Reader",
+        "desc": "保存到 Readwise Reader"
+      },
+      "readwiseHint": "在 readwise.io/access_token 生成访问令牌并粘贴到这里。",
+      "instapaper": {
+        "name": "Instapaper",
+        "desc": "保存到 Instapaper"
+      },
+      "instapaperHint": "Instapaper 账号的用户名与密码（HTTP Basic 认证）。",
+      "outline": {
+        "name": "Outline",
+        "desc": "创建 Outline 文档"
+      },
+      "outlineHint": "填含 /api 的服务地址（如 https://wiki.example.com/api）、API 令牌，以及集合名称或 UUID。",
+      "readeck": {
+        "name": "Readeck",
+        "desc": "收藏到 Readeck"
+      },
+      "readeckHint": "Readeck 服务器根地址与 API 令牌（个人资料 → 应用）。",
+      "zotero": {
+        "name": "Zotero",
+        "desc": "添加 Zotero 条目"
+      },
+      "zoteroHint": "Zotero 数字用户 ID 与在 zotero.org/settings/keys 生成的 API Key。",
+      "obsidian": {
+        "name": "Obsidian",
+        "desc": "在 Vault 中写入笔记"
+      },
+      "obsidianHint": "本地 Vault 文件夹的绝对路径；每次保存会写入一篇带 frontmatter 的 Markdown 笔记。"
     },
     "shortcuts": {
       "navigation": "导航",
@@ -612,7 +698,12 @@
     "noNotionPage": "请在 设置 → 集成 中设置目标 Notion 页面 ID",
     "noPocketConfig": "请在 设置 → 集成 中添加 Pocket consumer key 和访问令牌",
     "noInstapaperConfig": "请在 设置 → 集成 中添加 Instapaper 用户名和密码",
-    "noKindleConfig": "请在 设置 → 集成 中配置 Kindle 地址和 SMTP 服务器"
+    "noKindleConfig": "请在 设置 → 集成 中配置 Kindle 地址和 SMTP 服务器",
+    "integrationUnknown": "未知集成",
+    "integrationNotConfigured": "该集成配置不完整——请在 设置 → 集成 中补全必填项",
+    "integrationMethodInvalid": "Webhook 的 HTTP 方法不受支持",
+    "integrationSchemeInvalid": "不允许使用该 URL Scheme",
+    "obsidianNoteExists": "Vault 中已存在同名笔记"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

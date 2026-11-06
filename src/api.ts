@@ -377,3 +377,21 @@ export const closePageView = () => invoke<void>("close_page_view");
 
 export const configureAiProvider = (provider: string, model?: string, baseUrl?: string) =>
   invoke<[string, string]>("configure_ai_provider", { provider, model, baseUrl });
+
+// ── integrations ──
+/** What a successful `runIntegration` reports back: a "view it" link when the
+ *  target service returned one, else null. */
+export interface RunIntegrationOutcome {
+  url: string | null;
+}
+
+/** Send the article to one integration. `kind` selects the sender (cubox /
+ *  readwise / instapaper / outline / readeck / zotero / obsidian / webhook /
+ *  urlScheme) and `config` carries exactly the fields that kind needs; the
+ *  Rust side loads the article and performs the call (see integrations.rs). */
+export const runIntegration = (args: {
+  kind: string;
+  useAiSummary: boolean;
+  config: Record<string, unknown>;
+  articleId: number;
+}) => invoke<RunIntegrationOutcome>("run_integration", args);

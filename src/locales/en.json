@@ -212,7 +212,10 @@
     "lightboxClose": "Close",
     "lightboxPrev": "Previous image",
     "lightboxNext": "Next image",
-    "lightboxHint": "Scroll to zoom · Drag to pan"
+    "lightboxHint": "Scroll to zoom · Drag to pan",
+    "tbIntegration": "Send to {{name}}",
+    "integrationDone": "Saved to {{name}}",
+    "integrationDoneWithLink": "Saved to {{name}} — {{url}}"
   },
   "settings": {
     "title": "Settings",
@@ -224,6 +227,7 @@
       "subscriptions": "Subscriptions",
       "filters": "Filters",
       "sync": "Sync",
+      "integrations": "Integrations",
       "shortcuts": "Shortcuts",
       "notifications": "Notifications",
       "advanced": "Advanced",
@@ -236,6 +240,7 @@
       "subscriptions": "{{count}} feeds",
       "filters": "Keyword rules for incoming articles",
       "sync": "Cloud sync and third-party services",
+      "integrations": "Save articles to connected services",
       "shortcuts": "Keyboard shortcuts",
       "notifications": "New article alerts and badges",
       "advanced": "Cache, network, experimental features",
@@ -410,6 +415,87 @@
       "connected": "Connected",
       "disconnected": "Disconnected",
       "syncDone": "Sync complete · aligned the state of {{count}} articles"
+    },
+    "integrations": {
+      "general": "General",
+      "intro": "Send the article you are reading to a save-for-later service, or to your own webhook — one toolbar button per enabled integration.",
+      "useAiSummary": "Use AI summary as description",
+      "useAiSummaryDesc": "When on, integrations receive the article's AI summary as its description instead of the body-derived one.",
+      "builtins": "Built-in integrations",
+      "customTitle": "Custom integrations",
+      "addCustom": "Add integration",
+      "customEmpty": "No custom integrations yet — add a webhook or a URL scheme.",
+      "untitled": "Untitled integration",
+      "configured": "Configured",
+      "notConfigured": "Not configured",
+      "configure": "Configure",
+      "deleteTitle": "Delete integration",
+      "deleteMessage": "Delete “{{name}}”? Its toolbar button goes away with it.",
+      "namePlaceholder": "Integration name",
+      "kind": "Kind",
+      "kindWebhook": "Webhook",
+      "kindUrlScheme": "URL scheme",
+      "methodLabel": "Method",
+      "headerKey": "Header name",
+      "headerValue": "Header value",
+      "addHeader": "Add header",
+      "removeHeader": "Remove header",
+      "placeholdersTitle": "Template placeholders",
+      "ph": {
+        "title": "Article title",
+        "url": "Article URL",
+        "contentHtml": "Body HTML",
+        "contentMarkdown": "Body as Markdown",
+        "summary": "AI summary (when enabled above), else description",
+        "description": "Body-derived description",
+        "author": "Author",
+        "publishedAt": "Publish date (ISO 8601)"
+      },
+      "field": {
+        "apiUrl": "Cubox API URL",
+        "token": "Token",
+        "username": "Username",
+        "password": "Password",
+        "endpoint": "Server endpoint",
+        "collection": "Collection",
+        "userId": "User ID",
+        "vaultPath": "Vault path"
+      },
+      "cubox": {
+        "name": "Cubox",
+        "desc": "Save to Cubox"
+      },
+      "cuboxHint": "Paste the personal API URL from Cubox → Settings → Extensions & Automation → API extension.",
+      "readwise": {
+        "name": "Readwise Reader",
+        "desc": "Save to Readwise Reader"
+      },
+      "readwiseHint": "Create an access token at readwise.io/access_token and paste it here.",
+      "instapaper": {
+        "name": "Instapaper",
+        "desc": "Save to Instapaper"
+      },
+      "instapaperHint": "Your Instapaper account username and password (HTTP Basic).",
+      "outline": {
+        "name": "Outline",
+        "desc": "Create an Outline document"
+      },
+      "outlineHint": "Endpoint including /api (e.g. https://wiki.example.com/api), an API token, and the collection name or UUID.",
+      "readeck": {
+        "name": "Readeck",
+        "desc": "Bookmark in Readeck"
+      },
+      "readeckHint": "Your Readeck server root URL and an API token (Profile → Applications).",
+      "zotero": {
+        "name": "Zotero",
+        "desc": "Add a Zotero item"
+      },
+      "zoteroHint": "Your numeric Zotero user id and an API key created at zotero.org/settings/keys.",
+      "obsidian": {
+        "name": "Obsidian",
+        "desc": "Write a note into your vault"
+      },
+      "obsidianHint": "Absolute path of the local vault folder; each save writes a Markdown note with frontmatter."
     },
     "shortcuts": {
       "navigation": "Navigation",
@@ -612,7 +698,12 @@
     "noNotionPage": "Set the target Notion page id in Settings → Integrations",
     "noPocketConfig": "Add your Pocket consumer key and access token in Settings → Integrations",
     "noInstapaperConfig": "Add your Instapaper username and password in Settings → Integrations",
-    "noKindleConfig": "Configure your Kindle address and SMTP server in Settings → Integrations"
+    "noKindleConfig": "Configure your Kindle address and SMTP server in Settings → Integrations",
+    "integrationUnknown": "Unknown integration",
+    "integrationNotConfigured": "This integration is not fully configured — fill in its fields in Settings → Integrations",
+    "integrationMethodInvalid": "The webhook's HTTP method is not supported",
+    "integrationSchemeInvalid": "This URL scheme is not allowed",
+    "obsidianNoteExists": "A note with this name already exists in the vault"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

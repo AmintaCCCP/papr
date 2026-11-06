@@ -212,7 +212,10 @@
     "lightboxClose": "閉じる",
     "lightboxPrev": "前の画像",
     "lightboxNext": "次の画像",
-    "lightboxHint": "スクロールでズーム · ドラッグで移動"
+    "lightboxHint": "スクロールでズーム · ドラッグで移動",
+    "tbIntegration": "{{name}} に送信",
+    "integrationDone": "{{name}} に保存しました",
+    "integrationDoneWithLink": "{{name}} に保存しました — {{url}}"
   },
   "settings": {
     "title": "設定",
@@ -224,6 +227,7 @@
       "subscriptions": "購読",
       "filters": "フィルター",
       "sync": "同期",
+      "integrations": "連携",
       "shortcuts": "ショートカット",
       "notifications": "通知",
       "advanced": "詳細設定",
@@ -236,6 +240,7 @@
       "subscriptions": "{{count}} 件のフィード",
       "filters": "新着記事へのキーワードルール",
       "sync": "クラウド同期と外部サービス",
+      "integrations": "記事を連携サービスに保存",
       "shortcuts": "キーボードショートカット",
       "notifications": "新着記事の通知とバッジ",
       "advanced": "キャッシュ、ネットワーク、実験的機能",
@@ -410,6 +415,87 @@
       "connected": "接続しました",
       "disconnected": "接続を解除しました",
       "syncDone": "同期が完了しました · {{count}} 件の記事の状態を揃えました"
+    },
+    "integrations": {
+      "general": "一般",
+      "intro": "読んでいる記事をワンクリックで保存先サービスへ送るか、独自の Webhook に送信します。有効な連携ごとにツールバーへボタンが並びます。",
+      "useAiSummary": "AI 要約を説明文として使用",
+      "useAiSummaryDesc": "オンにすると、連携先には本文から抽出した説明文の代わりに記事の AI 要約が送られます。",
+      "builtins": "内蔵連携",
+      "customTitle": "カスタム連携",
+      "addCustom": "連携を追加",
+      "customEmpty": "カスタム連携はまだありません — Webhook または URL スキームを追加してください。",
+      "untitled": "無題の連携",
+      "configured": "設定済み",
+      "notConfigured": "未設定",
+      "configure": "設定",
+      "deleteTitle": "連携を削除",
+      "deleteMessage": "「{{name}}」を削除しますか？ツールバーのボタンも削除されます。",
+      "namePlaceholder": "連携名",
+      "kind": "種類",
+      "kindWebhook": "Webhook",
+      "kindUrlScheme": "URL スキーム",
+      "methodLabel": "メソッド",
+      "headerKey": "ヘッダー名",
+      "headerValue": "ヘッダー値",
+      "addHeader": "ヘッダーを追加",
+      "removeHeader": "ヘッダーを削除",
+      "placeholdersTitle": "テンプレート プレースホルダー",
+      "ph": {
+        "title": "記事タイトル",
+        "url": "記事 URL",
+        "contentHtml": "本文 HTML",
+        "contentMarkdown": "本文 Markdown",
+        "summary": "AI 要約（上の設定が有効な場合）または説明文",
+        "description": "本文から抽出した説明文",
+        "author": "著者",
+        "publishedAt": "公開日時（ISO 8601）"
+      },
+      "field": {
+        "apiUrl": "Cubox API URL",
+        "token": "トークン",
+        "username": "ユーザー名",
+        "password": "パスワード",
+        "endpoint": "サーバー URL",
+        "collection": "コレクション",
+        "userId": "ユーザー ID",
+        "vaultPath": "Vault パス"
+      },
+      "cubox": {
+        "name": "Cubox",
+        "desc": "Cubox に保存"
+      },
+      "cuboxHint": "Cubox「設定 → 拡張と自動化 → API 拡張」の個人 API URL を貼り付けてください。",
+      "readwise": {
+        "name": "Readwise Reader",
+        "desc": "Readwise Reader に保存"
+      },
+      "readwiseHint": "readwise.io/access_token でアクセス トークンを発行して貼り付けてください。",
+      "instapaper": {
+        "name": "Instapaper",
+        "desc": "Instapaper に保存"
+      },
+      "instapaperHint": "Instapaper アカウントのユーザー名とパスワード（HTTP Basic 認証）。",
+      "outline": {
+        "name": "Outline",
+        "desc": "Outline ドキュメントを作成"
+      },
+      "outlineHint": "/api を含むサーバー URL（例: https://wiki.example.com/api）、API トークン、コレクション名または UUID。",
+      "readeck": {
+        "name": "Readeck",
+        "desc": "Readeck にブックマーク"
+      },
+      "readeckHint": "Readeck サーバーのルート URL と API トークン（プロフィール → アプリ）。",
+      "zotero": {
+        "name": "Zotero",
+        "desc": "Zotero アイテムを追加"
+      },
+      "zoteroHint": "Zotero の数値ユーザー ID と zotero.org/settings/keys で作成した API キー。",
+      "obsidian": {
+        "name": "Obsidian",
+        "desc": "Vault にノートを書き込む"
+      },
+      "obsidianHint": "ローカル Vault フォルダーの絶対パス。保存のたびに frontmatter 付き Markdown ノートを書き込みます。"
     },
     "shortcuts": {
       "navigation": "ナビゲーション",
@@ -612,7 +698,12 @@
     "noNotionPage": "設定 → 連携 で対象の Notion ページ ID を設定してください",
     "noPocketConfig": "設定 → 連携 で Pocket のコンシューマーキーとアクセストークンを追加してください",
     "noInstapaperConfig": "設定 → 連携 で Instapaper のユーザー名とパスワードを追加してください",
-    "noKindleConfig": "設定 → 連携 で Kindle アドレスと SMTP サーバーを設定してください"
+    "noKindleConfig": "設定 → 連携 で Kindle アドレスと SMTP サーバーを設定してください",
+    "integrationUnknown": "不明な連携です",
+    "integrationNotConfigured": "この連携は設定が不完全です — 設定 → 連携 で必須項目を入力してください",
+    "integrationMethodInvalid": "Webhook の HTTP メソッドは対応していません",
+    "integrationSchemeInvalid": "この URL スキームは許可されていません",
+    "obsidianNoteExists": "同じ名前のノートが Vault に既に存在します"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",
