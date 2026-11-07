@@ -338,6 +338,21 @@ export default function App() {
 
   const openSettings = (section?: string) => setSettings({ open: true, section });
 
+  // Toggle the AI summary card. The card renders inline in the reading view,
+  // so from the original-page view this first returns there — the same
+  // behavior as the reader toolbar button; toggling blind from the web view
+  // would flip state with no visible feedback and pop the card open later.
+  const toggleAiSummary = () => {
+    const st = useUi.getState();
+    if (st.selectedArticleId == null) return;
+    if (st.readerView === "web") {
+      st.setReaderView("reader");
+      st.setAiOpen(true);
+    } else {
+      st.setAiOpen(!st.aiOpen);
+    }
+  };
+
   // ── command-palette actions ──
   const handleCommand = (action: CommandAction) => {
     switch (action) {
@@ -350,10 +365,7 @@ export default function App() {
       case "toggle-focus":
         useUi.getState().setFocusMode(!useUi.getState().focusMode);
         break;
-      case "toggle-ai":
-        if (useUi.getState().selectedArticleId != null)
-          useUi.getState().setAiOpen(!useUi.getState().aiOpen);
-        break;
+      case "toggle-ai": toggleAiSummary(); break;
       case "refresh": doRefresh(); break;
       case "add-feed": setAddFeed(true); break;
       case "new-folder": setNewFolder(true); break;
@@ -482,7 +494,7 @@ export default function App() {
         case "i":
           if (st.selectedArticleId != null) {
             e.preventDefault();
-            st.setAiOpen(!st.aiOpen);
+            toggleAiSummary();
           }
           break;
         case "f": e.preventDefault(); st.setFocusMode(!st.focusMode); break;

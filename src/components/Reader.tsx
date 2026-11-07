@@ -205,7 +205,8 @@ export default function Reader({ onToast }: Props) {
   // Reading vs. the article's original web page, shown in an in-app iframe.
   // Sites that set X-Frame-Options / CSP frame-ancestors refuse to load this
   // way — the in-frame hint points those back to "open in browser".
-  const [viewMode, setViewMode] = useState<"reader" | "web">("reader");
+  const readerView = useUi((s) => s.readerView);
+  const setReaderView = useUi((s) => s.setReaderView);
   const [tagPick, setTagPick] = useState<{ x: number; y: number } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
@@ -324,7 +325,7 @@ export default function Reader({ onToast }: Props) {
   useEffect(() => {
     setShowExtracted(useUi.getState().prefs.defaultOpenMode === "extracted");
     setShowTranslation(false);
-    setViewMode("reader");
+    setReaderView("reader");
     setScrolled(false);
     setTagPick(null);
     setHeroBroken(false);
@@ -347,7 +348,7 @@ export default function Reader({ onToast }: Props) {
     if (!a || openMode === undefined || openModeAppliedRef.current === a.id)
       return;
     openModeAppliedRef.current = a.id;
-    if (openMode === "web" && a.url) setViewMode("web");
+    if (openMode === "web" && a.url) setReaderView("web");
     else setShowExtracted(openMode === "extracted");
   }, [a, openMode]);
 
@@ -367,7 +368,7 @@ export default function Reader({ onToast }: Props) {
   // Drive the native original-page child webview (page_view.rs) while in web
   // mode. It floats above the DOM, so we measure the host rect and keep the
   // webview aligned to it across window/sidebar resizes. (Switching articles
-  // resets viewMode to "reader" above, so a.url is stable within a session.)
+  // resets readerView to "reader" above, so a.url is stable within a session.)
   const articleUrl = a?.url ?? null;
   // Anything that floats over the reading area must suspend the page view: the
   // child webview floats above the whole DOM, so it would otherwise occlude a
@@ -390,7 +391,7 @@ export default function Reader({ onToast }: Props) {
   // while hidden, so re-showing never lands the page at a stale rect.
   useEffect(() => {
     const host = pageHostRef.current;
-    if (viewMode !== "web" || !articleUrl || !host) return;
+    if (readerView !== "web" || !articleUrl || !host) return;
 
     const bounds = () => {
       const r = host.getBoundingClientRect();
@@ -428,14 +429,14 @@ export default function Reader({ onToast }: Props) {
       window.removeEventListener("resize", sync);
       api.closePageView().catch(() => {});
     };
-  }, [viewMode, articleUrl]);
+  }, [readerView, articleUrl]);
 
   // Visibility: toggle the webview as overlays come and go, without reloading.
   // No-op (backend-side) when no webview is open.
   useEffect(() => {
-    if (viewMode !== "web" || !articleUrl) return;
+    if (readerView !== "web" || !articleUrl) return;
     api.setPageViewVisible(!overlayOpen).catch(() => {});
-  }, [overlayOpen, viewMode, articleUrl]);
+  }, [overlayOpen, readerView, articleUrl]);
 
   // Recover article-body images the webview fails to load, then hide the
   // stragglers. The webview sends no Referer (see sanitize.rs) — right for
@@ -956,8 +957,8 @@ export default function Reader({ onToast }: Props) {
             // page view and show the summary when the button is pressed from
             // there (toggling off would read as a no-op, the card is hidden
             // in web mode).
-            if (viewMode === "web") {
-              setViewMode("reader");
+            if (readerView === "web") {
+              setReaderView("reader");
               setAiOpen(true);
               return;
             }
@@ -1019,11 +1020,11 @@ export default function Reader({ onToast }: Props) {
         <div className="tb-btn spacer" />
         {a.url && (
           <button
-            className={`tb-btn ${viewMode === "web" ? "on" : ""}`}
+            className={`tb-btn ${readerView === "web" ? "on" : ""}`}
             title={t("reader.tbWebView")}
             aria-label={t("reader.tbWebView")}
-            aria-pressed={viewMode === "web"}
-            onClick={() => setViewMode((v) => (v === "web" ? "reader" : "web"))}
+            aria-pressed={readerView === "web"}
+            onClick={() => setReaderView(readerView === "web" ? "reader" : "web")}
           >
             <Icon name="eye" size={16} />
           </button>
@@ -1040,7 +1041,7 @@ export default function Reader({ onToast }: Props) {
         )}
       </div>
 
-      {viewMode === "web" && a.url ? (
+      {readerView === "web" && a.url ? (
         <div className="reader-webview">
           <div className="reader-webview-bar">
             <span className="reader-webview-url">{a.url}</span>
@@ -1414,7 +1415,10 @@ function AISummary({ article }: { article: ArticleDetail }) {
   // Generate a summary the first time the card shows for an article without
   // one, and again whenever the user hits Retry / Regenerate. `failed` is in
   // the guard so a failed run isn't silently re-attempted just because the
-  // card was reopened.
+  // card was reopened. `busy` is a dep so the guard re-arms when an abandoned
+  // run settles: reopening the card mid-stream (before the old promise
+  // resolves) would otherwise find `busy` still true, skip starting a run,
+  // and never retry once `busy` cleared — wedging the card on an empty body.
   useEffect(() => {
     if (!open || busy || text || failed) return;
     const run = ++runRef.current;
@@ -1443,7 +1447,12 @@ function AISummary({ article }: { article: ArticleDetail }) {
         }
       })
       .then(() => {
-        if (!cancelled) qc.invalidateQueries({ queryKey: ["article", article.id] });
+        // The backend keeps streaming to completion and persists the summary
+        // even after the frontend stopped listening (card closed, article
+        // switched, original-page view opened) — always refresh the cache, so
+        // a remount sees the persisted text instead of spending a second
+        // generation on it.
+        qc.invalidateQueries({ queryKey: ["article", article.id] });
       })
       .catch((e) => {
         if (!cancelled && !sawErrorEvent) {
@@ -1467,7 +1476,7 @@ function AISummary({ article }: { article: ArticleDetail }) {
       if (!settled) setText(article.aiSummary);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, article.id, retry]);
+  }, [open, article.id, retry, busy]);
 
   // Copy the raw markdown text — the summary's structured shape (TL;DR +
   // bullets) is what's useful elsewhere.

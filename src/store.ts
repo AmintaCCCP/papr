@@ -173,6 +173,12 @@ interface UiState {
    *  article — the reader closes it on article switch (the auto-summarize
    *  preference re-opens it for the new article when on). */
   aiOpen: boolean;
+  /** Whether the reader shows the reading view or the article's original
+   *  page (native child webview). Lives here, not in the reader component,
+   *  so the keyboard / command-palette AI-summary toggle can return to the
+   *  reading view the same way the reader toolbar button does — the summary
+   *  card only renders in the reading view. */
+  readerView: "reader" | "web";
   /** A covering modal (subscribe / settings / explore …) is open. The reader's
    *  original-page view is a native child webview that floats above the whole
    *  DOM — including modals — so it must be torn down while one is up, or it
@@ -202,6 +208,7 @@ interface UiState {
 
   setFocusMode: (v: boolean) => void;
   setAiOpen: (v: boolean) => void;
+  setReaderView: (v: "reader" | "web") => void;
   setModalOpen: (v: boolean) => void;
   setMenuOpen: (v: boolean) => void;
 }
@@ -321,6 +328,7 @@ export const useUi = create<UiState>((set, get) => ({
 
   focusMode: false,
   aiOpen: false,
+  readerView: "reader",
   modalOpen: false,
   menuOpen: false,
 
@@ -389,6 +397,7 @@ export const useUi = create<UiState>((set, get) => ({
 
   setFocusMode: (focusMode) => set({ focusMode }),
   setAiOpen: (aiOpen) => set({ aiOpen }),
+  setReaderView: (readerView) => set({ readerView }),
   setModalOpen: (modalOpen) => set({ modalOpen }),
   setMenuOpen: (menuOpen) => set({ menuOpen }),
 }));

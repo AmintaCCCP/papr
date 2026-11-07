@@ -215,6 +215,7 @@
     "tbIntegration": "Send to {{name}}",
     "integrationDone": "Saved to {{name}}",
     "integrationDoneWithLink": "Saved to {{name}} — {{url}}",
+    "aiCopy": "Copy summary",
     "aiCopied": "Summary copied",
     "aiRegenerate": "Regenerate summary"
   },

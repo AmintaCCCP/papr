@@ -215,6 +215,7 @@
     "tbIntegration": "{{name}} に送信",
     "integrationDone": "{{name}} に保存しました",
     "integrationDoneWithLink": "{{name}} に保存しました — {{url}}",
+    "aiCopy": "要約をコピー",
     "aiCopied": "要約をコピーしました",
     "aiRegenerate": "要約を再生成"
   },

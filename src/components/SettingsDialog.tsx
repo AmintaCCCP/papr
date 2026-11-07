@@ -2182,7 +2182,7 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
   const [model, setModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [prompt, setPrompt] = useState("");
-  const savedPrompt = useRef("");
+  const [savedPrompt, setSavedPrompt] = useState("");
   // The built-in prompt, fetched so the editor's placeholder shows exactly
   // what runs when the user's own prompt is empty.
   const [defaultPrompt, setDefaultPrompt] = useState("");
@@ -2303,7 +2303,7 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
         }
         if (sp) {
           setPrompt(sp);
-          savedPrompt.current = sp;
+          setSavedPrompt(sp);
         }
         if (typeof dp === "string") setDefaultPrompt(dp);
         if (eng === "google" || eng === "deepl" || eng === "bing" || eng === "llm")
@@ -2461,12 +2461,12 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           <button
             className="s-btn"
             type="button"
-            disabled={!prompt && savedPrompt.current === ""}
+            disabled={!prompt && savedPrompt === ""}
             onClick={() => {
               // Reset to the built-in default: clear the editor and the
               // stored key — the backend then runs the default prompt again.
               setPrompt("");
-              savedPrompt.current = "";
+              setSavedPrompt("");
               save("ai_summary_prompt", "", t("settings.advanced.aiPromptLabel"));
             }}
           >
@@ -2485,8 +2485,8 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
             // built-in default runs again.
             const trimmed = prompt.trim();
             if (trimmed !== prompt) setPrompt(trimmed);
-            if (trimmed !== savedPrompt.current) {
-              savedPrompt.current = trimmed;
+            if (trimmed !== savedPrompt) {
+              setSavedPrompt(trimmed);
               save("ai_summary_prompt", trimmed, t("settings.advanced.aiPromptLabel"));
             }
           }}
