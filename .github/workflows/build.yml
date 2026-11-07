@@ -159,16 +159,21 @@ jobs:
       # there; no GitHub release is created or touched. When the updater key
       # is configured, test builds sign exactly like release builds do.
       - name: Build desktop bundles
-        id: build
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ (matrix.platform == 'macos-latest' && format('--target {0} ', matrix.target) || '') }}${{ env.EXTRA_BUILD_ARGS }}
 
+      # upload-artifact can't consume tauri-action's artifactPaths output —
+      # it is a JSON-array string, which v4 treats as one literal glob and
+      # finds nothing. Glob the bundle outputs directly instead; cargo puts
+      # them under the root target dir on every platform, with cross-target
+      # mac builds adding the triple as an extra path segment.
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
           name: papr-desktop-${{ matrix.target }}
-          path: ${{ steps.build.outputs.artifactPaths }}
+          path: |
+            target/${{ matrix.platform == 'macos-latest' && format('{0}/', matrix.target) || '' }}release/bundle/**
           if-no-files-found: error
