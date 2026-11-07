@@ -166,7 +166,6 @@
     "footerHint": "記事 · フィード · コマンド"
   },
   "reader": {
-    "resizeAi": "AI 要約パネルの幅を調整",
     "fullTextExtracted": "全文を抽出しました",
     "linkCopied": "リンクをコピーしました",
     "ctxCopy": "コピー",
@@ -215,7 +214,10 @@
     "lightboxHint": "スクロールでズーム · ドラッグで移動",
     "tbIntegration": "{{name}} に送信",
     "integrationDone": "{{name}} に保存しました",
-    "integrationDoneWithLink": "{{name}} に保存しました — {{url}}"
+    "integrationDoneWithLink": "{{name}} に保存しました — {{url}}",
+    "aiCopy": "要約をコピー",
+    "aiCopied": "要約をコピーしました",
+    "aiRegenerate": "要約を再生成"
   },
   "settings": {
     "title": "設定",
@@ -599,6 +601,11 @@
       "aiTestDesc": "最小のリクエストを 1 回送り、キー・Base URL・モデルを確認します",
       "aiTesting": "テスト中…",
       "aiTestOk": "接続 OK · {{model}} · {{ms}}ms",
+      "autoSummarize": "記事を開いたら自動で要約を読み込む",
+      "autoSummarizeDesc": "記事を開くとすぐに AI 要約を表示します。キャッシュがあれば即時表示、なければバックグラウンドで生成します",
+      "aiPromptLabel": "要約プロンプト",
+      "aiPromptDesc": "AI が要約を生成する際の指示です。空欄の場合はプレースホルダーに表示された既定のプロンプトを使用します。変更は新しく生成する要約に適用されます",
+      "aiPromptReset": "既定に戻す",
       "translateEngine": "翻訳エンジン",
       "translateEngineDesc": "記事翻訳の既定エンジン。LLM は上の AI プロバイダーを使用します。Google・DeepL・Bing は独立サービスです。閲覧画面で記事ごとに一時的に切り替えられます",
       "translateEngineLabel": "翻訳エンジン",
@@ -703,7 +710,8 @@
     "integrationNotConfigured": "この連携は設定が不完全です — 設定 → 連携 で必須項目を入力してください",
     "integrationMethodInvalid": "Webhook の HTTP メソッドは対応していません",
     "integrationSchemeInvalid": "この URL スキームは許可されていません",
-    "obsidianNoteExists": "同じ名前のノートが Vault に既に存在します"
+    "obsidianNoteExists": "同じ名前のノートが Vault に既に存在します",
+    "aiEmptyResponse": "プロバイダが空の要約を返しました — モデルとプロンプトを確認してください"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

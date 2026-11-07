@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../api";
 import { LANGUAGES } from "../i18n";
-import { useUi, PANEL_BOUNDS } from "../store";
+import { useUi } from "../store";
 import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
@@ -23,7 +23,6 @@ import {
 import type { ArticleDetail } from "../types";
 import Icon from "./Icon";
 import TagPicker from "./TagPicker";
-import ResizeHandle from "./ResizeHandle";
 import HighlightLayer from "./HighlightLayer";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import Lightbox from "./Lightbox";
@@ -189,6 +188,7 @@ export default function Reader({ onToast }: Props) {
   const setFocusMode = useUi((s) => s.setFocusMode);
   const aiOpen = useUi((s) => s.aiOpen);
   const setAiOpen = useUi((s) => s.setAiOpen);
+  const autoSummarize = useUi((s) => s.prefs.autoSummarize);
   const markReadOnOpen = useUi((s) => s.prefs.markReadOnOpen);
   const markReadOnScroll = useUi((s) => s.prefs.markReadOnScroll);
   const showReadingTime = useUi((s) => s.prefs.showReadingTime);
@@ -205,7 +205,8 @@ export default function Reader({ onToast }: Props) {
   // Reading vs. the article's original web page, shown in an in-app iframe.
   // Sites that set X-Frame-Options / CSP frame-ancestors refuse to load this
   // way — the in-frame hint points those back to "open in browser".
-  const [viewMode, setViewMode] = useState<"reader" | "web">("reader");
+  const readerView = useUi((s) => s.readerView);
+  const setReaderView = useUi((s) => s.setReaderView);
   const [tagPick, setTagPick] = useState<{ x: number; y: number } | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
@@ -238,6 +239,9 @@ export default function Reader({ onToast }: Props) {
   // events near the foot doesn't fire `setRead` repeatedly before the
   // optimistic cache patch lands.
   const scrollMarkedRef = useRef<number | null>(null);
+  // Article id we already auto-loaded the summary for (see the auto-summarize
+  // effect), so dismissing the card keeps it closed for this article.
+  const autoSummarizedRef = useRef<number | null>(null);
   const playTrack = usePlayer((s) => s.play);
   const playingSrc = usePlayer((s) => (s.playing ? s.track?.src : null));
 
@@ -321,13 +325,18 @@ export default function Reader({ onToast }: Props) {
   useEffect(() => {
     setShowExtracted(useUi.getState().prefs.defaultOpenMode === "extracted");
     setShowTranslation(false);
-    setViewMode("reader");
+    setReaderView("reader");
     setScrolled(false);
     setTagPick(null);
     setHeroBroken(false);
     setHeroDataUrl(null);
     scrollMarkedRef.current = null;
+    // The summary card is per-article: close it so the next article starts
+    // fresh (the auto-summarize preference re-opens it below when enabled).
+    setAiOpen(false);
+    autoSummarizedRef.current = null;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // Apply the effective open mode once the article (and the feed list) is
@@ -339,26 +348,39 @@ export default function Reader({ onToast }: Props) {
     if (!a || openMode === undefined || openModeAppliedRef.current === a.id)
       return;
     openModeAppliedRef.current = a.id;
-    if (openMode === "web" && a.url) setViewMode("web");
+    if (openMode === "web" && a.url) setReaderView("web");
     else setShowExtracted(openMode === "extracted");
   }, [a, openMode]);
+
+  // Auto-load the summary (Folo-style): with the preference on, the card
+  // appears as soon as the article loads — a cached summary shows instantly,
+  // a missing one starts generating (see AISummary). Fires once per article
+  // and only while the card is closed, so dismissing it keeps it closed for
+  // this article; switching away and back loads it again.
+  useEffect(() => {
+    if (!a || !autoSummarize) return;
+    if (autoSummarizedRef.current === a.id) return;
+    autoSummarizedRef.current = a.id;
+    setAiOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [a?.id, autoSummarize]);
 
   // Drive the native original-page child webview (page_view.rs) while in web
   // mode. It floats above the DOM, so we measure the host rect and keep the
   // webview aligned to it across window/sidebar resizes. (Switching articles
-  // resets viewMode to "reader" above, so a.url is stable within a session.)
+  // resets readerView to "reader" above, so a.url is stable within a session.)
   const articleUrl = a?.url ?? null;
   // Anything that floats over the reading area must suspend the page view: the
   // child webview floats above the whole DOM, so it would otherwise occlude a
   // covering modal (subscribe / settings / explore — issue #54), a context
-  // menu raised over the reader (issue #74), the tag picker, or the AI drawer
-  // that slides over the reader's right edge. We *hide* the webview rather than
-  // tear it down, so dismissing the overlay reveals the already-loaded page
-  // instantly instead of reloading it (the bounds keep syncing while hidden,
-  // below).
+  // menu raised over the reader (issue #74), or the tag picker. (The AI
+  // summary card is inline in the article, so it doesn't count.) We *hide*
+  // the webview rather than tear it down, so dismissing the overlay reveals
+  // the already-loaded page instantly instead of reloading it (the bounds
+  // keep syncing while hidden, below).
   const modalOpen = useUi((s) => s.modalOpen);
   const menuOpen = useUi((s) => s.menuOpen);
-  const overlayOpen = modalOpen || menuOpen || aiOpen || tagPick != null;
+  const overlayOpen = modalOpen || menuOpen || tagPick != null;
   // Read the latest value inside the lifecycle effect without making it a
   // dependency — overlays toggle visibility (below), never the webview's life.
   const overlayOpenRef = useRef(overlayOpen);
@@ -369,7 +391,7 @@ export default function Reader({ onToast }: Props) {
   // while hidden, so re-showing never lands the page at a stale rect.
   useEffect(() => {
     const host = pageHostRef.current;
-    if (viewMode !== "web" || !articleUrl || !host) return;
+    if (readerView !== "web" || !articleUrl || !host) return;
 
     const bounds = () => {
       const r = host.getBoundingClientRect();
@@ -387,8 +409,8 @@ export default function Reader({ onToast }: Props) {
           api.closePageView().catch(() => {});
           return;
         }
-        // Created visible by default; if an overlay is already up (e.g. the AI
-        // drawer was open when web mode was toggled on), hide it at once.
+        // Created visible by default; if an overlay is already up (e.g. a
+        // modal was open when web mode was toggled on), hide it at once.
         if (overlayOpenRef.current) api.setPageViewVisible(false).catch(() => {});
       },
       () => {},
@@ -407,14 +429,14 @@ export default function Reader({ onToast }: Props) {
       window.removeEventListener("resize", sync);
       api.closePageView().catch(() => {});
     };
-  }, [viewMode, articleUrl]);
+  }, [readerView, articleUrl]);
 
   // Visibility: toggle the webview as overlays come and go, without reloading.
   // No-op (backend-side) when no webview is open.
   useEffect(() => {
-    if (viewMode !== "web" || !articleUrl) return;
+    if (readerView !== "web" || !articleUrl) return;
     api.setPageViewVisible(!overlayOpen).catch(() => {});
-  }, [overlayOpen, viewMode, articleUrl]);
+  }, [overlayOpen, readerView, articleUrl]);
 
   // Recover article-body images the webview fails to load, then hide the
   // stragglers. The webview sends no Referer (see sanitize.rs) — right for
@@ -926,6 +948,26 @@ export default function Reader({ onToast }: Props) {
           <Icon name="text" size={16} />
         </button>
         <button
+          className={`tb-btn ${aiOpen ? "on" : ""}`}
+          title={t("reader.tbAiSummary")}
+          aria-label={t("reader.tbAiSummary")}
+          aria-pressed={aiOpen}
+          onClick={() => {
+            // The card renders inside the reader view — leave the original
+            // page view and show the summary when the button is pressed from
+            // there (toggling off would read as a no-op, the card is hidden
+            // in web mode).
+            if (readerView === "web") {
+              setReaderView("reader");
+              setAiOpen(true);
+              return;
+            }
+            setAiOpen(!aiOpen);
+          }}
+        >
+          <Icon name={aiOpen ? "sparkle-fill" : "sparkle"} size={16} />
+        </button>
+        <button
           className="tb-btn"
           title={t("reader.tbShare")}
           aria-label={t("reader.tbShare")}
@@ -978,11 +1020,11 @@ export default function Reader({ onToast }: Props) {
         <div className="tb-btn spacer" />
         {a.url && (
           <button
-            className={`tb-btn ${viewMode === "web" ? "on" : ""}`}
+            className={`tb-btn ${readerView === "web" ? "on" : ""}`}
             title={t("reader.tbWebView")}
             aria-label={t("reader.tbWebView")}
-            aria-pressed={viewMode === "web"}
-            onClick={() => setViewMode((v) => (v === "web" ? "reader" : "web"))}
+            aria-pressed={readerView === "web"}
+            onClick={() => setReaderView(readerView === "web" ? "reader" : "web")}
           >
             <Icon name="eye" size={16} />
           </button>
@@ -999,7 +1041,7 @@ export default function Reader({ onToast }: Props) {
         )}
       </div>
 
-      {viewMode === "web" && a.url ? (
+      {readerView === "web" && a.url ? (
         <div className="reader-webview">
           <div className="reader-webview-bar">
             <span className="reader-webview-url">{a.url}</span>
@@ -1087,6 +1129,12 @@ export default function Reader({ onToast }: Props) {
               ))}
             </div>
           )}
+
+          {/* The AI summary card sits between the article head (title, meta,
+              tags) and its content — the same above-the-article placement
+              Folo uses. Keyed with the article element, so it remounts and
+              re-seeds from the new article's cached summary on switch. */}
+          <AISummary article={a} />
 
           {ytId ? (
             <iframe
@@ -1259,16 +1307,6 @@ export default function Reader({ onToast }: Props) {
         />
       )}
 
-      <AIDrawer
-        // Keyed by article id so switching articles remounts the drawer:
-        // its `text` state then re-initialises from the new article's
-        // summary, rather than carrying the previous one's across.
-        key={a.id}
-        open={aiOpen}
-        article={a}
-        onClose={() => setAiOpen(false)}
-      />
-
       {tagPick && (
         <TagPicker
           articleId={a.id}
@@ -1348,42 +1386,45 @@ export default function Reader({ onToast }: Props) {
   );
 }
 
-function AIDrawer({
-  open,
-  article,
-  onClose,
-}: {
-  open: boolean;
-  article: ArticleDetail;
-  onClose: () => void;
-}) {
+/** The inline AI summary card rendered between the article head and its body
+ *  (Folo's above-the-article placement): a header with the sparkle icon, the
+ *  "AI summary" label and copy / regenerate / close actions, with the markdown
+ *  summary below. Generation starts when the card is shown and the article
+ *  has no cached summary — triggered by the toolbar or context-menu button,
+ *  or automatically by the auto-summarize preference. */
+function AISummary({ article }: { article: ArticleDetail }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const aiWidth = useUi((s) => s.aiWidth);
+  const open = useUi((s) => s.aiOpen);
   // Initialised from the article's stored summary (if any). The parent keys
-  // this component by article id, so a switch remounts it and re-runs this
-  // initialiser — no separate "reset on article change" effect is needed.
+  // the article element by article id, so a switch remounts this component
+  // and re-runs this initialiser — no separate "reset on article change"
+  // effect is needed.
   const [text, setText] = useState<string | null>(article.aiSummary);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const [retry, setRetry] = useState(0);
-  // Identifies the latest summarize run. Closing the drawer mid-stream cancels
-  // an effect run but the component stays mounted (it is only moved off-screen),
-  // so the underlying request keeps streaming and its promise settles later.
-  // Only the run whose generation still matches may touch `busy` on settle —
-  // otherwise a stale run's `finally` would either wedge the drawer on the
-  // loading state or clobber a newer run's `busy` flag.
+  // Identifies the latest summarize run. Closing the card mid-stream cancels
+  // an effect run but the component stays mounted (hidden), so the underlying
+  // request keeps streaming and its promise settles later. Only the run whose
+  // generation still matches may touch `busy` on settle — otherwise a stale
+  // run's `finally` would either wedge the card on the loading state or
+  // clobber a newer run's `busy` flag.
   const runRef = useRef(0);
 
-  // Generate a summary the first time the drawer opens for an article, and
-  // again whenever the user hits Retry. `failed` is in the guard so a failed
-  // run isn't silently re-attempted just because the drawer was reopened.
+  // Generate a summary the first time the card shows for an article without
+  // one, and again whenever the user hits Retry / Regenerate. `failed` is in
+  // the guard so a failed run isn't silently re-attempted just because the
+  // card was reopened. `busy` is a dep so the guard re-arms when an abandoned
+  // run settles: reopening the card mid-stream (before the old promise
+  // resolves) would otherwise find `busy` still true, skip starting a run,
+  // and never retry once `busy` cleared — wedging the card on an empty body.
   useEffect(() => {
     if (!open || busy || text || failed) return;
     const run = ++runRef.current;
     let cancelled = false;
     // Whether the stream settled (resolved or rejected) on its own. If the
-    // cleanup runs while this is still false, the drawer was closed mid-stream
+    // cleanup runs while this is still false, the card was closed mid-stream
     // — the accumulated `text` is then a truncated fragment.
     let settled = false;
     // An error raised inside the stream surfaces twice: once as an `error`
@@ -1406,7 +1447,12 @@ function AIDrawer({
         }
       })
       .then(() => {
-        if (!cancelled) qc.invalidateQueries({ queryKey: ["article", article.id] });
+        // The backend keeps streaming to completion and persists the summary
+        // even after the frontend stopped listening (card closed, article
+        // switched, original-page view opened) — always refresh the cache, so
+        // a remount sees the persisted text instead of spending a second
+        // generation on it.
+        qc.invalidateQueries({ queryKey: ["article", article.id] });
       })
       .catch((e) => {
         if (!cancelled && !sawErrorEvent) {
@@ -1418,7 +1464,7 @@ function AIDrawer({
         settled = true;
         // Clear `busy` for the current run even if it was cancelled — the
         // component is still mounted, and leaving `busy` true would wedge the
-        // drawer on the loading state. Skip if a newer run has superseded us.
+        // card on the loading state. Skip if a newer run has superseded us.
         if (runRef.current === run) setBusy(false);
       });
     return () => {
@@ -1430,57 +1476,63 @@ function AIDrawer({
       if (!settled) setText(article.aiSummary);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, article.id, retry]);
+  }, [open, article.id, retry, busy]);
 
-  const loading = busy && !text;
-  const onRetry = () => {
+  // Copy the raw markdown text — the summary's structured shape (TL;DR +
+  // bullets) is what's useful elsewhere.
+  const onCopy = () => {
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => toast.show(t("reader.aiCopied")), () => {});
+  };
+  const onRegenerate = () => {
     setText("");
     setFailed(false);
     setRetry((n) => n + 1);
   };
   // Parse + sanitize the summary only when the text changes, not on every
-  // AIDrawer re-render (e.g. each open/close toggle).
+  // AISummary re-render (e.g. each open/close toggle).
   const html = useMemo(() => (text ? renderMarkdown(text) : ""), [text]);
 
+  if (!open) return null;
+
   return (
-    <div
-      className={`ai-drawer ${open ? "open" : ""}`}
-      // A labelled complementary landmark so screen-reader users can jump
-      // straight to the summary.
-      role="complementary"
-      aria-label={t("reader.aiSummaryTitle")}
-      // When closed the drawer is only moved off-screen — `inert` keeps its
-      // close button and content out of the tab order and the a11y tree.
-      inert={!open}
-    >
-      {/* Left-edge handle: dragging left widens the drawer. Hidden from the
-          a11y tree while the drawer is closed (the whole drawer is `inert`). */}
-      <div className="resize-handle-slot resize-handle-slot--inline">
-        <ResizeHandle
-          width={aiWidth}
-          side="left"
-          min={PANEL_BOUNDS.ai.min}
-          max={PANEL_BOUNDS.ai.max}
-          onResize={(w) => useUi.getState().setPanel({ aiWidth: w })}
-          label={t("reader.resizeAi")}
-        />
-      </div>
-      <div className="ai-head">
+    <div className="ai-card" role="region" aria-label={t("reader.aiSummaryTitle")}>
+      <div className="ai-card-head">
         <span className="accent-ico">
-          <Icon name="sparkle-fill" size={15} />
+          <Icon name="sparkle-fill" size={14} />
         </span>
-        <h3>{t("reader.aiSummaryTitle")}</h3>
-        <button
-          className="tb-btn close"
-          onClick={onClose}
-          title={t("common.close")}
-          aria-label={t("common.close")}
-        >
-          <Icon name="x" size={14} />
-        </button>
+        <span className="ai-card-title">{t("reader.aiSummaryTitle")}</span>
+        <span className="ai-card-actions">
+          <button
+            className="tb-btn"
+            onClick={onCopy}
+            disabled={!text || busy}
+            title={t("reader.aiCopy")}
+            aria-label={t("reader.aiCopy")}
+          >
+            <Icon name="copy" size={13} />
+          </button>
+          <button
+            className="tb-btn"
+            onClick={onRegenerate}
+            disabled={busy}
+            title={t("reader.aiRegenerate")}
+            aria-label={t("reader.aiRegenerate")}
+          >
+            <Icon name="refresh" size={13} />
+          </button>
+          <button
+            className="tb-btn"
+            onClick={() => useUi.getState().setAiOpen(false)}
+            title={t("common.close")}
+            aria-label={t("common.close")}
+          >
+            <Icon name="x" size={13} />
+          </button>
+        </span>
       </div>
-      <div className="ai-body" aria-live="polite" aria-busy={busy}>
-        {loading && (
+      <div className="ai-card-body" aria-live="polite" aria-busy={busy}>
+        {busy && !text && (
           <div className="ai-loading">
             <span className="ai-dot" />
             <span className="ai-dot" />
@@ -1492,7 +1544,7 @@ function AIDrawer({
           <div className="ai-error">
             <Icon name="alert" size={18} />
             <span>{t("reader.aiError")}</span>
-            <button className="empty-retry" onClick={onRetry}>
+            <button className="empty-retry" onClick={onRegenerate}>
               <Icon name="refresh" size={12} />
               {t("common.retry")}
             </button>
@@ -1505,16 +1557,7 @@ function AIDrawer({
               onClick={makeLinkClickHandler(article.url)}
               dangerouslySetInnerHTML={{ __html: html }}
             />
-            <div
-              style={{
-                fontSize: 11,
-                color: "var(--muted-2)",
-                marginTop: 24,
-                lineHeight: 1.5,
-              }}
-            >
-              {t("reader.aiDisclaimer")}
-            </div>
+            <div className="ai-card-foot">{t("reader.aiDisclaimer")}</div>
           </>
         )}
       </div>

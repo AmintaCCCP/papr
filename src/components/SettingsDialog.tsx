@@ -2173,10 +2173,19 @@ type AiProvider = "anthropic" | "openai" | "deepseek";
 function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
   const { t, i18n } = useTranslation();
   const qc = useQueryClient();
+  // Summary behaviour: auto-load the summary when an article opens, and the
+  // custom system prompt (empty = the built-in default).
+  const autoSummarize = useUi((s) => s.prefs.autoSummarize);
+  const setPref = useUi((s) => s.setPref);
   const [provider, setProvider] = useState<AiProvider>("anthropic");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [savedPrompt, setSavedPrompt] = useState("");
+  // The built-in prompt, fetched so the editor's placeholder shows exactly
+  // what runs when the user's own prompt is empty.
+  const [defaultPrompt, setDefaultPrompt] = useState("");
   // Default engine + target language for translation. Empty lang = follow the UI
   // language until the user picks one.
   const [engine, setEngine] = useState<TranslateEngine>("llm");
@@ -2272,10 +2281,12 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
       api.getSetting("ai_api_key"),
       api.getSetting("ai_model"),
       api.getSetting("ai_base_url"),
+      api.getSetting("ai_summary_prompt"),
       api.getSetting("translate_engine"),
       api.getSetting("translate_target_lang"),
+      api.defaultSummaryPrompt().catch(() => ""),
     ])
-      .then(([p, k, m, b, eng, tl]) => {
+      .then(([p, k, m, b, sp, eng, tl, dp]) => {
         if (p === "openai" || p === "anthropic" || p === "deepseek")
           setProvider(p);
         if (k) {
@@ -2290,6 +2301,11 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           setBaseUrl(b);
           savedBaseUrl.current = b;
         }
+        if (sp) {
+          setPrompt(sp);
+          setSavedPrompt(sp);
+        }
+        if (typeof dp === "string") setDefaultPrompt(dp);
         if (eng === "google" || eng === "deepl" || eng === "bing" || eng === "llm")
           setEngine(eng);
         if (tl) setTranslateLang(tl);
@@ -2430,6 +2446,53 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           )}
         </div>
       </Row>
+      <Row
+        label={t("settings.advanced.autoSummarize")}
+        desc={t("settings.advanced.autoSummarizeDesc")}
+      >
+        <Toggle
+          checked={autoSummarize}
+          onChange={(v) => setPref({ autoSummarize: v })}
+        />
+      </Row>
+      <div className="ai-prompt">
+        <div className="ai-prompt-label">
+          <span>{t("settings.advanced.aiPromptLabel")}</span>
+          <button
+            className="s-btn"
+            type="button"
+            disabled={!prompt && savedPrompt === ""}
+            onClick={() => {
+              // Reset to the built-in default: clear the editor and the
+              // stored key — the backend then runs the default prompt again.
+              setPrompt("");
+              setSavedPrompt("");
+              save("ai_summary_prompt", "", t("settings.advanced.aiPromptLabel"));
+            }}
+          >
+            {t("settings.advanced.aiPromptReset")}
+          </button>
+        </div>
+        <p className="settings-group-desc">{t("settings.advanced.aiPromptDesc")}</p>
+        <textarea
+          className="rule-input ai-prompt-input"
+          {...NO_AUTOCORRECT}
+          value={prompt}
+          placeholder={defaultPrompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          onBlur={() => {
+            // Trim before persisting; an empty prompt clears the key so the
+            // built-in default runs again.
+            const trimmed = prompt.trim();
+            if (trimmed !== prompt) setPrompt(trimmed);
+            if (trimmed !== savedPrompt) {
+              setSavedPrompt(trimmed);
+              save("ai_summary_prompt", trimmed, t("settings.advanced.aiPromptLabel"));
+            }
+          }}
+          rows={6}
+        />
+      </div>
       <Row
         label={t("settings.advanced.translateEngine")}
         desc={t("settings.advanced.translateEngineDesc")}

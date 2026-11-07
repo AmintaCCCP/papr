@@ -166,7 +166,6 @@
     "footerHint": "支持文章 · 订阅源 · 命令"
   },
   "reader": {
-    "resizeAi": "调整 AI 摘要面板宽度",
     "fullTextExtracted": "已提取全文",
     "linkCopied": "链接已复制",
     "ctxCopy": "复制",
@@ -215,7 +214,10 @@
     "lightboxHint": "滚动缩放 · 拖拽平移",
     "tbIntegration": "发送到 {{name}}",
     "integrationDone": "已保存到 {{name}}",
-    "integrationDoneWithLink": "已保存到 {{name}} — {{url}}"
+    "integrationDoneWithLink": "已保存到 {{name}} — {{url}}",
+    "aiCopy": "复制摘要",
+    "aiCopied": "摘要已复制",
+    "aiRegenerate": "重新生成摘要"
   },
   "settings": {
     "title": "设置",
@@ -599,6 +601,11 @@
       "aiTestDesc": "发送一次最小请求，验证密钥、Base URL 与模型是否可用",
       "aiTesting": "测试中…",
       "aiTestOk": "连接正常 · {{model}} · {{ms}}ms",
+      "autoSummarize": "打开文章时自动加载摘要",
+      "autoSummarizeDesc": "打开文章后立即显示 AI 摘要——已有缓存时即刻显示，否则在后台自动生成",
+      "aiPromptLabel": "摘要提示词",
+      "aiPromptDesc": "AI 生成摘要时遵循的指令。留空使用占位符中显示的默认提示词，修改后对新摘要生效",
+      "aiPromptReset": "恢复默认",
       "translateEngine": "翻译引擎",
       "translateEngineDesc": "翻译文章的默认引擎。LLM 使用上方的 AI 服务商；Google、DeepL、Bing 为独立服务。可在阅读界面按文章临时切换",
       "translateEngineLabel": "翻译引擎",
@@ -703,7 +710,8 @@
     "integrationNotConfigured": "该集成配置不完整——请在 设置 → 集成 中补全必填项",
     "integrationMethodInvalid": "Webhook 的 HTTP 方法不受支持",
     "integrationSchemeInvalid": "不允许使用该 URL Scheme",
-    "obsidianNoteExists": "Vault 中已存在同名笔记"
+    "obsidianNoteExists": "Vault 中已存在同名笔记",
+    "aiEmptyResponse": "服务商返回了空摘要——请检查模型与提示词"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

@@ -93,7 +93,6 @@ export default function App() {
   const readerWidth = useUi((s) => s.readerWidth);
   const sidebarWidth = useUi((s) => s.sidebarWidth);
   const listWidth = useUi((s) => s.listWidth);
-  const aiWidth = useUi((s) => s.aiWidth);
   const reduceMotion = useUi((s) => s.prefs.reduceMotion);
   const focusMode = useUi((s) => s.focusMode);
 
@@ -215,16 +214,15 @@ export default function App() {
     root.setProperty("--reader-width", `${readerWidth}px`);
   }, [readerFont, readerSize, readerLeading, readerWidth]);
 
-  // ── apply the draggable pane widths as the grid/drawer CSS variables ──
-  // These drive `.window`'s grid columns and the AI drawer's width; the resize
-  // handles write to the store, the store persists, and this mirrors the value
-  // back onto the document root.
+  // ── apply the draggable pane widths as the grid CSS variables ──
+  // These drive `.window`'s grid columns; the resize handles write to the
+  // store, the store persists, and this mirrors the value back onto the
+  // document root.
   useEffect(() => {
     const root = document.documentElement.style;
     root.setProperty("--col-sidebar", `${sidebarWidth}px`);
     root.setProperty("--col-list", `${listWidth}px`);
-    root.setProperty("--ai-width", `${aiWidth}px`);
-  }, [sidebarWidth, listWidth, aiWidth]);
+  }, [sidebarWidth, listWidth]);
 
   // ── toast ──
   // The store owns the queue; App owns only the dwell timer and the render.
@@ -340,6 +338,21 @@ export default function App() {
 
   const openSettings = (section?: string) => setSettings({ open: true, section });
 
+  // Toggle the AI summary card. The card renders inline in the reading view,
+  // so from the original-page view this first returns there — the same
+  // behavior as the reader toolbar button; toggling blind from the web view
+  // would flip state with no visible feedback and pop the card open later.
+  const toggleAiSummary = () => {
+    const st = useUi.getState();
+    if (st.selectedArticleId == null) return;
+    if (st.readerView === "web") {
+      st.setReaderView("reader");
+      st.setAiOpen(true);
+    } else {
+      st.setAiOpen(!st.aiOpen);
+    }
+  };
+
   // ── command-palette actions ──
   const handleCommand = (action: CommandAction) => {
     switch (action) {
@@ -352,10 +365,7 @@ export default function App() {
       case "toggle-focus":
         useUi.getState().setFocusMode(!useUi.getState().focusMode);
         break;
-      case "toggle-ai":
-        if (useUi.getState().selectedArticleId != null)
-          useUi.getState().setAiOpen(!useUi.getState().aiOpen);
-        break;
+      case "toggle-ai": toggleAiSummary(); break;
       case "refresh": doRefresh(); break;
       case "add-feed": setAddFeed(true); break;
       case "new-folder": setNewFolder(true); break;
@@ -439,7 +449,7 @@ export default function App() {
       // selected: without them here, j/k would navigate away (destroying the
       // overlay — and, for the toolbar, the live selection the user was about
       // to highlight), s/u/b would act on the article, and Escape would close
-      // the AI drawer instead of just the overlay.
+      // the summary card instead of just the overlay.
       if (
         document.querySelector(
           ".cp-backdrop, .settings-backdrop, .modal-backdrop, .ctx-menu, .tag-picker, .hl-popover, .hl-toolbar",
@@ -484,7 +494,7 @@ export default function App() {
         case "i":
           if (st.selectedArticleId != null) {
             e.preventDefault();
-            st.setAiOpen(!st.aiOpen);
+            toggleAiSummary();
           }
           break;
         case "f": e.preventDefault(); st.setFocusMode(!st.focusMode); break;

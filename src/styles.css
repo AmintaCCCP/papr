@@ -381,15 +381,6 @@ button { font-family: inherit; }
   z-index: 6;            /* above the panes, below modals/toasts */
   pointer-events: none;  /* only the handle itself is interactive */
 }
-.resize-handle-slot--inline {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 6;
-  width: 0;
-  pointer-events: none;
-}
 .resize-handle {
   position: absolute;
   top: 0;
@@ -1158,42 +1149,48 @@ button { font-family: inherit; }
 }
 .tag:hover { background: var(--accent-soft); color: var(--accent-ink); }
 
-/* AI summary drawer */
-.ai-drawer {
-  position: absolute;
-  top: 38px; right: 0; bottom: 0;
-  width: var(--ai-width, 360px);
+/* AI summary card — the inline block above the article body (Folo-style).
+   Rendered inside the reader's scroll flow, so it scrolls with the article. */
+.ai-card {
+  margin: 22px 0 6px;
   background: var(--panel);
-  border-left: 1px solid var(--hair);
-  transform: translateX(100%);
-  transition: transform .35s cubic-bezier(.22,.61,.36,1);
-  z-index: 5;
-  display: flex;
-  flex-direction: column;
+  border: 1px solid var(--hair);
+  border-radius: 10px;
+  overflow: hidden;
 }
-.ai-drawer.open { transform: translateX(0); }
-.ai-head {
-  padding: 18px 20px 12px;
+.ai-card-head {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 9px 14px;
   border-bottom: 1px solid var(--hair);
+  background: var(--hover);
 }
-.ai-head h3 {
-  margin: 0;
-  font-size: 13px;
+.ai-card-title {
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.02em;
+  color: var(--ink-2);
 }
-.ai-head .accent-ico { color: var(--accent); display: inline-flex; }
-.ai-head .close { margin-left: auto; }
-.ai-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: 18px 20px;
+.ai-card-head .accent-ico { color: var(--accent); display: inline-flex; }
+.ai-card-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.ai-card-actions .tb-btn { width: 26px; height: 26px; }
+.ai-card-body {
+  padding: 14px 16px 16px;
   font-size: 13px;
   line-height: 1.6;
   color: var(--ink-2);
+}
+.ai-card-foot {
+  font-size: 11px;
+  color: var(--muted-2);
+  margin-top: 14px;
+  line-height: 1.5;
 }
 .ai-loading {
   display: inline-flex;
@@ -1223,6 +1220,29 @@ button { font-family: inherit; }
 }
 .ai-test-ok { color: var(--success); font-size: 12.5px; }
 .ai-test-err { color: var(--danger); font-size: 12.5px; }
+/* Settings: the editable AI summary prompt */
+.ai-prompt {
+  padding: 14px 0 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ai-prompt-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.ai-prompt-label span {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.ai-prompt-input {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
 .ai-dot {
   width: 6px; height: 6px;
   background: var(--accent);
