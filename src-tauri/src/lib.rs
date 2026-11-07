@@ -282,6 +282,7 @@ pub fn run() {
             commands::configure_ai_provider,
             commands::ai_test,
             commands::ai_summarize,
+            commands::default_summary_prompt,
             commands::ai_ask,
             commands::ai_digest,
             commands::ai_translate,

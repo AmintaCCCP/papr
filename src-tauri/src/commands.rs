@@ -756,8 +756,45 @@ pub async fn configure_ai_provider(
 
 // ─────────────────────────── AI ───────────────────────────
 
+/// The built-in article-summary system prompt. Settings shows it as the
+/// prompt editor's placeholder; `ai_summarize` uses it whenever the user
+/// hasn't saved a custom `ai_summary_prompt`.
+pub(crate) const DEFAULT_SUMMARY_PROMPT: &str = "You are a sharp news editor. Summarize the article so a reader can \
+     decide whether to read it in full.\n\n\
+     Format the response in markdown using exactly this shape:\n\
+     **TL;DR** — One sentence capturing the single most important point.\n\n\
+     - Key fact, finding, or claim (under ~20 words)\n\
+     - Another key point\n\
+     - 3 to 5 bullets total, one idea each, no nested bullets\n\n\
+     Output only this structure. No preamble, no closing remarks, no \
+     section headers, no extra prose.";
+
+/// The system prompt the article summary runs with: the user's saved
+/// `ai_summary_prompt` when one is set (Settings → AI), else the built-in
+/// default — both with the response-language directive appended so output
+/// follows the UI language. Shared by the reader's streaming summarize and
+/// the integrations' on-demand generation so a custom prompt applies to both.
+pub(crate) fn summary_system_prompt(conn: &rusqlite::Connection) -> String {
+    let custom = db::get_setting(conn, "ai_summary_prompt")
+        .ok()
+        .flatten()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    format!(
+        "{}{}",
+        custom.unwrap_or_else(|| DEFAULT_SUMMARY_PROMPT.to_string()),
+        response_language(conn)
+    )
+}
+
+/// The user turn for an article summary — the title plus the body, truncated
+/// to keep the request within the token budget.
+pub(crate) fn summary_user_turn(title: &str, body: &str) -> String {
+    format!("Title: {title}\n\n{}", truncate(body, 8000))
+}
+
 /// Load the AI provider configuration from the settings table.
-fn load_ai_config(conn: &rusqlite::Connection) -> AppResult<AiConfig> {
+pub(crate) fn load_ai_config(conn: &rusqlite::Connection) -> AppResult<AiConfig> {
     AiConfig::new(
         db::get_setting(conn, "ai_provider")?,
         db::get_setting(conn, "ai_api_key")?,
@@ -867,16 +904,18 @@ pub async fn ai_test(
 }
 
 /// Stream an AI summary of one article; the full summary is also persisted.
+/// The system prompt comes from the user's saved `ai_summary_prompt` when one
+/// is set, else the built-in default (`summary_system_prompt`).
 #[tauri::command]
 pub async fn ai_summarize(
     state: State<'_, AppState>,
     article_id: i64,
     on_token: Channel<AiEvent>,
 ) -> AppResult<()> {
-    let (title, body, cfg, lang) = {
+    let (title, body, cfg, system) = {
         let conn = state.read().await;
         let (title, body) = db::article_text(&conn, article_id)?;
-        (title, body, load_ai_config(&conn)?, response_language(&conn))
+        (title, body, load_ai_config(&conn)?, summary_system_prompt(&conn))
     };
     // A title-only item (link-aggregator posts, some podcast/video feeds carry
     // no body text) gives the model nothing to summarize. Without this guard it
@@ -886,21 +925,10 @@ pub async fn ai_summarize(
     if body.trim().is_empty() {
         return Err(AppError::code("noArticleBody"));
     }
-    // The drawer renders the response as markdown (.ai-prose styles paragraphs,
-    // bullets, and bold), so we ask for structured output instead of a single
-    // dense paragraph — the reader can scan a TL;DR + bullets far faster.
-    let system = format!(
-        "You are a sharp news editor. Summarize the article so a reader can \
-         decide whether to read it in full.\n\n\
-         Format the response in markdown using exactly this shape:\n\
-         **TL;DR** — One sentence capturing the single most important point.\n\n\
-         - Key fact, finding, or claim (under ~20 words)\n\
-         - Another key point\n\
-         - 3 to 5 bullets total, one idea each, no nested bullets\n\n\
-         Output only this structure. No preamble, no closing remarks, no \
-         section headers, no extra prose.{lang}"
-    );
-    let user = format!("Title: {title}\n\n{}", truncate(&body, 8000));
+    // The summary card renders the response as markdown (.ai-prose styles
+    // paragraphs, bullets, and bold), so the default prompt asks for
+    // structured output — a custom prompt decides its own shape.
+    let user = summary_user_turn(&title, &body);
 
     let http = state.http();
     let outcome = stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::MAX_TOKENS).await?;
@@ -913,6 +941,13 @@ pub async fn ai_summarize(
         db::set_ai_summary(&conn, article_id, outcome.text.trim())?;
     }
     Ok(())
+}
+
+/// The built-in summary prompt for the settings UI — the prompt editor shows
+/// it as the placeholder so the user can see and start from the default.
+#[tauri::command]
+pub fn default_summary_prompt() -> &'static str {
+    DEFAULT_SUMMARY_PROMPT
 }
 
 /// Answer a question using the user's subscribed articles as RAG context.
@@ -1750,6 +1785,40 @@ pub async fn delete_highlight(state: State<'_, AppState>, id: i64) -> AppResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    // --- summary prompt: custom-prompt fallback + language directive ---
+
+    #[test]
+    fn summary_system_prompt_falls_back_to_the_default() {
+        let conn = crate::db::open(Path::new(":memory:")).unwrap();
+        // No `ai_summary_prompt` saved — the built-in default with the
+        // response-language directive appended.
+        let got = summary_system_prompt(&conn);
+        assert!(got.starts_with(DEFAULT_SUMMARY_PROMPT));
+        assert!(got.ends_with("\n\nAlways write your response in English."));
+    }
+
+    #[test]
+    fn summary_system_prompt_prefers_a_saved_custom_prompt() {
+        let conn = crate::db::open(Path::new(":memory:")).unwrap();
+        // A blank / whitespace-only saved prompt is treated as unset — the
+        // settings editor clears the key on save, so this path only guards
+        // against a stale empty value.
+        db::set_setting(&conn, "ai_summary_prompt", "   ").unwrap();
+        assert!(summary_system_prompt(&conn).starts_with(DEFAULT_SUMMARY_PROMPT));
+        db::set_setting(&conn, "ai_summary_prompt", "  Bullet three takeaways.  ")
+            .unwrap();
+        assert_eq!(
+            summary_system_prompt(&conn),
+            "Bullet three takeaways.\n\nAlways write your response in English."
+        );
+    }
+
+    #[test]
+    fn summary_user_turn_embeds_title_and_body() {
+        assert_eq!(summary_user_turn("Title", "Body text"), "Title: Title\n\nBody text");
+    }
 
     // --- preview-translation helpers: the plain-text round-trip the list uses ---
 

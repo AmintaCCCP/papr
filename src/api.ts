@@ -204,6 +204,11 @@ export const getSetting = (key: string) =>
 export const setSetting = (key: string, value: string) =>
   invoke<void>("set_setting", { key, value });
 
+/** The built-in article-summary system prompt — the prompt editor's
+ *  placeholder, so the user can see (and start from) the default. */
+export const defaultSummaryPrompt = () =>
+  invoke<string>("default_summary_prompt");
+
 // ── AI ──
 /** What a successful `testAi` round trip saw (mirrors `ai::TestOutcome`). */
 export interface AiTestOutcome {

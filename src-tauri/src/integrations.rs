@@ -74,7 +74,7 @@ pub async fn run_integration(
 ) -> AppResult<RunOutcome> {
     // Load the article (plus its feed's URL for the Obsidian frontmatter)
     // behind a short-lived read lock; the network work below needs none.
-    let (article, feed_url) = {
+    let (mut article, feed_url) = {
         let conn = state.read().await;
         let article = crate::db::get_article(&conn, article_id)?;
         let feed_url = match kind == "obsidian" {
@@ -88,11 +88,68 @@ pub async fn run_integration(
         };
         (article, feed_url)
     };
+    // "AI summary as description" (Folo's `generateSummary` on-demand flow):
+    // with the preference on, an article that has no summary yet gets one
+    // generated right here, before the send — so the description the service
+    // receives is a real summary instead of the plain-text excerpt fallback.
+    // A failure fails the whole send loudly rather than silently saving a
+    // non-summary description.
+    if use_ai_summary && article.ai_summary.as_deref().map_or(true, |s| s.trim().is_empty()) {
+        ensure_ai_summary(&state, &mut article).await?;
+    }
     let ctx = ArticleContext::build(article, feed_url).await?;
 
     let client = state.http();
     let url = dispatch(&app, &client, &kind, use_ai_summary, &config, &ctx).await?;
     Ok(RunOutcome { url })
+}
+
+/// Generate, persist, and store on `article` the AI summary used as the
+/// description when the "AI summary as description" preference is on and the
+/// article has none yet. Shares the reader's summary prompt
+/// (`commands::summary_system_prompt`), so a custom prompt set in Settings
+/// shapes both paths identically, and the persisted result is cached the same
+/// way — the next reader open (or send) shows it without spending another
+/// API call. Runs off the connection lock: the completion is network work.
+async fn ensure_ai_summary(
+    state: &State<'_, AppState>,
+    article: &mut ArticleDetail,
+) -> AppResult<()> {
+    let (cfg, system, user) = {
+        let conn = state.read().await;
+        let (title, body) = crate::db::article_text(&conn, article.id)?;
+        let cfg = crate::commands::load_ai_config(&conn)?;
+        // A title-only item gives the model nothing to summarize and the
+        // reader's summarize bails with the same error — mirror it so the
+        // failure is explicit instead of a fabricated summary from the title.
+        if body.trim().is_empty() {
+            return Err(AppError::code("noArticleBody"));
+        }
+        (
+            cfg,
+            crate::commands::summary_system_prompt(&conn),
+            crate::commands::summary_user_turn(&title, &body),
+        )
+    };
+    let http = state.http();
+    let text = crate::ai::complete_chat(
+        &http,
+        &cfg,
+        &system,
+        &user,
+        crate::ai::MAX_TOKENS,
+    )
+    .await?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AppError::code("aiEmptyResponse"));
+    }
+    {
+        let conn = state.db.lock().await;
+        crate::db::set_ai_summary(&conn, article.id, text)?;
+    }
+    article.ai_summary = Some(text.to_string());
+    Ok(())
 }
 
 /// Send the article through the integration `kind` names. Returns a

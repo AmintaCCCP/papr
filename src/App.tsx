@@ -93,7 +93,6 @@ export default function App() {
   const readerWidth = useUi((s) => s.readerWidth);
   const sidebarWidth = useUi((s) => s.sidebarWidth);
   const listWidth = useUi((s) => s.listWidth);
-  const aiWidth = useUi((s) => s.aiWidth);
   const reduceMotion = useUi((s) => s.prefs.reduceMotion);
   const focusMode = useUi((s) => s.focusMode);
 
@@ -215,16 +214,15 @@ export default function App() {
     root.setProperty("--reader-width", `${readerWidth}px`);
   }, [readerFont, readerSize, readerLeading, readerWidth]);
 
-  // ── apply the draggable pane widths as the grid/drawer CSS variables ──
-  // These drive `.window`'s grid columns and the AI drawer's width; the resize
-  // handles write to the store, the store persists, and this mirrors the value
-  // back onto the document root.
+  // ── apply the draggable pane widths as the grid CSS variables ──
+  // These drive `.window`'s grid columns; the resize handles write to the
+  // store, the store persists, and this mirrors the value back onto the
+  // document root.
   useEffect(() => {
     const root = document.documentElement.style;
     root.setProperty("--col-sidebar", `${sidebarWidth}px`);
     root.setProperty("--col-list", `${listWidth}px`);
-    root.setProperty("--ai-width", `${aiWidth}px`);
-  }, [sidebarWidth, listWidth, aiWidth]);
+  }, [sidebarWidth, listWidth]);
 
   // ── toast ──
   // The store owns the queue; App owns only the dwell timer and the render.
@@ -439,7 +437,7 @@ export default function App() {
       // selected: without them here, j/k would navigate away (destroying the
       // overlay — and, for the toolbar, the live selection the user was about
       // to highlight), s/u/b would act on the article, and Escape would close
-      // the AI drawer instead of just the overlay.
+      // the summary card instead of just the overlay.
       if (
         document.querySelector(
           ".cp-backdrop, .settings-backdrop, .modal-backdrop, .ctx-menu, .tag-picker, .hl-popover, .hl-toolbar",

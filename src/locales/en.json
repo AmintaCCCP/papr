@@ -166,7 +166,6 @@
     "footerHint": "Articles · Feeds · Commands"
   },
   "reader": {
-    "resizeAi": "Resize AI summary panel",
     "fullTextExtracted": "Full text extracted",
     "linkCopied": "Link copied",
     "ctxCopy": "Copy",
@@ -215,7 +214,9 @@
     "lightboxHint": "Scroll to zoom · Drag to pan",
     "tbIntegration": "Send to {{name}}",
     "integrationDone": "Saved to {{name}}",
-    "integrationDoneWithLink": "Saved to {{name}} — {{url}}"
+    "integrationDoneWithLink": "Saved to {{name}} — {{url}}",
+    "aiCopied": "Summary copied",
+    "aiRegenerate": "Regenerate summary"
   },
   "settings": {
     "title": "Settings",
@@ -599,6 +600,11 @@
       "aiTestDesc": "Send one minimal request to check the key, Base URL and model",
       "aiTesting": "Testing…",
       "aiTestOk": "Connected · {{model}} · {{ms}} ms",
+      "autoSummarize": "Auto-load summary on open",
+      "autoSummarizeDesc": "Show the AI summary as soon as an article opens — a cached one appears instantly, a new one is generated in the background",
+      "aiPromptLabel": "Summary prompt",
+      "aiPromptDesc": "The instruction the AI follows when summarizing. Leave empty to use the default shown as the placeholder; changes apply to newly generated summaries",
+      "aiPromptReset": "Reset to default",
       "translateEngine": "Translation engine",
       "translateEngineDesc": "Default engine for translating articles. LLM uses the AI provider above; Google, DeepL and Bing are standalone services. You can switch it per article from the reader",
       "translateEngineLabel": "Translation engine",
@@ -703,7 +709,8 @@
     "integrationNotConfigured": "This integration is not fully configured — fill in its fields in Settings → Integrations",
     "integrationMethodInvalid": "The webhook's HTTP method is not supported",
     "integrationSchemeInvalid": "This URL scheme is not allowed",
-    "obsidianNoteExists": "A note with this name already exists in the vault"
+    "obsidianNoteExists": "A note with this name already exists in the vault",
+    "aiEmptyResponse": "The provider returned an empty summary — check the model and prompt"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",
