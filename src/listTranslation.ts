@@ -1,6 +1,8 @@
-// Viewport-driven list-row translation jobs. Unlike the reader's body
-// translation store, these jobs translate only title/snippet previews and are
-// scheduled as virtualized rows become visible.
+// List-row translation jobs for the article currently open in the reader.
+// Unlike the reader's body-translation store, these jobs translate only the
+// title/snippet preview. The article list enqueues just the opened row —
+// translating whole viewports in the background hammered rate-limited engines
+// (Google) with one request per visible row until they answered 429.
 
 import { create } from "zustand";
 import * as api from "./api";
@@ -24,7 +26,7 @@ export interface ListTranslationJob {
 
 interface ListTranslationState {
   jobs: Record<string, ListTranslationJob>;
-  enqueueVisible: (articles: ArticleSummary[], lang: string, engine: string) => void;
+  enqueue: (articles: ArticleSummary[], lang: string, engine: string) => void;
 }
 
 const MAX_CONCURRENT = 3;
@@ -124,7 +126,7 @@ export const useListTranslation = create<ListTranslationState>((set, get) => {
   return {
     jobs: {},
 
-    enqueueVisible: (articles, lang, engine) => {
+    enqueue: (articles, lang, engine) => {
       const targetLang = lang.trim();
       if (!targetLang) return;
 

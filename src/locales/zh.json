@@ -133,7 +133,7 @@
     "translateMode": "列表翻译",
     "translateOff": "列表显示原文",
     "translateOffShort": "原文",
-    "translateAuto": "列表自动翻译",
+    "translateAuto": "仅翻译当前打开的文章",
     "translateAutoShort": "自动译",
     "translateStatusLoading": "翻译中…",
     "hideRead": "隐藏已读 (V)",

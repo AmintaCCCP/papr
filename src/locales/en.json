@@ -133,7 +133,7 @@
     "translateMode": "List translation",
     "translateOff": "Show originals in the list",
     "translateOffShort": "Original",
-    "translateAuto": "Auto-translate list items",
+    "translateAuto": "Translate the opened article",
     "translateAutoShort": "Auto",
     "translateStatusLoading": "Translating…",
     "hideRead": "Hide read (V)",
