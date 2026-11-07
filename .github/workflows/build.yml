@@ -105,30 +105,66 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Tauri's CLI treats empty-but-set signing env vars as "provided":
+      # an empty APPLE_CERTIFICATE makes it run `security import` on nothing
+      # (macOS bundle fails), and an empty TAURI_SIGNING_PRIVATE_KEY breaks
+      # updater-artifact signing (every platform fails). So instead of
+      # mapping secrets straight into env, export them via GITHUB_ENV only
+      # when actually configured, and drop updater artifacts when the
+      # signing key is absent so test builds can complete ad-hoc.
+      - name: Resolve signing environment
+        shell: bash
+        env:
+          IN_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          IN_SIGNING_KEY_PW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          IN_CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          IN_CERT_PW: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          IN_KEYCHAIN_PW: ${{ secrets.KEYCHAIN_PASSWORD }}
+          IN_APPLE_ID: ${{ secrets.APPLE_ID }}
+          IN_APPLE_PW: ${{ secrets.APPLE_PASSWORD }}
+          IN_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # Multi-line values (the minisign key, the base64 p12) go through
+          # the heredoc form of GITHUB_ENV.
+          export_value() {
+            echo "$2<<__SECRET_EOF__" >> "$GITHUB_ENV"
+            printf '%s\n' "$1" >> "$GITHUB_ENV"
+            echo "__SECRET_EOF__" >> "$GITHUB_ENV"
+          }
+
+          if [ -n "$IN_SIGNING_KEY" ]; then
+            export_value "$IN_SIGNING_KEY" TAURI_SIGNING_PRIVATE_KEY
+            export_value "$IN_SIGNING_KEY_PW" TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          else
+            # No updater key configured — disable createUpdaterArtifacts so
+            # the build still completes; bundles stay unsigned for the updater.
+            echo 'EXTRA_BUILD_ARGS=--config {"bundle":{"createUpdaterArtifacts":false}}' >> "$GITHUB_ENV"
+          fi
+
+          # The whole Apple signing/notarization set only matters when a
+          # certificate exists; notarization never runs on ad-hoc builds.
+          if [ -n "$IN_CERT" ]; then
+            export_value "$IN_CERT" APPLE_CERTIFICATE
+            export_value "$IN_CERT_PW" APPLE_CERTIFICATE_PASSWORD
+            export_value "$IN_IDENTITY" APPLE_SIGNING_IDENTITY
+            export_value "$IN_KEYCHAIN_PW" KEYCHAIN_PASSWORD
+            export_value "$IN_APPLE_ID" APPLE_ID
+            export_value "$IN_APPLE_PW" APPLE_PASSWORD
+            export_value "$IN_TEAM" APPLE_TEAM_ID
+          fi
+
       # No tagName / releaseName — tauri-action builds the bundles and stops
-      # there; no GitHub release is created or touched.
+      # there; no GitHub release is created or touched. When the updater key
+      # is configured, test builds sign exactly like release builds do.
       - name: Build desktop bundles
         id: build
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater signing — the bundle config enables createUpdaterArtifacts,
-          # so the build refuses to run without this key. Passing it here means
-          # test builds sign exactly like release builds do.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS code signing + notarization — empty values are simply
-          # ignored by tauri-action on runners/secrets where they are absent,
-          # yielding ad-hoc (unsigned) local-test builds.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          args: ${{ matrix.platform == 'macos-latest' && format('--target {0}', matrix.target) || '' }}
+          args: ${{ (matrix.platform == 'macos-latest' && format('--target {0} ', matrix.target) || '') }}${{ env.EXTRA_BUILD_ARGS }}
 
       - name: Upload bundles
         uses: actions/upload-artifact@v4
