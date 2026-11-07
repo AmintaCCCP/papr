@@ -1,11 +1,16 @@
 name: Build
 
-# On-demand desktop packaging: builds the Tauri bundles (dmg/app, msi/nsis,
-# AppImage/deb) for the chosen platform and uploads them as workflow
-# artifacts. No release is created — dispatch it to verify packaging works
-# or to grab an installable build of any branch.
+# Desktop packaging: builds the Tauri bundles (dmg/app, msi/nsis, AppImage/
+# deb) for every platform and uploads them as workflow artifacts. No release
+# is created — every push to any branch gets a compiled client per target,
+# and the workflow can still be dispatched manually to package a subset of
+# platforms or to grab an installable build of a specific branch.
 
 on:
+  # Every commit, on every branch (`**` covers branch names with slashes).
+  # Tag pushes are excluded — the Release workflow owns those.
+  push:
+    branches: ["**"]
   workflow_dispatch:
     inputs:
       platforms:
@@ -17,6 +22,13 @@ on:
           - macos
           - linux
           - windows
+
+# A second push to the same branch while its build is still running cancels
+# the older one — four runner legs of cargo compilation only to be superseded
+# seconds later is pure waste.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Resolve the picker into the matrix legs. Kept as its own job because the
@@ -50,7 +62,8 @@ jobs:
             windows)
               matrix='[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}]'
               ;;
-            all)
+            # Push events carry no input at all — same as picking "all".
+            all | "")
               matrix=$all
               ;;
             *)
