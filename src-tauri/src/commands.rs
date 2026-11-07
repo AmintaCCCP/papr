@@ -7,12 +7,14 @@ use crate::error::{AppError, AppResult};
 use crate::extraction;
 use crate::ingestion::discovery::{self, DiscoveryResult};
 use crate::ingestion::newsletter::{self, NewsletterConfig};
+use crate::ingestion::parsers;
 use crate::ingestion::sources::{self, Normalized};
 use crate::ingestion::{fetch, parse};
+
 use crate::models::*;
-use crate::scheduler;
 use crate::opml;
 use crate::sanitize;
+use crate::scheduler;
 use crate::state::AppState;
 use crate::translate;
 use serde::{Deserialize, Serialize};
@@ -85,7 +87,11 @@ pub async fn add_feed(
     // expansion is a plain HTTP feed URL, so the rest of the pipeline handles
     // it with no further special-casing. Only touch the DB when it's actually
     // an rsshub link, so the common case pays nothing.
-    let url = if url.trim().get(..9).is_some_and(|s| s.eq_ignore_ascii_case("rsshub://")) {
+    let url = if url
+        .trim()
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rsshub://"))
+    {
         let instance = {
             let conn = state.db.lock().await;
             db::get_setting(&conn, "rsshub_instance")?
@@ -117,6 +123,12 @@ pub async fn add_feed(
             Normalized::Untouched => (url.clone(), None),
         };
 
+    // An X profile URL never reaches the feed-document fetch/parse below: the
+    // built-in X parser produces the feed data instead (see `add_x_feed`).
+    if forced_type == Some(SourceType::X) {
+        return add_x_feed(state, &effective_url, folder_id).await;
+    }
+
     // Step 1: fetch whatever the user gave us (or the normalized feed URL).
     let (bytes, ct, final_url) = fetch::get(&client, &effective_url).await?;
 
@@ -139,11 +151,7 @@ pub async fn add_feed(
     let parsed = parse::parse_feed(&feed_bytes, &feed_url)?;
     let source_type = match forced_type {
         Some(t) => t,
-        None => parse::refine_source_type(
-            parse::detect_source_type(&feed_url),
-            &parsed,
-            &feed_url,
-        ),
+        None => parse::refine_source_type(parse::detect_source_type(&feed_url), &parsed, &feed_url),
     };
 
     let title = parsed
@@ -214,6 +222,149 @@ pub async fn add_feed(
         refresh_interval_min: None,
         auto_translate: false,
         open_mode: None,
+    })
+}
+
+/// The X-parser add flow: `https://x.com/<handle>` → the built-in parser's
+/// timeline page → a feed row (`source_type = 'x'`) plus the newest tweets as
+/// articles. Credentials are required — there is no unauthenticated fallback,
+/// so a missing configuration is a hard, coded error.
+///
+/// The gate order matters: enabled → not subscribed → credentials, so each
+/// failure names the one thing the user must fix.
+async fn add_x_feed(
+    state: State<'_, AppState>,
+    feed_url: &str,
+    folder_id: Option<i64>,
+) -> AppResult<Feed> {
+    // Enabled + duplicate checks come from the read pool; only the persist
+    // step below takes the writer.
+    {
+        let conn = state.read().await;
+        if !parsers::parser_enabled(&conn, parsers::X) {
+            return Err(AppError::code("parserDisabled"));
+        }
+        if db::find_feed_by_url(&conn, feed_url)?.is_some() {
+            return Err(AppError::code("alreadySubscribed"));
+        }
+    }
+    let (auth_token, ct0) = {
+        let conn = state.read().await;
+        parsers::x_credentials(&conn)
+    }
+    .ok_or_else(|| AppError::code(parsers::x::CODE_AUTH_REQUIRED))?;
+    let handle = parsers::x::handle_from_feed_url(feed_url)
+        .ok_or_else(|| AppError::code(parsers::x::CODE_HANDLE_INVALID))?;
+
+    let client = state.http();
+    let mut parser_state = {
+        let conn = state.read().await;
+        parsers::x::XState::load(&conn)
+    };
+    let page =
+        parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
+            .await
+            .map_err(parsers::x::XError::into_app_error)?;
+
+    let conn = state.db.lock().await;
+    // Persist the caches next to the feed row. Not one atomic transaction —
+    // a cache write that commits before a failed insert is harmless (the
+    // caches are accelerators), so the simplicity wins.
+    parser_state.save(&conn);
+    // 用户名 as both feed and article title, per the parser's contract. The
+    // avatar doubles as the favicon (a favicon request to x.com would need
+    // the same cookies anyway).
+    let feed_id = db::insert_feed(
+        &conn,
+        feed_url,
+        Some(feed_url),
+        &handle,
+        page.profile.bio.as_deref(),
+        SourceType::X,
+        folder_id,
+    )?;
+    if let Some(avatar) = &page.profile.avatar {
+        db::update_feed_meta(&conn, feed_id, None, None, None, Some(avatar))?;
+    }
+    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let rules = db::active_rules(&conn).unwrap_or_default();
+    for tweet in &page.tweets {
+        let article = parsers::x::tweet_to_article(tweet);
+        db::upsert_article(&conn, feed_id, &article, dedup, &rules)?;
+    }
+    // Count actual unread rows rather than tallying insertions — a filter
+    // rule may pre-mark fetched tweets read, and the returned `unread_count`
+    // must agree with the sidebar's `list_feeds` count (same reasoning as
+    // `add_feed`).
+    let unread = db::count_feed_unread(&conn, feed_id)?;
+    // The timeline fetch above is a genuine refresh — record it so the
+    // scheduler does not immediately re-fetch (mirrors `add_feed`).
+    let _ = db::touch_feed(&conn, feed_id);
+    let last_fetched_at = db::feed_last_fetched(&conn, feed_id).ok().flatten();
+    drop(conn);
+
+    Ok(Feed {
+        id: feed_id,
+        feed_url: feed_url.to_string(),
+        site_url: Some(feed_url.to_string()),
+        title: handle,
+        description: page.profile.bio,
+        favicon_url: page.profile.avatar,
+        folder_id,
+        source_type: SourceType::X.as_str().to_string(),
+        last_fetched_at,
+        fetch_error: None,
+        unread_count: unread,
+        refresh_interval_min: None,
+        auto_translate: false,
+        open_mode: None,
+    })
+}
+
+/// Result of the settings "test connection" probe for one parser.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParserTestResult {
+    /// Tweets fetched from the probe handle's timeline.
+    pub article_count: usize,
+}
+
+/// Validate a parser's configuration with a real upstream round-trip. For the
+/// X parser this fetches `handle`'s latest timeline page; success means the
+/// cookies work and the queryId chain resolved. Errors surface as coded
+/// errors the frontend localises (`xAuthInvalid`, `xBlocked`, …).
+#[tauri::command]
+pub async fn test_parser(
+    state: State<'_, AppState>,
+    id: String,
+    handle: String,
+) -> AppResult<ParserTestResult> {
+    if id != parsers::X {
+        return Err(AppError::code("parserUnknown"));
+    }
+    let handle = parsers::x::sanitize_handle_input(&handle)
+        .ok_or_else(|| AppError::code(parsers::x::CODE_HANDLE_INVALID))?;
+    let (auth_token, ct0) = {
+        let conn = state.read().await;
+        parsers::x_credentials(&conn)
+    }
+    .ok_or_else(|| AppError::code(parsers::x::CODE_AUTH_REQUIRED))?;
+
+    let client = state.http();
+    let mut parser_state = {
+        let conn = state.read().await;
+        parsers::x::XState::load(&conn)
+    };
+    let page =
+        parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
+            .await
+            .map_err(parsers::x::XError::into_app_error)?;
+    {
+        let conn = state.db.lock().await;
+        parser_state.save(&conn);
+    }
+    Ok(ParserTestResult {
+        article_count: page.tweets.len(),
     })
 }
 
@@ -598,11 +749,7 @@ pub async fn fetch_image(
 /// Returns `false` when the user cancels the dialog; the frontend shows a
 /// success toast only when a file was actually written.
 #[tauri::command]
-pub async fn save_image(
-    app: AppHandle,
-    url: String,
-    page_url: Option<String>,
-) -> AppResult<bool> {
+pub async fn save_image(app: AppHandle, url: String, page_url: Option<String>) -> AppResult<bool> {
     // Fetch first: a failed or unsupported URL errors out without ever showing
     // a dangling save dialog.
     let http = app.state::<AppState>().http();
@@ -612,7 +759,9 @@ pub async fn save_image(
         .file()
         .add_filter(
             "Image",
-            &["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico"],
+            &[
+                "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico",
+            ],
         )
         .set_file_name(image_filename(&url))
         .blocking_save_file();
@@ -681,8 +830,7 @@ pub async fn import_opml(app: AppHandle, content: String) -> AppResult<usize> {
     // skipping and leaving the imported feeds empty until the next tick.
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ =
-            scheduler::refresh_all(&app2, None, true, scheduler::RefreshScope::All).await;
+        let _ = scheduler::refresh_all(&app2, None, true, scheduler::RefreshScope::All).await;
     });
     Ok(count)
 }
@@ -718,11 +866,17 @@ pub async fn save_text_file(
     extensions: Vec<String>,
 ) -> AppResult<bool> {
     let extensions: Vec<&str> = extensions.iter().map(String::as_str).collect();
-    let Some(path) = app.dialog().file()
+    let Some(path) = app
+        .dialog()
+        .file()
         .add_filter(filter_name, &extensions)
         .set_file_name(default_name)
-        .blocking_save_file() else { return Ok(false); };
-    let path = path.into_path()
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
         .map_err(|_| AppError::other("save dialog returned a non-file path"))?;
     write_bytes(path, content.into_bytes()).await?;
     Ok(true)
@@ -737,18 +891,17 @@ pub async fn get_setting(state: State<'_, AppState>, key: String) -> AppResult<O
 }
 
 #[tauri::command]
-pub async fn set_setting(
-    state: State<'_, AppState>,
-    key: String,
-    value: String,
-) -> AppResult<()> {
+pub async fn set_setting(state: State<'_, AppState>, key: String, value: String) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::set_setting(&conn, &key, &value)
 }
 
 #[tauri::command]
 pub async fn configure_ai_provider(
-    state: State<'_, AppState>, provider: String, model: Option<String>, base_url: Option<String>,
+    state: State<'_, AppState>,
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
 ) -> AppResult<(String, String)> {
     let conn = state.db.lock().await;
     db::configure_ai_provider(&conn, &provider, model.as_deref(), base_url.as_deref())
@@ -759,7 +912,8 @@ pub async fn configure_ai_provider(
 /// The built-in article-summary system prompt. Settings shows it as the
 /// prompt editor's placeholder; `ai_summarize` uses it whenever the user
 /// hasn't saved a custom `ai_summary_prompt`.
-pub(crate) const DEFAULT_SUMMARY_PROMPT: &str = "You are a sharp news editor. Summarize the article so a reader can \
+pub(crate) const DEFAULT_SUMMARY_PROMPT: &str =
+    "You are a sharp news editor. Summarize the article so a reader can \
      decide whether to read it in full.\n\n\
      Format the response in markdown using exactly this shape:\n\
      **TL;DR** — One sentence capturing the single most important point.\n\n\
@@ -915,7 +1069,12 @@ pub async fn ai_summarize(
     let (title, body, cfg, system) = {
         let conn = state.read().await;
         let (title, body) = db::article_text(&conn, article_id)?;
-        (title, body, load_ai_config(&conn)?, summary_system_prompt(&conn))
+        (
+            title,
+            body,
+            load_ai_config(&conn)?,
+            summary_system_prompt(&conn),
+        )
     };
     // A title-only item (link-aggregator posts, some podcast/video feeds carry
     // no body text) gives the model nothing to summarize. Without this guard it
@@ -997,10 +1156,7 @@ pub async fn ai_ask(
 
 /// Stream an AI briefing that synthesizes the most recent articles by theme.
 #[tauri::command]
-pub async fn ai_digest(
-    state: State<'_, AppState>,
-    on_token: Channel<AiEvent>,
-) -> AppResult<()> {
+pub async fn ai_digest(state: State<'_, AppState>, on_token: Channel<AiEvent>) -> AppResult<()> {
     let (cfg, articles, lang) = {
         let conn = state.read().await;
         (
@@ -1045,7 +1201,6 @@ pub enum TranslateEvent {
     /// The full sanitized translation, sent once on completion.
     Done { html: String },
 }
-
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1137,7 +1292,9 @@ pub async fn translate_article_preview(
     // tag" covers it, and a single prompt can never drift between the two paths.
     let system = translate::translate_system_prompt(translate::language_name(&target));
     let source = preview_translation_html(&title, &snippet);
-    let raw = backend.translate_batch(&http, &system, &source, &target).await?;
+    let raw = backend
+        .translate_batch(&http, &system, &source, &target)
+        .await?;
     let clean = sanitize::sanitize(raw.trim(), None);
     let translated_title = text_for_selector(&clean, "h1");
     let translated_snippet = text_for_selector(&clean, "p");
@@ -1226,7 +1383,9 @@ pub async fn ai_translate(
     let system = translate::translate_system_prompt(translate::language_name(&target));
     let mut full = String::new();
     for (i, batch) in batches.iter().enumerate() {
-        let raw = backend.translate_batch(&http, &system, batch, &target).await?;
+        let raw = backend
+            .translate_batch(&http, &system, batch, &target)
+            .await?;
         // Engine output (LLM or machine translation) is untrusted, so each batch
         // passes through the same sanitizer as feed HTML before it reaches the
         // webview or the database. Source URLs are already absolute (sanitized at
@@ -1234,7 +1393,10 @@ pub async fn ai_translate(
         let clean = sanitize::sanitize(raw.trim(), None);
         full.push_str(&clean);
         full.push('\n');
-        let _ = on_event.send(TranslateEvent::Batch { html: clean, done: i + 1 });
+        let _ = on_event.send(TranslateEvent::Batch {
+            html: clean,
+            done: i + 1,
+        });
     }
 
     let final_html = full.trim().to_string();
@@ -1343,8 +1505,15 @@ pub async fn freshrss_connect(
     provider: Option<String>,
 ) -> AppResult<()> {
     let state = app.state::<AppState>();
-    crate::sync::connect(&state.db, &state.http(), &url, &username, &password, provider.as_deref())
-        .await
+    crate::sync::connect(
+        &state.db,
+        &state.http(),
+        &url,
+        &username,
+        &password,
+        provider.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1422,11 +1591,7 @@ pub async fn rename_tag(state: State<'_, AppState>, id: i64, name: String) -> Ap
 }
 
 #[tauri::command]
-pub async fn set_tag_color(
-    state: State<'_, AppState>,
-    id: i64,
-    color: String,
-) -> AppResult<()> {
+pub async fn set_tag_color(state: State<'_, AppState>, id: i64, color: String) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::set_tag_color(&conn, id, &color)
 }
@@ -1489,7 +1654,16 @@ pub async fn update_rule(
         return Err(AppError::code("emptyRuleQuery"));
     }
     let conn = state.db.lock().await;
-    db::update_rule(&conn, id, name.trim(), enabled, feed_id, &field, query.trim(), &action)
+    db::update_rule(
+        &conn,
+        id,
+        name.trim(),
+        enabled,
+        feed_id,
+        &field,
+        query.trim(),
+        &action,
+    )
 }
 
 #[tauri::command]
@@ -1589,7 +1763,11 @@ pub async fn add_newsletter_source(
         password: input.password.clone(),
         folder: {
             let f = input.folder.trim();
-            if f.is_empty() { "INBOX".to_string() } else { f.to_string() }
+            if f.is_empty() {
+                "INBOX".to_string()
+            } else {
+                f.to_string()
+            }
         },
     };
     if cfg.host.is_empty() || cfg.username.is_empty() || cfg.password.is_empty() {
@@ -1626,8 +1804,9 @@ pub async fn add_newsletter_source(
     )
     .await
     {
-        Ok(joined) => joined
-            .map_err(|e| AppError::other(format!("newsletter poll task: {e}")))??,
+        Ok(joined) => {
+            joined.map_err(|e| AppError::other(format!("newsletter poll task: {e}")))??
+        }
         Err(_) => return Err(AppError::code("newsletterPollTimeout")),
     };
 
@@ -1695,10 +1874,7 @@ pub async fn list_newsletter_sources(
 
 /// Remove a newsletter source and all of its ingested articles.
 #[tauri::command]
-pub async fn remove_newsletter_source(
-    state: State<'_, AppState>,
-    feed_id: i64,
-) -> AppResult<()> {
+pub async fn remove_newsletter_source(state: State<'_, AppState>, feed_id: i64) -> AppResult<()> {
     let conn = state.db.lock().await;
     db::delete_newsletter_source(&conn, feed_id)
 }
@@ -1807,8 +1983,7 @@ mod tests {
         // against a stale empty value.
         db::set_setting(&conn, "ai_summary_prompt", "   ").unwrap();
         assert!(summary_system_prompt(&conn).starts_with(DEFAULT_SUMMARY_PROMPT));
-        db::set_setting(&conn, "ai_summary_prompt", "  Bullet three takeaways.  ")
-            .unwrap();
+        db::set_setting(&conn, "ai_summary_prompt", "  Bullet three takeaways.  ").unwrap();
         assert_eq!(
             summary_system_prompt(&conn),
             "Bullet three takeaways.\n\nAlways write your response in English."
@@ -1817,7 +1992,10 @@ mod tests {
 
     #[test]
     fn summary_user_turn_embeds_title_and_body() {
-        assert_eq!(summary_user_turn("Title", "Body text"), "Title: Title\n\nBody text");
+        assert_eq!(
+            summary_user_turn("Title", "Body text"),
+            "Title: Title\n\nBody text"
+        );
     }
 
     // --- preview-translation helpers: the plain-text round-trip the list uses ---

@@ -3,9 +3,7 @@
 
 use crate::db;
 use crate::error::{AppError, AppResult};
-use reqwest::header::{
-    CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
-};
+use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::{Client, StatusCode};
 use rusqlite::Connection;
 use std::time::Duration;
@@ -20,8 +18,11 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Read a response body, aborting if it exceeds `MAX_BODY_BYTES`. Streams in
 /// chunks so an unbounded (or lying-`Content-Length`) response can't first be
 /// buffered whole.
-async fn read_capped(mut resp: reqwest::Response) -> AppResult<Vec<u8>> {
-    if resp.content_length().is_some_and(|n| n > MAX_BODY_BYTES as u64) {
+pub(crate) async fn read_capped(mut resp: reqwest::Response) -> AppResult<Vec<u8>> {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_BODY_BYTES as u64)
+    {
         return Err(AppError::code("responseTooLarge"));
     }
     let mut buf: Vec<u8> = Vec::new();

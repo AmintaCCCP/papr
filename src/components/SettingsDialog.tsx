@@ -30,6 +30,16 @@ import {
   type IntegrationSettings,
 } from "../lib/integrations";
 import { feedHost } from "../lib/feedMeta";
+import {
+  PARSER_FIELDS,
+  PARSER_KEYS,
+  PARSER_META,
+  parseParsers,
+  parserReady,
+  type ParserConfig,
+  type ParserKey,
+  type ParsersSettings,
+} from "../lib/parsers";
 import { modKey, modCombo } from "../lib/platform";
 import { reportError } from "../toast";
 import { checkForUpdates } from "../lib/updater";
@@ -59,6 +69,7 @@ const SECTIONS: { id: string; labelKey: string; icon: IconName }[] = [
   { id: "filters", labelKey: "settings.nav.filters", icon: "mute" },
   { id: "sync", labelKey: "settings.nav.sync", icon: "refresh" },
   { id: "integrations", labelKey: "settings.nav.integrations", icon: "link" },
+  { id: "parsers", labelKey: "settings.nav.parsers", icon: "flask" },
   { id: "shortcuts", labelKey: "settings.nav.shortcuts", icon: "command" },
   { id: "notifications", labelKey: "settings.nav.notifications", icon: "inbox" },
   { id: "advanced", labelKey: "settings.nav.advanced", icon: "sort" },
@@ -120,6 +131,7 @@ export default function SettingsDialog({
     filters: t("settings.sub.filters"),
     sync: t("settings.sub.sync"),
     integrations: t("settings.sub.integrations"),
+    parsers: t("settings.sub.parsers"),
     shortcuts: t("settings.sub.shortcuts"),
     notifications: t("settings.sub.notifications"),
     advanced: t("settings.sub.advanced"),
@@ -188,6 +200,7 @@ export default function SettingsDialog({
             )}
             {section === "sync" && <SyncSection onToast={onToast} />}
             {section === "integrations" && <IntegrationsSection />}
+            {section === "parsers" && <ParsersSection />}
             {section === "shortcuts" && <ShortcutsSection />}
             {section === "notifications" && <NotificationsSection />}
             {section === "advanced" && <AdvancedSection onToast={onToast} />}
@@ -1557,6 +1570,265 @@ function IntegTextField({
         }}
       />
     </label>
+  );
+}
+
+/* ── parsers ─────────────────────────────────────────────── */
+// Built-in feed parsers (RSSHub-style routes): each recognizes a class of
+// URLs and produces feed data by talking to the site directly. Configuration
+// persists as one JSON blob under the `parsers` setting, read back by the
+// Rust ingestion side — the same shape/trade-off as the `integrations` blob.
+
+function ParsersSection() {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const settingsQ = useQuery({
+    queryKey: ["parsers"],
+    queryFn: () => api.getSetting("parsers"),
+  });
+  const settings = useMemo(
+    () => parseParsers(settingsQ.data ?? null),
+    [settingsQ.data],
+  );
+  const [configuring, setConfiguring] = useState<ParserKey | null>(null);
+
+  /** Persist a new blob. The query cache is patched optimistically first, so
+   *  edits that land before the refetch compose instead of clobbering. */
+  const update = (key: ParserKey, cfg: ParserConfig) => {
+    const next: ParsersSettings = { ...settings, [key]: cfg };
+    const blob = JSON.stringify(next);
+    qc.setQueryData(["parsers"], blob);
+    api
+      .setSetting("parsers", blob)
+      .then(() => qc.invalidateQueries({ queryKey: ["parsers"] }))
+      .catch((e) => {
+        reportError(e);
+        qc.invalidateQueries({ queryKey: ["parsers"] });
+      });
+  };
+
+  return (
+    <>
+      <div className="settings-group">
+        <h3 className="settings-group-title">{t("settings.parsers.title")}</h3>
+        <p className="settings-group-desc">{t("settings.parsers.intro")}</p>
+        {PARSER_KEYS.map((key) => (
+          <ParserCard
+            key={key}
+            idKey={key}
+            cfg={settings[key]}
+            onChange={(cfg) => update(key, cfg)}
+            onConfigure={() => setConfiguring(key)}
+          />
+        ))}
+      </div>
+      {configuring && (
+        <ParserSettingsModal
+          parserKey={configuring}
+          cfg={settings[configuring]}
+          onChange={(cfg) => update(configuring, cfg)}
+          onClose={() => setConfiguring(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/** One parser card: logo, status chip, gear (opens the credential dialog) and
+ *  the enable toggle. Enabling without credentials is allowed — the status
+ *  chip says so, and subscribing then fails with an actionable error. */
+function ParserCard({
+  idKey,
+  cfg,
+  onChange,
+  onConfigure,
+}: {
+  idKey: ParserKey;
+  cfg: ParserConfig;
+  onChange: (cfg: ParserConfig) => void;
+  onConfigure: () => void;
+}) {
+  const { t } = useTranslation();
+  const meta = PARSER_META[idKey];
+  const ready = parserReady(idKey, cfg);
+  return (
+    <div className="integ-card">
+      <div className="s-service">
+        <div className="logo" style={{ background: meta.color }}>
+          <span
+            style={{
+              color: "#fff",
+              fontWeight: 700,
+              fontSize: 15,
+              lineHeight: 1,
+            }}
+            aria-hidden="true"
+          >
+            {meta.glyph}
+          </span>
+        </div>
+        <div className="info">
+          <div className="title">{t(meta.nameKey)}</div>
+          <div className="desc">{t(meta.descKey)}</div>
+        </div>
+        <span className={`status ${ready ? "on" : ""}`}>
+          {t(
+            ready
+              ? "settings.integrations.configured"
+              : "settings.integrations.notConfigured",
+          )}
+        </span>
+        <button
+          className="icon-btn"
+          title={t("settings.integrations.configure")}
+          onClick={onConfigure}
+        >
+          <Icon name="settings" size={13} />
+        </button>
+        <Toggle
+          checked={cfg.enabled}
+          onChange={(v) => onChange({ ...cfg, enabled: v })}
+          aria-label={t(meta.nameKey)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** The parser's credential dialog: cookie fields, a real upstream "test
+ *  connection" probe, and a clear button. Fields commit on blur / Enter (the
+ *  same contract as the integrations fields), so closing the dialog keeps
+ *  whatever was committed. */
+function ParserSettingsModal({
+  parserKey,
+  cfg,
+  onChange,
+  onClose,
+}: {
+  parserKey: ParserKey;
+  cfg: ParserConfig;
+  onChange: (cfg: ParserConfig) => void;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
+  const meta = PARSER_META[parserKey];
+
+  const [testHandle, setTestHandle] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testOk, setTestOk] = useState(false);
+  const [testResult, setTestResult] = useState<string | null>(null);
+
+  // Escape must close the dialog regardless of which control has focus —
+  // an input-level handler dies as soon as the user tabs to a button.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+
+  const runTest = async () => {
+    const handle = testHandle.trim();
+    if (!handle || testing) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await api.testParser(parserKey, handle);
+      setTestOk(true);
+      setTestResult(t("settings.parsers.testOk", { count: res.articleCount }));
+    } catch (e) {
+      setTestOk(false);
+      setTestResult(errorText(e));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const clear = () => {
+    onChange({ ...cfg, authToken: undefined, ct0: undefined });
+    setTestOk(false);
+    setTestResult(null);
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="parser-dialog-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="parser-dialog-title">
+          {t(meta.nameKey)} · {t("settings.parsers.configure")}
+        </h2>
+        {PARSER_FIELDS[parserKey].map((f) => (
+          <IntegTextField
+            key={f.key}
+            label={t(`settings.parsers.field.${f.key}`)}
+            password={f.password}
+            value={cfg[f.key]}
+            onCommit={(v) => onChange({ ...cfg, [f.key]: v || undefined })}
+          />
+        ))}
+        <p className="integ-hint">{t("settings.parsers.cookieHint")}</p>
+
+        <div
+          style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}
+        >
+          <input
+            className="s-text-input"
+            style={{ flex: 1 }}
+            placeholder={t("settings.parsers.testHandlePlaceholder")}
+            aria-label={t("settings.parsers.testHandlePlaceholder")}
+            {...NO_AUTOCORRECT}
+            value={testHandle}
+            onChange={(e) => setTestHandle(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) runTest();
+            }}
+          />
+          <button
+            className="s-btn"
+            disabled={testing || !testHandle.trim()}
+            onClick={runTest}
+          >
+            {t(testing ? "settings.parsers.testing" : "settings.parsers.test")}
+          </button>
+        </div>
+        {testResult && (
+          <p
+            className="integ-hint"
+            style={{ color: testOk ? "var(--ok, #2E7D4F)" : "var(--danger, #CC2936)" }}
+          >
+            {testResult}
+          </p>
+        )}
+
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            justifyContent: "flex-end",
+            marginTop: 16,
+          }}
+        >
+          <button className="s-btn" onClick={clear}>
+            {t("settings.parsers.clear")}
+          </button>
+          <button className="s-btn primary" onClick={onClose}>
+            {t("common.done")}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -81,6 +81,18 @@ function SbItem({
   );
 }
 
+/** A feed's `fetch_error` for display: coded errors (`xAuthRequired`, …)
+ *  localize through `error.<code>`; free-form text (newsletter IMAP errors)
+ *  shows as-is — `t()` echoes the key when no translation exists. */
+function fetchErrorText(
+  code: string,
+  t: (key: string) => string,
+): string {
+  const key = `error.${code}`;
+  const msg = t(key);
+  return msg && msg !== key ? msg : code;
+}
+
 export default function Sidebar({
   onAddFeed,
   onExplore,
@@ -519,7 +531,7 @@ export default function Sidebar({
         e.preventDefault();
         setMenu({ x: e.clientX, y: e.clientY, kind: "feed", feed: f });
       }}
-      title={f.fetchError ?? f.title}
+      title={f.fetchError ? fetchErrorText(f.fetchError, t) : f.title}
     >
       <FeedAvatar title={f.title} faviconUrl={f.faviconUrl} seed={f.id} />
       <span className="sb-label">{f.title}</span>

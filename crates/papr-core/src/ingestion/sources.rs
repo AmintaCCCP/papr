@@ -72,6 +72,15 @@ pub fn normalize_source(input: &str) -> Normalized {
             source_type: SourceType::Mastodon,
         };
     }
+    // X profile URLs route to the built-in X parser — the pattern lives in
+    // `parsers::x`; whether that parser is *enabled* is the caller's concern
+    // (it needs the settings connection this pure function must not touch).
+    if let Some(feed) = super::parsers::x::normalize_x_url(&url) {
+        return Normalized::Feed {
+            url: feed,
+            source_type: SourceType::X,
+        };
+    }
 
     Normalized::Untouched
 }
@@ -124,9 +133,7 @@ fn path_segments(path: &str) -> Vec<&str> {
 
 /// True if `id` looks like a YouTube channel id (`UC` + 22 chars).
 fn is_channel_id(id: &str) -> bool {
-    id.len() == 24
-        && id.starts_with("UC")
-        && id.chars().all(is_id_char)
+    id.len() == 24 && id.starts_with("UC") && id.chars().all(is_id_char)
 }
 
 /// True if `id` looks like a YouTube playlist id (`PL`, `UU`, `LL`, `FL`, …).
@@ -151,9 +158,7 @@ fn normalize_youtube(host: &str, path: &str, url: &Url) -> Normalized {
         if let Some((_, list)) = url.query_pairs().find(|(k, _)| k == "list") {
             if is_playlist_id(&list) {
                 return Normalized::Feed {
-                    url: format!(
-                        "https://www.youtube.com/feeds/videos.xml?playlist_id={list}"
-                    ),
+                    url: format!("https://www.youtube.com/feeds/videos.xml?playlist_id={list}"),
                     source_type: SourceType::Youtube,
                 };
             }
@@ -197,20 +202,16 @@ fn normalize_reddit(path: &str) -> Option<String> {
     let sub = segments[1];
     // A subreddit name is alphanumeric + underscore; reject anything else so a
     // post permalink (`/r/SUB/comments/...`) does not become a bogus feed.
-    if sub.is_empty()
-        || !sub
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if sub.is_empty() || !sub.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return None;
     }
     match segments.get(2).copied() {
         // Bare subreddit (`/r/SUB`, `/r/SUB/`) → its main feed.
         None => Some(format!("https://www.reddit.com/r/{sub}/.rss")),
         // A sub-listing (`/r/SUB/top`) → keep that listing's feed.
-        Some(listing @ ("hot" | "new" | "top" | "rising")) => Some(format!(
-            "https://www.reddit.com/r/{sub}/{listing}/.rss"
-        )),
+        Some(listing @ ("hot" | "new" | "top" | "rising")) => {
+            Some(format!("https://www.reddit.com/r/{sub}/{listing}/.rss"))
+        }
         // Already a `.rss` URL, or a `.rss` listing — leave for the caller.
         Some(s) if s.ends_with(".rss") => None,
         // Anything else (`/comments/...`, `/wiki/...`) is not a subreddit
@@ -533,8 +534,11 @@ mod tests {
     #[test]
     fn expand_rsshub_maps_route_onto_instance() {
         assert_eq!(
-            expand_rsshub("rsshub://github/issue/DIYgod/RSSHub", DEFAULT_RSSHUB_INSTANCE)
-                .as_deref(),
+            expand_rsshub(
+                "rsshub://github/issue/DIYgod/RSSHub",
+                DEFAULT_RSSHUB_INSTANCE
+            )
+            .as_deref(),
             Some("https://rsshub.app/github/issue/DIYgod/RSSHub")
         );
     }
@@ -542,8 +546,11 @@ mod tests {
     #[test]
     fn expand_rsshub_honours_custom_self_hosted_instance() {
         assert_eq!(
-            expand_rsshub("rsshub://bilibili/user/video/2267573", "https://rss.example.com/")
-                .as_deref(),
+            expand_rsshub(
+                "rsshub://bilibili/user/video/2267573",
+                "https://rss.example.com/"
+            )
+            .as_deref(),
             Some("https://rss.example.com/bilibili/user/video/2267573")
         );
     }
@@ -553,15 +560,21 @@ mod tests {
         // Scheme casing varies; leading route slashes and instance trailing
         // slashes must not produce a doubled `//`.
         assert_eq!(
-            expand_rsshub("  RSSHub:///telegram/channel/awesomeDIYgod  ", "https://rsshub.app")
-                .as_deref(),
+            expand_rsshub(
+                "  RSSHub:///telegram/channel/awesomeDIYgod  ",
+                "https://rsshub.app"
+            )
+            .as_deref(),
             Some("https://rsshub.app/telegram/channel/awesomeDIYgod")
         );
     }
 
     #[test]
     fn expand_rsshub_rejects_non_rsshub_and_empty_route() {
-        assert_eq!(expand_rsshub("https://rsshub.app/foo", DEFAULT_RSSHUB_INSTANCE), None);
+        assert_eq!(
+            expand_rsshub("https://rsshub.app/foo", DEFAULT_RSSHUB_INSTANCE),
+            None
+        );
         assert_eq!(expand_rsshub("rsshub://", DEFAULT_RSSHUB_INSTANCE), None);
         assert_eq!(expand_rsshub("rss", DEFAULT_RSSHUB_INSTANCE), None);
     }

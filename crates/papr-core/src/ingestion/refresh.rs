@@ -12,6 +12,7 @@
 use crate::db;
 use crate::error::AppResult;
 use crate::ingestion::newsletter;
+use crate::ingestion::parsers::{self, x};
 use crate::ingestion::{fetch, parse};
 use crate::models::{RefreshProgress, SourceType};
 use rusqlite::Connection;
@@ -132,7 +133,7 @@ pub async fn refresh_core(
     scope: RefreshScope,
     mut on_event: impl FnMut(RefreshProgress),
 ) -> AppResult<RefreshSummary> {
-    let (feeds, newsletters, concurrency, dedup, rules) = {
+    let (feeds, newsletters, parser_feeds, concurrency, dedup, rules) = {
         let conn = db.lock().await;
         // The global default interval for feeds without a per-feed override.
         let global_min = db::get_setting(&conn, "refresh_interval_min")
@@ -142,38 +143,47 @@ pub async fn refresh_core(
             .filter(|m| *m >= 5)
             .map(|m| m.min(db::REFRESH_OFF_MINUTES))
             .unwrap_or(30);
-        let (feeds, newsletters) = match scope {
+        let (feeds, newsletters, parser_feeds) = match scope {
             RefreshScope::All => (
                 db::feeds_to_refresh(&conn)?,
                 db::newsletter_sources_to_poll(&conn).unwrap_or_default(),
+                db::parser_feeds_to_refresh(&conn).unwrap_or_default(),
             ),
             RefreshScope::Due => (
                 db::feeds_due_for_refresh(&conn, global_min)?,
                 db::newsletter_sources_due_to_poll(&conn, global_min).unwrap_or_default(),
+                db::parser_feeds_due_for_refresh(&conn, global_min).unwrap_or_default(),
             ),
-            // The HTTP fetch set excludes newsletter sources (`source_type !=
-            // 'newsletter'` in the query), so a newsletter feed's synthetic
-            // `newsletter://` URL is never handed to `fetch_one`; it is polled
-            // over IMAP via the separate newsletter set instead.
+            // The HTTP fetch set excludes newsletter and parser sources
+            // (`NOT IN ('newsletter','x')` in the queries), so a newsletter's
+            // synthetic `newsletter://` URL is never handed to `fetch_one` and
+            // an X feed is never fetched as a feed document; each is polled by
+            // its own leg below instead.
             RefreshScope::Feed(id) => (
                 db::feeds_to_refresh_for_feed(&conn, id)?,
                 db::newsletter_sources_for_feed(&conn, id).unwrap_or_default(),
+                db::parser_feeds_for_feed(&conn, id).unwrap_or_default(),
             ),
             RefreshScope::Folder(id) => (
                 db::feeds_to_refresh_in_folder(&conn, id)?,
                 db::newsletter_sources_in_folder(&conn, id).unwrap_or_default(),
+                db::parser_feeds_in_folder(&conn, id).unwrap_or_default(),
             ),
         };
         let concurrency =
             db::setting_parsed::<i64>(&conn, "net_concurrency", 6).clamp(1, 16) as usize;
         let dedup = db::setting_flag(&conn, "dedup_enabled", false);
         let rules = db::active_rules(&conn).unwrap_or_default();
-        (feeds, newsletters, concurrency, dedup, rules)
+        (feeds, newsletters, parser_feeds, concurrency, dedup, rules)
     };
 
     // Nothing due this cycle: emit a no-op Started/Finished and bow out before
     // the heavier tail. The manual refresh (scope All) always runs the pipeline.
-    if scope == RefreshScope::Due && feeds.is_empty() && newsletters.is_empty() {
+    if scope == RefreshScope::Due
+        && feeds.is_empty()
+        && newsletters.is_empty()
+        && parser_feeds.is_empty()
+    {
         on_event(RefreshProgress::Started { total: 0 });
         on_event(RefreshProgress::Finished { new_articles: 0 });
         return Ok(RefreshSummary {
@@ -258,6 +268,10 @@ pub async fn refresh_core(
     // Newsletter sources: poll each configured IMAP mailbox and ingest any new
     // messages as articles, alongside the RSS refresh above.
     total_new += poll_newsletters(db, newsletters, dedup, &rules).await;
+
+    // Parser feeds: fetch each X timeline through the built-in X parser, same
+    // cadence as the RSS refresh above.
+    total_new += poll_parsers(db, client, parser_feeds, dedup, &rules).await;
 
     // Retention: drop old read articles when a finite window is configured. The
     // DELETE scans the whole table, so throttle it to once per day rather than
@@ -372,6 +386,98 @@ async fn poll_newsletters(
                 let _ = db::set_feed_error(&conn, feed_id, &e);
             }
         }
+    }
+    total_new
+}
+
+/// Fetch every parser feed's timeline through the built-in X parser and ingest
+/// the tweets as articles. Runs as part of [`refresh_core`] so X timelines
+/// refresh on the same cadence as RSS feeds. Returns the new-article count.
+///
+/// Sequential with a throttle between handles — the GraphQL API is
+/// rate-limited per login session, so concurrency would trade a little speed
+/// for 429s. One feed's failure (bad cookies for everyone, one account gone)
+/// is recorded as that feed's `fetch_error` and does not abort the others.
+async fn poll_parsers(
+    db: &Mutex<Connection>,
+    client: &reqwest::Client,
+    feeds: Vec<(i64, String)>,
+    dedup: bool,
+    rules: &[crate::models::Rule],
+) -> usize {
+    if feeds.is_empty() {
+        return 0;
+    }
+
+    // The enabled toggle gates the whole leg: disabling the parser stops new
+    // subscriptions AND puts existing feeds to sleep (no more x.com traffic)
+    // until it is re-enabled. Checked here rather than filtered in the query
+    // so the toggle is one settings read, not a join per scope.
+    let enabled = {
+        let conn = db.lock().await;
+        parsers::parser_enabled(&conn, parsers::X)
+    };
+    if !enabled {
+        return 0;
+    }
+
+    // Credentials and the caches are per-login-session, shared across feeds:
+    // read them once, save once.
+    let credentials = {
+        let conn = db.lock().await;
+        parsers::x_credentials(&conn)
+    };
+    let Some((auth_token, ct0)) = credentials else {
+        // Enabled parser feeds without cookies can only error — say so per
+        // feed so the sidebar tooltip shows the actionable reason.
+        let conn = db.lock().await;
+        for (feed_id, _) in &feeds {
+            let _ = db::set_feed_error(&conn, *feed_id, parsers::x::CODE_AUTH_REQUIRED);
+        }
+        return 0;
+    };
+    let mut state = {
+        let conn = db.lock().await;
+        x::XState::load(&conn)
+    };
+
+    let mut total_new = 0usize;
+    for (index, (feed_id, feed_url)) in feeds.iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(x::HANDLE_THROTTLE_MS)).await;
+        }
+        let handle = match x::handle_from_feed_url(feed_url) {
+            Some(h) => h,
+            None => {
+                log::warn!("x parser: feed {feed_id} has a malformed URL: {feed_url}");
+                let conn = db.lock().await;
+                let _ = db::set_feed_error(&conn, *feed_id, "malformed X feed URL");
+                continue;
+            }
+        };
+        match x::fetch_user_tweets(client, &auth_token, &ct0, &handle, &mut state).await {
+            Ok(page) => {
+                // Map to articles before taking the DB lock — the HTML
+                // sanitization is CPU-bound and must not starve queries.
+                let articles: Vec<db::NewArticle> =
+                    page.tweets.iter().map(x::tweet_to_article).collect();
+                total_new += upsert_articles(db, *feed_id, &articles, dedup, rules, "x").await;
+                let conn = db.lock().await;
+                let _ = db::touch_feed(&conn, *feed_id);
+            }
+            Err(e) => {
+                log::warn!("x parser: timeline fetch failed for @{handle}: {e}");
+                // Store the coded key when the failure has one so the sidebar
+                // tooltip can localize; fall back to the raw text otherwise.
+                let message = e.code().map(String::from).unwrap_or_else(|| e.to_string());
+                let conn = db.lock().await;
+                let _ = db::set_feed_error(&conn, *feed_id, &message);
+            }
+        }
+    }
+    {
+        let conn = db.lock().await;
+        state.save(&conn);
     }
     total_new
 }

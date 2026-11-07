@@ -16,6 +16,10 @@ pub enum SourceType {
     Reddit,
     /// An email newsletter polled from an IMAP mailbox (see ingestion::newsletter).
     Newsletter,
+    /// An X (Twitter) user timeline fetched by the built-in X parser (see
+    /// `ingestion::parsers::x`) instead of a feed document. The feed's URL is
+    /// the profile URL itself; authentication lives in the `parsers` setting.
+    X,
 }
 
 impl SourceType {
@@ -28,9 +32,9 @@ impl SourceType {
             SourceType::Bluesky => "bluesky",
             SourceType::Reddit => "reddit",
             SourceType::Newsletter => "newsletter",
+            SourceType::X => "x",
         }
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,7 +211,15 @@ pub enum ArticleQuery {
     content = "data"
 )]
 pub enum RefreshProgress {
-    Started { total: usize },
-    FeedDone { feed_id: i64, new_articles: usize, error: Option<String> },
-    Finished { new_articles: usize },
+    Started {
+        total: usize,
+    },
+    FeedDone {
+        feed_id: i64,
+        new_articles: usize,
+        error: Option<String>,
+    },
+    Finished {
+        new_articles: usize,
+    },
 }

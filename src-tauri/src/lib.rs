@@ -291,6 +291,7 @@ pub fn run() {
             commands::cleanup_articles,
             commands::vacuum_db,
             commands::reset_settings,
+            commands::test_parser,
             commands::clear_all_data,
             commands::apply_network_settings,
             commands::freshrss_connect,

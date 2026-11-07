@@ -233,7 +233,8 @@
       "shortcuts": "ショートカット",
       "notifications": "通知",
       "advanced": "詳細設定",
-      "about": "情報"
+      "about": "情報",
+      "parsers": "パーサー"
     },
     "sub": {
       "general": "フィードの更新、既定の動作、起動方法",
@@ -246,7 +247,8 @@
       "shortcuts": "キーボードショートカット",
       "notifications": "新着記事の通知とバッジ",
       "advanced": "キャッシュ、ネットワーク、実験的機能",
-      "about": "バージョン情報とクレジット"
+      "about": "バージョン情報とクレジット",
+      "parsers": "内蔵パーサーと認証情報"
     },
     "general": {
       "refresh": "更新",
@@ -499,6 +501,25 @@
       },
       "obsidianHint": "ローカル Vault フォルダーの絶対パス。保存のたびに frontmatter 付き Markdown ノートを書き込みます。"
     },
+    "parsers": {
+      "title": "内蔵パーサー",
+      "intro": "パーサーを使うと、RSS を提供しないサイトの内容をサードパーティなしで直接取得できます。有効化すると、対応するリンクをそのまま購読できます。",
+      "x": {
+        "name": "X（Twitter）",
+        "desc": "x.com/ユーザー名を購読し、そのユーザーの最新ツイートを取得します。"
+      },
+      "configure": "設定",
+      "field": {
+        "authToken": "auth_token",
+        "ct0": "ct0"
+      },
+      "cookieHint": "認証情報は必須です：x.com にログインし、ブラウザの開発者ツール（アプリケーション → Cookie）から auth_token と ct0 の値をコピーしてください。取得はあなた自身のセッションを使い、認証情報はこの端末のデータベースにのみ保存されます。",
+      "testHandlePlaceholder": "ユーザー名（例：jack）",
+      "test": "接続テスト",
+      "testing": "テスト中…",
+      "testOk": "接続成功：{{count}} 件のツイートを取得しました",
+      "clear": "認証情報を消去"
+    },
     "shortcuts": {
       "navigation": "ナビゲーション",
       "nextArticle": "次の記事",
@@ -711,7 +732,14 @@
     "integrationMethodInvalid": "Webhook の HTTP メソッドは対応していません",
     "integrationSchemeInvalid": "この URL スキームは許可されていません",
     "obsidianNoteExists": "同じ名前のノートが Vault に既に存在します",
-    "aiEmptyResponse": "プロバイダが空の要約を返しました — モデルとプロンプトを確認してください"
+    "aiEmptyResponse": "プロバイダが空の要約を返しました — モデルとプロンプトを確認してください",
+    "parserDisabled": "このリンクは内蔵パーサーで処理されますが、対応するパーサーが無効です。設定 → パーサー で有効にしてください。",
+    "parserUnknown": "不明なパーサーです。",
+    "xAuthRequired": "X パーサーには認証情報が必要です：設定 → パーサー で auth_token と ct0 を設定してください。",
+    "xAuthInvalid": "X の認証が無効になりました（auth_token/ct0 が不正または期限切れ）。設定 → パーサー で更新してください。",
+    "xAccountUnavailable": "この X ユーザーのタイムラインを取得できません（アカウントが存在しない・制限中・削除済みの可能性）。",
+    "xBlocked": "X へのリクエストが拒否されました（HTTP 403 — ファイアウォール、IP 制限、またはアカウント制限の可能性）。設定 → 詳細 でネットワークプロキシを設定して再試行してください。",
+    "xHandleInvalid": "無効な X ユーザー名です（1〜15 文字の英数字・アンダースコア）。"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",
