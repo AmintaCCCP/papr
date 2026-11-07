@@ -64,7 +64,7 @@ export default function ArticleList({ onToast }: Props) {
   const listTranslateMode =
     listTranslateModeSetting.data === "auto" ? "auto" : "off";
   const listTranslationJobs = useListTranslation((s) => s.jobs);
-  const enqueueVisibleTranslations = useListTranslation((s) => s.enqueueVisible);
+  const enqueueListTranslation = useListTranslation((s) => s.enqueue);
 
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const feedById = useMemo(() => {
@@ -399,24 +399,23 @@ export default function ArticleList({ onToast }: Props) {
 
   const vItems = virt.getVirtualItems();
 
+  // List translation only covers the article currently open in the reader.
+  // Enqueuing every visible row on each scroll fired one request per row at the
+  // translation engine — rate-limited engines such as Google answer 429 long
+  // before a feed finishes — so unopened articles keep their original titles.
   useEffect(() => {
     if (listTranslateMode !== "auto") return;
     if (!translationSettingsReady) return;
-    const visible = vItems
-      .filter((vi) => vi.index >= 0 && vi.index < items.length)
-      .slice(0, 16)
-      .map((vi) => items[vi.index])
-      .filter(Boolean);
-    enqueueVisibleTranslations(visible, targetLang, translateEngine);
+    const opened = items.find((x) => x.id === selectedId);
+    if (opened) enqueueListTranslation([opened], targetLang, translateEngine);
   }, [
-    enqueueVisibleTranslations,
+    enqueueListTranslation,
     items,
     listTranslateMode,
     translationSettingsReady,
+    selectedId,
     targetLang,
     translateEngine,
-    virt.range?.startIndex,
-    virt.range?.endIndex,
   ]);
   const showCount = t("articleList.countArticles", {
     count: items.length,
