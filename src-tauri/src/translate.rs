@@ -144,29 +144,22 @@ const MT_TIMEOUT: Duration = Duration::from_secs(30);
 /// deciding when a long article is split. A short article falls under the budget
 /// and translates in a single request — only longer ones are chunked — and the
 /// size is tuned to each engine's limits: the LLM is bounded by its per-batch
-/// output-token cap; Google's free endpoint carries the text in a GET query, so
-/// its URL must stay short; DeepL and Bing accept large POST bodies, so a bigger
-/// batch means fewer round-trips on a long article.
+/// output-token cap; Google, DeepL and Bing all take large POST bodies, so a
+/// bigger batch means fewer round-trips on a long article.
 pub fn chunk_budget(engine: &str) -> usize {
     match engine {
-        "google" => 1500,
-        "deepl" | "bing" => 8000,
+        "google" | "deepl" | "bing" => 8000,
         _ => ai::TRANSLATE_CHUNK_BUDGET,
     }
 }
-
-/// A desktop-browser User-Agent for the Bing token endpoint, which rejects
-/// requests without a plausible one.
-const BING_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                       (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0";
 
 /// Text nodes inside these elements are code/markup, not prose, so they are left
 /// untranslated (the LLM prompt makes the same exclusion for its path).
 const SKIP_TEXT_TAGS: &[&str] = &["script", "style", "code", "pre", "kbd", "samp"];
 
 /// The chosen engine plus the credentials/handles it needs at request time. Built
-/// by [`ready`] from a [`Selection`]; for Bing the auth token is fetched once up
-/// front and reused across every batch.
+/// by [`ready`] from a [`Selection`]; every machine-translation engine here is
+/// keyless, so no variant carries credentials.
 pub enum Backend {
     /// Cloud LLM — handed HTML, returns HTML (the original path).
     Llm(ai::AiConfig),
@@ -174,12 +167,11 @@ pub enum Backend {
     Google,
     /// DeepL's free web endpoint (keyless, the same one the web client uses).
     Deepl,
-    /// Bing/Edge translator; the string is a short-lived bearer token.
-    Bing(String),
+    /// Bing/Edge translator (keyless).
+    Bing,
 }
 
-/// The engine choice resolved from settings, before any network work. Bing's
-/// token is not yet fetched here so settings loading stays synchronous.
+/// The engine choice resolved from settings, before any network work.
 pub enum Selection {
     Llm(ai::AiConfig),
     Google,
@@ -187,14 +179,14 @@ pub enum Selection {
     Bing,
 }
 
-/// Turn a [`Selection`] into a request-ready [`Backend`], performing any one-off
-/// network setup (Bing's auth token). Run once before the per-batch loop.
-pub async fn ready(client: &Client, sel: Selection) -> AppResult<Backend> {
+/// Turn a [`Selection`] into a request-ready [`Backend`]. No one-off network
+/// setup is needed — every engine is keyless — so this is a plain conversion.
+pub fn ready(sel: Selection) -> AppResult<Backend> {
     Ok(match sel {
         Selection::Llm(cfg) => Backend::Llm(cfg),
         Selection::Google => Backend::Google,
         Selection::Deepl => Backend::Deepl,
-        Selection::Bing => Backend::Bing(bing_token(client).await?),
+        Selection::Bing => Backend::Bing,
     })
 }
 
@@ -328,9 +320,9 @@ async fn translate_fragment(
 }
 
 /// Dispatch a list of plain-text segments to the selected engine. The returned
-/// vector is positionally aligned with `cores` (DeepL and Bing align by their
-/// array APIs; Google reconstructs alignment from line breaks with a per-segment
-/// fallback).
+/// vector is positionally aligned with `cores`: all three machine-translation
+/// engines send the segments as an ordered array and error when the response
+/// count does not match the request, so a success always carries every segment.
 async fn translate_segments(
     client: &Client,
     backend: &Backend,
@@ -340,7 +332,7 @@ async fn translate_segments(
     match backend {
         Backend::Google => google_segments(client, cores, target).await,
         Backend::Deepl => deepl_segments(client, cores, target).await,
-        Backend::Bing(token) => bing_segments(client, token, cores, target).await,
+        Backend::Bing => bing_segments(client, cores, target).await,
         Backend::Llm(_) => unreachable!("LLM batches are translated as whole HTML, not segments"),
     }
 }
@@ -382,56 +374,102 @@ async fn http_error(resp: reqwest::Response, engine: &str) -> AppError {
 
 // ── Google (free, keyless) ───────────────────────────────────────────────────
 
-/// Translate one plain-text blob via Google's free `translate_a/single`
-/// endpoint, concatenating the per-sentence pieces it returns.
-async fn google_call(client: &Client, text: &str, target: &str) -> AppResult<String> {
+/// Max text segments per Google request. Each segment rides as its own repeated
+/// `q=` form field and comes back positionally aligned, so batches stay small
+/// and the alignment is exact.
+const GOOGLE_MAX_SEGMENTS: usize = 20;
+/// Byte cap on the text carried by one Google request (the sum of the `q=`
+/// values, not counting encoding overhead) — mirrors the web client's
+/// conservative per-request ceiling so an oversized body is never rejected.
+const GOOGLE_MAX_REQUEST_BYTES: usize = 1800;
+
+/// Translate segments with Google's `clients5` dict endpoint (`client=
+/// dict-chrome-ex`, the same one Chrome's built-in translate uses). Each
+/// segment is sent as a repeated `q=` form field and answered positionally, so
+/// no newline-join reconstruction — and none of its per-segment request
+/// fallback, which multiplied request volume exactly when the engine was
+/// rate-limiting — is needed.
+async fn google_segments(
+    client: &Client,
+    cores: &[String],
+    target: &str,
+) -> AppResult<Vec<String>> {
+    let mut out = Vec::with_capacity(cores.len());
+    let mut batch: Vec<&str> = Vec::with_capacity(GOOGLE_MAX_SEGMENTS);
+    let mut batch_bytes = 0usize;
+    for core in cores {
+        // Flush when the next segment would push the request past the segment
+        // or byte ceiling; a batch is never empty at flush time, so every
+        // segment lands in exactly one request.
+        if !batch.is_empty()
+            && (batch.len() >= GOOGLE_MAX_SEGMENTS
+                || batch_bytes + core.len() > GOOGLE_MAX_REQUEST_BYTES)
+        {
+            out.extend(google_request(client, &batch, target).await?);
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch_bytes += core.len();
+        batch.push(core);
+    }
+    if !batch.is_empty() {
+        out.extend(google_request(client, &batch, target).await?);
+    }
+    Ok(out)
+}
+
+/// One `translate_a/t` request for `batch`, returning its positionally aligned
+/// translations.
+async fn google_request(
+    client: &Client,
+    batch: &[&str],
+    target: &str,
+) -> AppResult<Vec<String>> {
+    let form: Vec<(&str, &str)> = batch.iter().map(|c| ("q", *c)).collect();
     let resp = client
-        .get("https://translate.googleapis.com/translate_a/single")
+        .post("https://clients5.google.com/translate_a/t")
         .query(&[
-            ("client", "gtx"),
+            ("client", "dict-chrome-ex"),
             ("sl", "auto"),
             ("tl", google_code(target)),
-            ("dt", "t"),
-            ("q", text),
         ])
+        .form(&form)
         .timeout(MT_TIMEOUT)
         .send()
         .await?;
     if !resp.status().is_success() {
         return Err(http_error(resp, "Google").await);
     }
-    let v: Value = resp.json().await?;
-    let mut out = String::new();
-    if let Some(arr) = v.get(0).and_then(|x| x.as_array()) {
-        for seg in arr {
-            if let Some(s) = seg.get(0).and_then(|x| x.as_str()) {
-                out.push_str(s);
-            }
-        }
+    let v: Value = resp.json().await.map_err(|e| {
+        AppError::other(format!("Google translate error: decoding response failed ({e})"))
+    })?;
+    let parsed = parse_google_segments(&v)?;
+    // The endpoint answers one entry per `q`; a shorter or longer response
+    // would silently misalign every following text node.
+    if parsed.len() != batch.len() {
+        return Err(AppError::other("Google translate error: segment count mismatch"));
     }
-    Ok(out)
+    Ok(parsed)
 }
 
-/// Translate segments with Google. The segments are joined by newlines into one
-/// request — Google preserves the newlines, so the response splits back into the
-/// same count. If it doesn't (Google merged or split a line), fall back to one
-/// request per segment so alignment is exact.
-async fn google_segments(
-    client: &Client,
-    cores: &[String],
-    target: &str,
-) -> AppResult<Vec<String>> {
-    let joined = cores.join("\n");
-    let out = google_call(client, &joined, target).await?;
-    let lines: Vec<String> = out.split('\n').map(|s| s.to_string()).collect();
-    if lines.len() == cores.len() {
-        return Ok(lines);
-    }
-    let mut result = Vec::with_capacity(cores.len());
-    for core in cores {
-        result.push(google_call(client, core, target).await?);
-    }
-    Ok(result)
+/// Parse one `translate_a/t` response body into positionally aligned
+/// translations. With `sl=auto` each entry is a `[text, detectedLang]` pair;
+/// with an explicit source language it is a bare string — accept both.
+fn parse_google_segments(v: &Value) -> AppResult<Vec<String>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| AppError::other("Google translate error: malformed response"))?;
+    arr.iter()
+        .map(|item| match item {
+            Value::String(s) => Ok(s.clone()),
+            Value::Array(pair) => pair
+                .first()
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| AppError::other("Google translate error: malformed response")),
+            _ => Err(AppError::other("Google translate error: malformed response")),
+        })
+        .collect()
 }
 
 // ── DeepL (free web endpoint, keyless) ───────────────────────────────────────
@@ -519,7 +557,9 @@ async fn deepl_free_call(
     if !resp.status().is_success() {
         return Err(http_error(resp, "DeepL").await);
     }
-    let v: Value = resp.json().await?;
+    let v: Value = resp.json().await.map_err(|e| {
+        AppError::other(format!("DeepL translate error: decoding response failed ({e})"))
+    })?;
     let arr = v
         .pointer("/result/texts")
         .and_then(|x| x.as_array())
@@ -530,63 +570,68 @@ async fn deepl_free_call(
         .collect())
 }
 
-// ── Bing / Edge translator (keyless via short-lived token) ───────────────────
+// ── Bing / Edge translator (keyless) ─────────────────────────────────────────
 
-/// Fetch a short-lived bearer token from Microsoft Edge's public auth endpoint,
-/// used to call the Edge translator without an API key.
-pub async fn bing_token(client: &Client) -> AppResult<String> {
-    let resp = client
-        .get("https://edge.microsoft.com/translate/auth")
-        .header("User-Agent", BING_UA)
-        .timeout(MT_TIMEOUT)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(http_error(resp, "Bing").await);
-    }
-    Ok(resp.text().await?)
-}
+/// Max text segments per Bing request, well under its per-call array limit.
+const BING_MAX_SEGMENTS: usize = 100;
 
-/// Translate segments with the Edge translator. Its request body is an array of
-/// `{ Text }` objects translated positionally, so no reconstruction is needed;
-/// requests are chunked well under its per-call array limit.
+/// Translate segments with the Edge translator's keyless `translatetext`
+/// endpoint. The Bearer-token flow this replaces — fetching a token from
+/// `edge.microsoft.com/translate/auth` — is gone: that endpoint now answers 404.
+/// The body is an array of plain strings translated positionally. The endpoint
+/// rejects UA-less clients with 400 ("Client Browser Version not supported"),
+/// so it depends on the shared client's desktop `User-Agent` — don't strip it.
 async fn bing_segments(
     client: &Client,
-    token: &str,
     cores: &[String],
     target: &str,
 ) -> AppResult<Vec<String>> {
     let mut out = Vec::with_capacity(cores.len());
-    for chunk in cores.chunks(900) {
-        let body: Vec<Value> = chunk.iter().map(|c| json!({ "Text": c })).collect();
+    for chunk in cores.chunks(BING_MAX_SEGMENTS) {
         let resp = client
-            .post("https://api-edge.cognitive.microsofttranslator.com/translate")
-            .query(&[("from", ""), ("to", bing_code(target)), ("api-version", "3.0")])
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
+            .post("https://edge.microsoft.com/translate/translatetext")
+            .query(&[
+                ("from", ""),
+                ("to", bing_code(target)),
+                ("isEnterpriseClient", "false"),
+            ])
+            .json(chunk)
             .timeout(MT_TIMEOUT)
             .send()
             .await?;
         if !resp.status().is_success() {
             return Err(http_error(resp, "Bing").await);
         }
-        let v: Value = resp.json().await?;
-        let arr = v
-            .as_array()
-            .ok_or_else(|| AppError::other("Bing translate error: malformed response"))?;
-        for item in arr {
-            let text = item
-                .get("translations")
+        let v: Value = resp.json().await.map_err(|e| {
+            AppError::other(format!("Bing translate error: decoding response failed ({e})"))
+        })?;
+        out.extend(parse_bing_segments(&v, chunk.len())?);
+    }
+    Ok(out)
+}
+
+/// Parse one `translatetext` response body into positionally aligned
+/// translations. Each entry is `{ translations: [{ text }] }`; the entry count
+/// must match the request's segment count, and every entry must carry a
+/// translation — a missing one would silently wipe that text node.
+fn parse_bing_segments(v: &Value, expected: usize) -> AppResult<Vec<String>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| AppError::other("Bing translate error: malformed response"))?;
+    if arr.len() != expected {
+        return Err(AppError::other("Bing translate error: segment count mismatch"));
+    }
+    arr.iter()
+        .map(|item| {
+            item.get("translations")
                 .and_then(|x| x.as_array())
                 .and_then(|a| a.first())
                 .and_then(|t| t.get("text"))
                 .and_then(|x| x.as_str())
-                .unwrap_or_default();
-            out.push(text.to_string());
-        }
-    }
-    Ok(out)
+                .map(|s| s.to_string())
+                .ok_or_else(|| AppError::other("Bing translate error: malformed response"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -757,10 +802,10 @@ mod tests {
 
     #[test]
     fn chunk_budget_is_tuned_per_engine() {
-        // Google (GET query) is the smallest; DeepL/Bing (POST) the largest; the
-        // LLM uses the shared token-bounded default; an unknown engine falls back
-        // to it too.
-        assert_eq!(chunk_budget("google"), 1500);
+        // The keyless machine-translation engines all take POST bodies, so they
+        // share the largest budget; the LLM uses the shared token-bounded
+        // default, and an unknown engine falls back to it too.
+        assert_eq!(chunk_budget("google"), 8000);
         assert_eq!(chunk_budget("deepl"), 8000);
         assert_eq!(chunk_budget("bing"), 8000);
         assert_eq!(chunk_budget("llm"), ai::TRANSLATE_CHUNK_BUDGET);
@@ -776,5 +821,63 @@ mod tests {
         assert_eq!(google_code("ja"), "ja");
         assert_eq!(deepl_code("xx"), "EN");
         assert_eq!(bing_code("xx"), "en");
+    }
+
+    // ── engine response parsers ─────────────────────────────────────────
+
+    #[test]
+    fn google_parser_reads_both_response_shapes() {
+        // With `sl=auto` each entry is a [text, detectedLang] pair; an explicit
+        // source language answers bare strings. Both must parse positionally.
+        let pairs = json!([["你好，世界", "en"], ["早上好", "en"]]);
+        assert_eq!(
+            parse_google_segments(&pairs).unwrap(),
+            vec!["你好，世界", "早上好"]
+        );
+        let bare = json!(["你好，世界", "早上好"]);
+        assert_eq!(
+            parse_google_segments(&bare).unwrap(),
+            vec!["你好，世界", "早上好"]
+        );
+    }
+
+    #[test]
+    fn google_parser_rejects_malformed_bodies() {
+        // Not an array at all.
+        assert!(parse_google_segments(&json!({"error": "x"})).is_err());
+        // An entry that is neither a string nor a [text, lang] pair.
+        assert!(parse_google_segments(&json!([42])).is_err());
+        // A pair whose first element is not a string.
+        assert!(parse_google_segments(&json!([[null, "en"]])).is_err());
+        // An empty body parses empty; the call site's count check is what
+        // turns an empty response for a non-empty request into an error.
+        assert_eq!(parse_google_segments(&json!([])).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bing_parser_reads_positional_translations() {
+        let body = json!([
+            {"translations": [{"text": "你好"}]},
+            {"translations": [{"text": "世界"}]}
+        ]);
+        assert_eq!(parse_bing_segments(&body, 2).unwrap(), vec!["你好", "世界"]);
+        // An empty request expects an empty response.
+        assert!(parse_bing_segments(&json!([]), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bing_parser_requires_the_response_to_align_with_the_request() {
+        let one = json!([{"translations": [{"text": "你好"}]}]);
+        // A shorter (or longer) response would silently misalign every
+        // following text node, so it must be an error rather than truncated.
+        assert!(parse_bing_segments(&one, 2).is_err());
+        assert!(parse_bing_segments(&json!("x"), 1).is_err());
+    }
+
+    #[test]
+    fn bing_parser_rejects_an_entry_without_a_translation() {
+        // Blanking the node would silently drop text; surface it as an error.
+        assert!(parse_bing_segments(&json!([{"translations": []}]), 1).is_err());
+        assert!(parse_bing_segments(&json!([{}]), 1).is_err());
     }
 }

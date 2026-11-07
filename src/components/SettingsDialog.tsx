@@ -2314,12 +2314,16 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
       .finally(() => { switching.current = false; setProfileBusy(false); });
   }, []);
 
-  const save = (key: string, value: string, label: string) => {
+  // Returns the save promise so callers can order follow-up work (e.g. cache
+  // invalidation) after the write has settled — invalidating while the write is
+  // still in flight lets the refetch read the pre-write value. The promise
+  // always resolves: a failed write is already surfaced as an error toast, and
+  // the refetch then simply re-reads the stored (old) value.
+  const save = (key: string, value: string, label: string): Promise<void> =>
     api
       .setSetting(key, value)
       .then(() => onToast(t("settings.advanced.aiSaved", { label })))
       .catch((e) => reportError(e));
-  };
 
   const placeholder =
     provider === "openai"
@@ -2508,10 +2512,13 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           aria-label={t("settings.advanced.translateEngine")}
           onChange={(v) => {
             setEngine(v);
-            save("translate_engine", v, t("settings.advanced.translateEngineLabel"));
-            // The reader reads this default when starting a translation —
-            // refresh it so the change takes effect on the next translate.
-            qc.invalidateQueries({ queryKey: ["setting", "translate_engine"] });
+            // Persist first, then refresh the cached setting. The reader and the
+            // article list translate with this default; invalidating before the
+            // write lands lets the refetch read the stale engine, so switching
+            // here would leave every translation on the previous engine.
+            save("translate_engine", v, t("settings.advanced.translateEngineLabel")).then(() =>
+              qc.invalidateQueries({ queryKey: ["setting", "translate_engine"] }),
+            );
           }}
         />
       </Row>
@@ -2525,10 +2532,12 @@ function AiSettingsGroup({ onToast }: { onToast: (m: string) => void }) {
           aria-label={t("settings.advanced.translateLang")}
           onChange={(v) => {
             setTranslateLang(v);
-            save("translate_target_lang", v, t("settings.advanced.translateLangLabel"));
-            // The reader caches this default to decide whether a stored
-            // translation is still current — refresh it so a change applies now.
-            qc.invalidateQueries({ queryKey: ["setting", "translate_target_lang"] });
+            // Same ordering as the engine switch: the reader compares this
+            // cached default against a stored translation's language to decide
+            // whether it is still current, so the refetch must see the write.
+            save("translate_target_lang", v, t("settings.advanced.translateLangLabel")).then(() =>
+              qc.invalidateQueries({ queryKey: ["setting", "translate_target_lang"] }),
+            );
           }}
         />
       </Row>

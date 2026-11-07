@@ -1131,7 +1131,7 @@ pub async fn translate_article_preview(
     }
 
     let http = state.http();
-    let backend = translate::ready(&http, sel).await?;
+    let backend = translate::ready(sel)?;
     // Reuse the reader's canonical translation prompt rather than a second copy:
     // the preview fragment is just an `<h1>`/`<p>` pair, so "preserve every HTML
     // tag" covers it, and a single prompt can never drift between the two paths.
@@ -1212,10 +1212,10 @@ pub async fn ai_translate(
     }
 
     let http = state.http();
-    // Resolve the chosen engine (fetching Bing's auth token, if selected) before
-    // the loop, so a credential or network failure surfaces before any progress
-    // is reported rather than mid-stream.
-    let backend = translate::ready(&http, sel).await?;
+    // Resolve the chosen engine into its backend before the loop, so a bad
+    // engine choice surfaces before any progress is reported rather than
+    // mid-stream.
+    let backend = translate::ready(sel)?;
 
     // Split by an engine-specific budget so a short article translates in one
     // request and a long one is chunked to fit the engine's per-call limits.
