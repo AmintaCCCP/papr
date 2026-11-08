@@ -585,10 +585,18 @@ export default function Reader({ onToast }: Props) {
   const startTranslate = useTranslationJobs((s) => s.translate);
   const job = useTranslationJobs((s) => (id != null ? s.jobs[id] : undefined));
 
-  const hasExtracted = !!a?.extractedHtml;
+  // X articles are rendered entirely by the parser, and that rendering is the
+  // final content — there is no web page behind it worth extracting. A URL
+  // fetch for `x.com/<user>/status/<id>` returns the logged-out SPA shell
+  // ("Log in or sign up", "Relevant people", the footer), so an extraction
+  // stored by an earlier version must never win over the card, and the
+  // extract/toggle controls are hidden below.
+  const isXPost = a?.sourceType === "x";
+  const hasExtracted = !!a?.extractedHtml && !isXPost;
   const canTranslate = !!(a?.extractedHtml || a?.contentHtml);
-  const baseBody =
-    (showExtracted && a?.extractedHtml ? a.extractedHtml : a?.contentHtml) || "";
+  const baseBody = isXPost
+    ? a?.contentHtml || ""
+    : (showExtracted && a?.extractedHtml ? a.extractedHtml : a?.contentHtml) || "";
   const jobForTarget = job && job.lang === targetLang ? job : undefined;
   const translating = jobForTarget?.status === "translating";
   const cachedValid = !!a?.translatedHtml && a.translatedLang === targetLang;
@@ -672,7 +680,9 @@ export default function Reader({ onToast }: Props) {
   // article — so a failed fetch isn't retried on every re-render.
   const autoExtractedRef = useRef<number | null>(null);
   useEffect(() => {
-    if (openMode !== "extracted" || !a || !a.url || a.extractedHtml) return;
+    // Parser articles are already complete (see `isXPost`): extracting their
+    // URL would replace a rendered tweet with the site's SPA shell.
+    if (openMode !== "extracted" || !a || !a.url || a.extractedHtml || isXPost) return;
     if (autoExtractedRef.current === a.id || extract.isPending) return;
     // Measure the *decoded* text, not the raw markup. A bare `<[^>]+>` tag
     // strip leaves HTML entities intact, so an entity-heavy stub
@@ -690,7 +700,7 @@ export default function Reader({ onToast }: Props) {
     autoExtractedRef.current = a.id;
     extract.mutate(a.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, a?.extractedHtml, openMode, feedOpenMode]);
+  }, [a?.id, a?.extractedHtml, openMode, feedOpenMode, isXPost]);
 
   // Per-feed auto-translate: when the article's source feed opts in, translate
   // it into the configured target the moment it opens. Fires once per article
@@ -892,10 +902,9 @@ export default function Reader({ onToast }: Props) {
   };
 
   const ytId = a.sourceType === "youtube" ? youtubeId(a.url) : null;
-  // X articles are single tweets, already rendered as a card that names the
-  // author. The generic title line would only repeat that handle, so it is
-  // dropped and the card head is the one place authorship appears.
-  const isXPost = a.sourceType === "x";
+  // (`isXPost` is computed above, alongside the body selection it also gates:
+  // an X article is a single rendered tweet card, so the generic title line —
+  // which would only repeat the handle — is dropped below as well.)
 
   return (
     <div className="reader" role="main">
@@ -934,23 +943,25 @@ export default function Reader({ onToast }: Props) {
         >
           <Icon name="tag" size={16} />
         </button>
-        <button
-          className={`tb-btn ${hasExtracted && showExtracted ? "on" : ""} ${
-            extract.isPending ? "spinning" : ""
-          }`}
-          onClick={() =>
-            hasExtracted ? setShowExtracted((v) => !v) : extract.mutate(a.id)
-          }
-          // Extraction needs the source URL; without one (and nothing
-          // extracted yet) the button can only error, so disable it.
-          disabled={extract.isPending || (!hasExtracted && !a.url)}
-          title={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
-          aria-label={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
-          aria-pressed={hasExtracted ? showExtracted : undefined}
-          aria-busy={extract.isPending}
-        >
-          <Icon name="text" size={16} />
-        </button>
+        {!isXPost && (
+          <button
+            className={`tb-btn ${hasExtracted && showExtracted ? "on" : ""} ${
+              extract.isPending ? "spinning" : ""
+            }`}
+            onClick={() =>
+              hasExtracted ? setShowExtracted((v) => !v) : extract.mutate(a.id)
+            }
+            // Extraction needs the source URL; without one (and nothing
+            // extracted yet) the button can only error, so disable it.
+            disabled={extract.isPending || (!hasExtracted && !a.url)}
+            title={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
+            aria-label={hasExtracted ? t("reader.tbToggleFullText") : t("reader.tbExtractFullText")}
+            aria-pressed={hasExtracted ? showExtracted : undefined}
+            aria-busy={extract.isPending}
+          >
+            <Icon name="text" size={16} />
+          </button>
+        )}
         <button
           className={`tb-btn ${aiOpen ? "on" : ""}`}
           title={t("reader.tbAiSummary")}

@@ -1031,6 +1031,80 @@ pub fn delete_newsletter_source(conn: &Connection, feed_id: i64) -> AppResult<()
     Ok(())
 }
 
+/// The `source_type` of the feed an article belongs to, or `None` for an
+/// unknown article id. Lets callers treat parser-served content differently —
+/// most importantly, refuse to web-extract it (see `extract_fulltext`).
+pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.source_type
+         FROM articles a JOIN feeds f ON f.id = a.feed_id
+         WHERE a.id = ?1",
+    )?;
+    let mut rows = stmt.query(params![article_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// Re-render an existing parser article in place, returning whether anything
+/// changed.
+///
+/// Parser feeds generate their body from papr's own renderer, so the stored
+/// markup can go stale when the renderer changes — and a plain re-fetch cannot
+/// fix it, because the same `(feed_id, guid)` is skipped as a duplicate. This
+/// updates the renderer-owned columns for a row that already exists and clears
+/// `extracted_html`: for a parser feed that column can only hold a previous web
+/// extraction of the site's SPA shell, which is exactly what must not win over
+/// the rendered card. Read state, stars, read-later, tags, highlights and the
+/// AI summary are deliberately left alone.
+pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
+    let existing: Option<(i64, Option<String>, Option<String>, String)> = conn
+        .query_row(
+            "SELECT id, content_html, extracted_html, body_text
+             FROM articles WHERE feed_id = ?1 AND guid = ?2",
+            params![feed_id, a.guid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((id, content_html, extracted_html, body_text)) = existing else {
+        return Ok(false);
+    };
+    // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
+    // and rewriting identical bytes would churn WAL pages and re-index FTS.
+    let rendered_differs =
+        content_html.as_deref() != a.content_html.as_deref() || body_text != a.body_text;
+    let stale_extraction = extracted_html.is_some();
+    if !rendered_differs && !stale_extraction {
+        return Ok(false);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE articles
+            SET title = ?2, summary = ?3, content_html = ?4, body_text = ?5,
+                image_url = COALESCE(?6, image_url),
+                published_at = COALESCE(?7, published_at),
+                extracted_html = NULL
+          WHERE id = ?1",
+        params![
+            id,
+            a.title,
+            a.summary,
+            a.content_html,
+            a.body_text,
+            a.image_url,
+            a.published_at
+        ],
+    )?;
+    tx.execute(
+        "UPDATE articles_fts SET title = ?2, body = ?3 WHERE rowid = ?1",
+        params![id, a.title, a.body_text],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// `(feed_id, feed_url)` for every parser feed (`source_type = 'x'`), the
 /// shape the parser leg of `refresh_core` needs — the feed_url carries the
 /// handle, and no revalidators exist because the GraphQL API sends no
@@ -3036,6 +3110,143 @@ mod tests {
             color,
             note,
         }
+    }
+
+    #[test]
+    fn parser_article_refresh_updates_markup_clears_junk_and_keeps_user_state() {
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            Some("https://x.com/jack"),
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let mut article = NewArticle {
+            guid: "800".into(),
+            url: Some("https://x.com/jack/status/800".into()),
+            title: "jack".into(),
+            author: None,
+            summary: Some("old summary".into()),
+            content_html: Some("<div>old bare markup</div>".into()),
+            body_text: "old body".into(),
+            image_url: None,
+            published_at: Some("2026-09-13T06:20:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE feed_id = ?1 AND guid = '800'",
+                params![feed_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            article_feed_source_type(&conn, id).unwrap().as_deref(),
+            Some("x")
+        );
+
+        // Unchanged markup is a no-op (a refresh re-renders the same tweet
+        // thousands of times; it must not churn the WAL or re-index FTS).
+        assert!(!refresh_parser_article(&conn, feed_id, &article).unwrap());
+
+        // Simulate an article stored by an older version: a bare body, a web
+        // extraction of x.com's SPA shell in `extracted_html`, and user state.
+        conn.execute(
+            "UPDATE articles SET is_read = 1, is_starred = 1, read_later = 1,
+                    extracted_html = '<p>Log in or sign up for X</p>'
+              WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        article.content_html = Some("<div class=\"x-tweet\">card</div>".into());
+        article.body_text = "new body".into();
+        article.summary = Some("new summary".into());
+        assert!(refresh_parser_article(&conn, feed_id, &article).unwrap());
+
+        let (content, extracted, body, is_read, starred, later, summary): (
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT content_html, extracted_html, body_text, is_read, is_starred,
+                        read_later, summary
+                   FROM articles WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Renderer-owned columns follow the new render.
+        assert_eq!(
+            content.as_deref(),
+            Some("<div class=\"x-tweet\">card</div>")
+        );
+        assert_eq!(body, "new body");
+        assert_eq!(summary.as_deref(), Some("new summary"));
+        // The junk extraction is gone: it can only ever have been the site's
+        // logged-out shell, and it must not win over the card.
+        assert_eq!(extracted, None);
+        // The user's own state survives a re-render.
+        assert_eq!((is_read, starred, later), (1, 1, 1));
+
+        // The search index follows the body it indexes.
+        let indexed: String = conn
+            .query_row(
+                "SELECT body FROM articles_fts WHERE rowid = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, "new body");
+    }
+
+    #[test]
+    fn refresh_parser_article_ignores_unknown_rows() {
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let article = NewArticle {
+            guid: "not-stored".into(),
+            url: None,
+            title: "jack".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(!refresh_parser_article(&conn, feed_id, &article).unwrap());
+        assert!(article_feed_source_type(&conn, 424242).unwrap().is_none());
     }
 
     #[test]

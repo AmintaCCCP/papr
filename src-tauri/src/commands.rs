@@ -624,6 +624,22 @@ pub async fn smart_counts(state: State<'_, AppState>) -> AppResult<SmartCounts> 
 /// Stores the result so subsequent reads are instant/offline.
 #[tauri::command]
 pub async fn extract_fulltext(state: State<'_, AppState>, article_id: i64) -> AppResult<String> {
+    // Parser feeds already deliver their final content from our own renderer
+    // (an X timeline, generated card and all). Fetching the article URL to
+    // "extract" it would hand back the site's SPA shell — for x.com that is the
+    // logged-out landing page: "Log in or sign up", "Relevant people",
+    // "What's happening", the footer — which then replaces the real post.
+    // Refused here so the desktop app *and* the agent CLI are both protected.
+    {
+        let conn = state.read().await;
+        let source_type = db::article_feed_source_type(&conn, article_id)?;
+        if source_type
+            .as_deref()
+            .is_some_and(crate::ingestion::parsers::is_parser_source_type)
+        {
+            return Err(AppError::code("parserNoExtract"));
+        }
+    }
     let url = {
         let conn = state.read().await;
         db::get_article(&conn, article_id)?
@@ -1374,23 +1390,45 @@ pub async fn ai_translate(
     // mid-stream.
     let backend = translate::ready(sel)?;
 
-    // Split by an engine-specific budget so a short article translates in one
-    // request and a long one is chunked to fit the engine's per-call limits.
-    let batches = translate::chunk_blocks(&source_html, translate::chunk_budget(&engine));
+    // A parser-rendered tweet card translates differently: only its bodies are
+    // content. Chrome (author head, handle, date, the RT marker) is metadata —
+    // sending it would both waste the request and yield a translated author
+    // name — and the card markup must survive, which whole-batch translation
+    // cannot guarantee (the model's output is re-sanitized into plain blocks).
+    // Everything else splits by an engine-specific budget so a short article
+    // translates in one request and a long one is chunked to fit the engine's
+    // per-call limits.
+    let is_card = translate::is_tweet_card(&source_html);
+    let batches = if is_card {
+        translate::tweet_body_batches(&source_html)
+    } else {
+        translate::chunk_blocks(&source_html, translate::chunk_budget(&engine))
+    };
     let total = batches.len();
     let _ = on_event.send(TranslateEvent::Start { total });
 
     let system = translate::translate_system_prompt(translate::language_name(&target));
     let mut full = String::new();
+    // Translated tweet bodies, in document order, for the splice below.
+    let mut bodies: Vec<String> = Vec::new();
     for (i, batch) in batches.iter().enumerate() {
         let raw = backend
             .translate_batch(&http, &system, batch, &target)
             .await?;
         // Engine output (LLM or machine translation) is untrusted, so each batch
-        // passes through the same sanitizer as feed HTML before it reaches the
-        // webview or the database. Source URLs are already absolute (sanitized at
-        // ingestion), so no base is needed.
-        let clean = sanitize::sanitize(raw.trim(), None);
+        // passes through a sanitizer before it reaches the webview or the
+        // database. Source URLs are already absolute (sanitized at ingestion),
+        // so no base is needed. A card body keeps the class-aware policy so the
+        // spliced result still renders inside the card.
+        let clean = if is_card {
+            sanitize::sanitize_parser(raw.trim(), None)
+        } else {
+            sanitize::sanitize(raw.trim(), None)
+        };
+        if is_card {
+            bodies.push(clean);
+            continue;
+        }
         full.push_str(&clean);
         full.push('\n');
         let _ = on_event.send(TranslateEvent::Batch {
@@ -1399,7 +1437,20 @@ pub async fn ai_translate(
         });
     }
 
-    let final_html = full.trim().to_string();
+    let final_html = if is_card {
+        // Reassemble around the source card: the head, wrappers and classes
+        // come from our renderer, only the bodies are engine output. No
+        // incremental Batch events on this path — a card is one or two short
+        // bodies, and a partial splice could not be rendered as a card anyway.
+        let spliced = translate::splice_tweet_bodies(&source_html, &bodies);
+        let _ = on_event.send(TranslateEvent::Batch {
+            html: String::new(),
+            done: total,
+        });
+        spliced
+    } else {
+        full.trim().to_string()
+    };
     if !final_html.is_empty() {
         let conn = state.db.lock().await;
         db::set_translation(&conn, article_id, &final_html, &target)?;

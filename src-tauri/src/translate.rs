@@ -7,9 +7,11 @@
 use crate::ai;
 use crate::error::{AppError, AppResult};
 use ego_tree::NodeId;
+use lol_html::html_content::ContentType;
+use lol_html::{element, rewrite_str, RewriteStrSettings};
 use reqwest::Client;
 use scraper::node::Node;
-use scraper::{ElementRef, Html};
+use scraper::{ElementRef, Html, Selector};
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,6 +29,58 @@ pub fn language_name(code: &str) -> &'static str {
         "ja" => "Japanese",
         _ => "English",
     }
+}
+
+/// True when `html` is a parser-rendered tweet card. The `x-tweet-body` class
+/// is proof enough: the feed sanitizer strips every `class` attribute, so only
+/// the built-in parsers can put it in an article body.
+pub fn is_tweet_card(html: &str) -> bool {
+    let doc = Html::parse_fragment(html);
+    tweet_body_selector()
+        .ok()
+        .is_some_and(|sel| doc.select(&sel).next().is_some())
+}
+
+fn tweet_body_selector() -> Result<Selector, scraper::error::SelectorErrorKind<'static>> {
+    Selector::parse(".x-tweet-body")
+}
+
+/// The bodies of a tweet card, in document order — the only part worth
+/// translating. A card's chrome (author name, handle, date, the `RT` marker)
+/// is metadata: sending it to an engine both wastes the request and produces a
+/// "translated" author name, so it is never part of a batch.
+pub fn tweet_body_batches(html: &str) -> Vec<String> {
+    let doc = Html::parse_fragment(html);
+    let Ok(sel) = tweet_body_selector() else {
+        return Vec::new();
+    };
+    doc.select(&sel).map(|body| body.inner_html()).collect()
+}
+
+/// Put translated bodies back into the card, leaving every other node — the
+/// author head, the card and quote wrappers, all `x-*` classes — exactly as the
+/// parser rendered it. Bodies are matched by document order; a translation list
+/// shorter than the body count leaves the remaining bodies in their source
+/// language rather than corrupting the card.
+pub fn splice_tweet_bodies(html: &str, translated: &[String]) -> String {
+    let next = std::cell::Cell::new(0usize);
+    let rewritten = rewrite_str(
+        html,
+        RewriteStrSettings {
+            element_content_handlers: vec![element!(".x-tweet-body", |el| {
+                let index = next.get();
+                next.set(index + 1);
+                if let Some(replacement) = translated.get(index) {
+                    // `ContentType::Html` is right here: the replacement is the
+                    // sanitized output of an engine, i.e. markup, not text.
+                    el.set_inner_content(replacement, ContentType::Html);
+                }
+                Ok(())
+            })],
+            ..RewriteStrSettings::default()
+        },
+    );
+    rewritten.unwrap_or_else(|_| html.to_string())
 }
 
 /// Build the system prompt instructing the model to translate one batch of HTML
@@ -230,7 +284,9 @@ fn collect_text(doc: &Html) -> (Vec<TextSlot>, Vec<String>) {
     let mut slots = Vec::new();
     let mut cores = Vec::new();
     for node in doc.tree.nodes() {
-        let Node::Text(t) = node.value() else { continue };
+        let Node::Text(t) = node.value() else {
+            continue;
+        };
         let s: &str = t;
         if s.trim().is_empty() {
             continue;
@@ -246,7 +302,11 @@ fn collect_text(doc: &Html) -> (Vec<TextSlot>, Vec<String>) {
         // Whitespace is ASCII, so these byte slices never split a UTF-8 char.
         let prefix = s[..s.len() - s.trim_start().len()].to_string();
         let suffix = s[s.trim_end().len()..].to_string();
-        slots.push(TextSlot { id: node.id(), prefix, suffix });
+        slots.push(TextSlot {
+            id: node.id(),
+            prefix,
+            suffix,
+        });
         cores.push(s.trim().to_string());
     }
     (slots, cores)
@@ -420,11 +480,7 @@ async fn google_segments(
 
 /// One `translate_a/t` request for `batch`, returning its positionally aligned
 /// translations.
-async fn google_request(
-    client: &Client,
-    batch: &[&str],
-    target: &str,
-) -> AppResult<Vec<String>> {
+async fn google_request(client: &Client, batch: &[&str], target: &str) -> AppResult<Vec<String>> {
     let form: Vec<(&str, &str)> = batch.iter().map(|c| ("q", *c)).collect();
     let resp = client
         .post("https://clients5.google.com/translate_a/t")
@@ -441,13 +497,17 @@ async fn google_request(
         return Err(http_error(resp, "Google").await);
     }
     let v: Value = resp.json().await.map_err(|e| {
-        AppError::other(format!("Google translate error: decoding response failed ({e})"))
+        AppError::other(format!(
+            "Google translate error: decoding response failed ({e})"
+        ))
     })?;
     let parsed = parse_google_segments(&v)?;
     // The endpoint answers one entry per `q`; a shorter or longer response
     // would silently misalign every following text node.
     if parsed.len() != batch.len() {
-        return Err(AppError::other("Google translate error: segment count mismatch"));
+        return Err(AppError::other(
+            "Google translate error: segment count mismatch",
+        ));
     }
     Ok(parsed)
 }
@@ -467,7 +527,9 @@ fn parse_google_segments(v: &Value) -> AppResult<Vec<String>> {
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
                 .ok_or_else(|| AppError::other("Google translate error: malformed response")),
-            _ => Err(AppError::other("Google translate error: malformed response")),
+            _ => Err(AppError::other(
+                "Google translate error: malformed response",
+            )),
         })
         .collect()
 }
@@ -501,11 +563,7 @@ fn deepl_timestamp(i_count: u64) -> u64 {
     ts - (ts % n) + n
 }
 
-async fn deepl_segments(
-    client: &Client,
-    cores: &[String],
-    target: &str,
-) -> AppResult<Vec<String>> {
+async fn deepl_segments(client: &Client, cores: &[String], target: &str) -> AppResult<Vec<String>> {
     let mut out = Vec::with_capacity(cores.len());
     for chunk in cores.chunks(50) {
         out.extend(deepl_free_call(client, chunk, target).await?);
@@ -558,7 +616,9 @@ async fn deepl_free_call(
         return Err(http_error(resp, "DeepL").await);
     }
     let v: Value = resp.json().await.map_err(|e| {
-        AppError::other(format!("DeepL translate error: decoding response failed ({e})"))
+        AppError::other(format!(
+            "DeepL translate error: decoding response failed ({e})"
+        ))
     })?;
     let arr = v
         .pointer("/result/texts")
@@ -566,7 +626,12 @@ async fn deepl_free_call(
         .ok_or_else(|| AppError::other("DeepL translate error: malformed response"))?;
     Ok(arr
         .iter()
-        .map(|t| t.get("text").and_then(|x| x.as_str()).unwrap_or_default().to_string())
+        .map(|t| {
+            t.get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
         .collect())
 }
 
@@ -581,11 +646,7 @@ const BING_MAX_SEGMENTS: usize = 100;
 /// The body is an array of plain strings translated positionally. The endpoint
 /// rejects UA-less clients with 400 ("Client Browser Version not supported"),
 /// so it depends on the shared client's desktop `User-Agent` — don't strip it.
-async fn bing_segments(
-    client: &Client,
-    cores: &[String],
-    target: &str,
-) -> AppResult<Vec<String>> {
+async fn bing_segments(client: &Client, cores: &[String], target: &str) -> AppResult<Vec<String>> {
     let mut out = Vec::with_capacity(cores.len());
     for chunk in cores.chunks(BING_MAX_SEGMENTS) {
         let resp = client
@@ -603,7 +664,9 @@ async fn bing_segments(
             return Err(http_error(resp, "Bing").await);
         }
         let v: Value = resp.json().await.map_err(|e| {
-            AppError::other(format!("Bing translate error: decoding response failed ({e})"))
+            AppError::other(format!(
+                "Bing translate error: decoding response failed ({e})"
+            ))
         })?;
         out.extend(parse_bing_segments(&v, chunk.len())?);
     }
@@ -619,7 +682,9 @@ fn parse_bing_segments(v: &Value, expected: usize) -> AppResult<Vec<String>> {
         .as_array()
         .ok_or_else(|| AppError::other("Bing translate error: malformed response"))?;
     if arr.len() != expected {
-        return Err(AppError::other("Bing translate error: segment count mismatch"));
+        return Err(AppError::other(
+            "Bing translate error: segment count mismatch",
+        ));
     }
     arr.iter()
         .map(|item| {
@@ -637,6 +702,72 @@ fn parse_bing_segments(v: &Value, expected: usize) -> AppResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parser cards ────────────────────────────────────────────────────
+
+    const CARD: &str = r#"<div class="x-tweet"><div class="x-tweet-head"><span class="x-chip">RT</span><span class="x-author"><strong>Display Name</strong><span class="x-handle">@jack</span></span><a class="x-permalink" href="https://x.com/jack/status/800">2026-09-13</a></div><blockquote class="x-quote"><div class="x-tweet-head"><span class="x-author"><strong>Original</strong><span class="x-handle">@orig</span></span><a class="x-permalink" href="https://x.com/orig/status/900">2026-09-12</a></div><div class="x-tweet-body">原推文 <a href="https://example.com/a">链接</a></div></blockquote></div>"#;
+
+    #[test]
+    fn a_tweet_card_is_recognised_by_its_body_class() {
+        assert!(is_tweet_card(CARD));
+        // Ordinary article HTML never matches — feed HTML loses every class at
+        // ingestion, so this cannot be spoofed by a feed.
+        assert!(!is_tweet_card("<p>plain <a href=\"#\">article</a></p>"));
+        assert!(!is_tweet_card(""));
+    }
+
+    #[test]
+    fn only_tweet_bodies_become_batches() {
+        let batches = tweet_body_batches(CARD);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].contains("原推文"));
+        // The author chrome is not content: no name, handle, date or RT marker
+        // may reach a translation engine.
+        assert!(!batches[0].contains("Display Name"));
+        assert!(!batches[0].contains("@jack"));
+        assert!(!batches[0].contains("2026-09-1"));
+        assert!(!batches[0].contains("RT"));
+    }
+
+    #[test]
+    fn a_plain_article_has_no_tweet_batches() {
+        assert!(tweet_body_batches("<p>hello</p><p>world</p>").is_empty());
+    }
+
+    #[test]
+    fn splicing_replaces_bodies_and_keeps_every_other_node() {
+        let out = splice_tweet_bodies(CARD, &["翻译后的原文".to_string()]);
+        // The translated body replaced the source text…
+        assert!(out.contains("翻译后的原文"), "{out}");
+        assert!(!out.contains("原推文"), "{out}");
+        // …while the card, its classes and the whole head survived untouched.
+        assert!(out.contains(r#"class="x-tweet""#), "{out}");
+        assert!(out.contains(r#"class="x-quote""#), "{out}");
+        assert!(out.contains(r#"class="x-tweet-body""#), "{out}");
+        assert!(out.contains("Display Name"), "{out}");
+        assert!(out.contains("@jack"), "{out}");
+        assert!(out.contains("2026-09-13"), "{out}");
+        assert!(out.contains(r#"class="x-chip""#), "{out}");
+    }
+
+    #[test]
+    fn splicing_two_bodies_in_document_order() {
+        let html = r#"<div class="x-tweet"><div class="x-tweet-head">head</div><div class="x-tweet-body">one</div><blockquote class="x-quote"><div class="x-tweet-head">head2</div><div class="x-tweet-body">two</div></blockquote></div>"#;
+        let out = splice_tweet_bodies(html, &["一".into(), "二".into()]);
+        assert!(out.contains(">一<"), "{out}");
+        assert!(out.contains(">二<"), "{out}");
+        assert!(out.contains("head2"), "{out}");
+    }
+
+    #[test]
+    fn a_short_translation_list_leaves_the_rest_in_source_language() {
+        // An engine that returned fewer batches must not shift a translation
+        // into the wrong body.
+        let html = r#"<div class="x-tweet"><div class="x-tweet-body">one</div><div class="x-tweet-body">two</div></div>"#;
+        let out = splice_tweet_bodies(html, &["一".into()]);
+        assert!(out.contains(">一<"), "{out}");
+        assert!(out.contains(">two<"), "{out}");
+    }
 
     // ── chunk_blocks ────────────────────────────────────────────────────
 
@@ -714,7 +845,10 @@ mod tests {
         let p = translate_system_prompt("Japanese");
         let lower = p.to_lowercase();
         assert!(lower.contains("html"), "no HTML mention: {p}");
-        assert!(lower.contains("preserve") || lower.contains("keep"), "no preserve directive: {p}");
+        assert!(
+            lower.contains("preserve") || lower.contains("keep"),
+            "no preserve directive: {p}"
+        );
     }
 
     // ── strip_code_fence ────────────────────────────────────────────────
@@ -851,7 +985,10 @@ mod tests {
         assert!(parse_google_segments(&json!([[null, "en"]])).is_err());
         // An empty body parses empty; the call site's count check is what
         // turns an empty response for a non-empty request into an error.
-        assert_eq!(parse_google_segments(&json!([])).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_google_segments(&json!([])).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

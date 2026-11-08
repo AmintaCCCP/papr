@@ -739,7 +739,8 @@
     "xAuthInvalid": "X authentication has expired (auth_token/ct0 invalid) — update the credentials in Settings → Parsers.",
     "xAccountUnavailable": "This X user's timeline is unavailable (the account may not exist, be restricted, or be gone).",
     "xBlocked": "The X request was refused (HTTP 403 — firewall challenge, IP restriction, or account restriction). Try configuring a network proxy in Settings → Advanced.",
-    "xHandleInvalid": "Invalid X username (1–15 letters, digits or underscores)."
+    "xHandleInvalid": "Invalid X username (1–15 letters, digits or underscores).",
+    "parserNoExtract": "This article is produced by a built-in parser and is already complete — extracting the web page would only return its login shell and footer."
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

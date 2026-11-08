@@ -739,7 +739,8 @@
     "xAuthInvalid": "X 鉴权已失效（auth_token/ct0 无效或过期），请到 设置 → 解析器 中更新凭据。",
     "xAccountUnavailable": "无法获取该 X 用户的时间线（账号可能不存在、受限或已注销）。",
     "xBlocked": "X 请求被拒绝（HTTP 403，可能被防火墙拦截、IP 受限或账号受限）——可在 设置 → 高级 中配置网络代理后重试。",
-    "xHandleInvalid": "无效的 X 用户名（1–15 位字母、数字或下划线）。"
+    "xHandleInvalid": "无效的 X 用户名（1–15 位字母、数字或下划线）。",
+    "parserNoExtract": "该文章由内置解析器生成，已是完整内容——无需也不应再抓取网页正文（站点页面只会返回登录页/页脚）。"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

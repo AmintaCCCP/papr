@@ -461,8 +461,19 @@ async fn poll_parsers(
                 // sanitization is CPU-bound and must not starve queries.
                 let articles: Vec<db::NewArticle> =
                     page.tweets.iter().map(x::tweet_to_article).collect();
-                total_new += upsert_articles(db, *feed_id, &articles, dedup, rules, "x").await;
+                let inserted = upsert_articles(db, *feed_id, &articles, dedup, rules, "x").await;
+                total_new += inserted;
                 let conn = db.lock().await;
+                // Re-render rows that already existed. Without this a tweet
+                // stored before a renderer change would keep its old markup
+                // forever: re-fetching the same guid is a dedup hit, never a
+                // rewrite. Same for the junk a previous web extraction may have
+                // stored (cleared by the same call).
+                // Idempotent: rows whose markup already matches are skipped
+                // inside the helper, so this is one cheap SELECT per tweet.
+                for article in &articles {
+                    let _ = db::refresh_parser_article(&conn, *feed_id, article);
+                }
                 let _ = db::touch_feed(&conn, *feed_id);
             }
             Err(e) => {
