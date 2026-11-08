@@ -892,6 +892,10 @@ export default function Reader({ onToast }: Props) {
   };
 
   const ytId = a.sourceType === "youtube" ? youtubeId(a.url) : null;
+  // X articles are single tweets, already rendered as a card that names the
+  // author. The generic title line would only repeat that handle, so it is
+  // dropped and the card head is the one place authorship appears.
+  const isXPost = a.sourceType === "x";
 
   return (
     <div className="reader" role="main">
@@ -1090,27 +1094,38 @@ export default function Reader({ onToast }: Props) {
               useUi.getState().select({ kind: "feed", value: a.feedId }, a.feedTitle)
             }
           >
-            <Icon name="rss" size={13} />
+            {isXPost ? (
+              <span className="src-badge" aria-hidden="true">
+                X
+              </span>
+            ) : (
+              <Icon name="rss" size={13} />
+            )}
             {a.feedTitle}
           </button>
-          <h1 className="article-title">{a.title}</h1>
-          <div className="article-meta">
-            {a.author && <span className="author">{a.author}</span>}
-            {a.author && a.publishedAt && <span>·</span>}
-            {a.publishedAt && <span>{fullDate(a.publishedAt)}</span>}
-            {showReadingTime && (
-              <>
-                <span>·</span>
-                <span>{t("reader.readMinutes", { count: readMinutes })}</span>
-              </>
-            )}
-            {extract.isPending && (
-              <>
-                <span>·</span>
-                <span>{t("reader.extractingFullText")}</span>
-              </>
-            )}
-          </div>
+          {!isXPost && <h1 className="article-title">{a.title}</h1>}
+          {/* An X post's date lives in the card head, so the generic meta line
+              would print it twice — it only surfaces here while a full-text
+              extraction is in flight. */}
+          {(!isXPost || extract.isPending) && (
+            <div className="article-meta">
+              {!isXPost && a.author && <span className="author">{a.author}</span>}
+              {!isXPost && a.author && a.publishedAt && <span>·</span>}
+              {!isXPost && a.publishedAt && <span>{fullDate(a.publishedAt)}</span>}
+              {showReadingTime && !isXPost && (
+                <>
+                  <span>·</span>
+                  <span>{t("reader.readMinutes", { count: readMinutes })}</span>
+                </>
+              )}
+              {extract.isPending && (
+                <>
+                  {!isXPost && <span>·</span>}
+                  <span>{t("reader.extractingFullText")}</span>
+                </>
+              )}
+            </div>
+          )}
 
           {a.tags.length > 0 && (
             <div className="article-tags">

@@ -29,7 +29,9 @@ async fn ensure_success(resp: Response, service: &str) -> AppResult<Response> {
     }
     let status = resp.status();
     let detail = resp.text().await.unwrap_or_default();
-    Err(AppError::other(format!("{service} error {status}: {detail}")))
+    Err(AppError::other(format!(
+        "{service} error {status}: {detail}"
+    )))
 }
 
 /// Per-request cap for AI streaming. The shared HTTP client carries the
@@ -409,7 +411,10 @@ async fn consume_sse(
             match handle_sse_line(&line, provider, &mut full, &mut *sink)? {
                 LineOutcome::Continue => {}
                 LineOutcome::ChannelClosed => {
-                    return Ok(ChatOutcome { text: full, completed: false });
+                    return Ok(ChatOutcome {
+                        text: full,
+                        completed: false,
+                    });
                 }
             }
         }
@@ -425,11 +430,17 @@ async fn consume_sse(
         match handle_sse_line(&line, provider, &mut full, &mut *sink)? {
             LineOutcome::Continue => {}
             LineOutcome::ChannelClosed => {
-                return Ok(ChatOutcome { text: full, completed: false });
+                return Ok(ChatOutcome {
+                    text: full,
+                    completed: false,
+                });
             }
         }
     }
-    Ok(ChatOutcome { text: full, completed: true })
+    Ok(ChatOutcome {
+        text: full,
+        completed: true,
+    })
 }
 
 /// Detect a provider error object carried inside an SSE data frame.
@@ -556,8 +567,13 @@ mod tests {
         let mut got = Vec::new();
         let mut full = String::new();
         let line = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n";
-        let out = handle_sse_line(line, Provider::OpenAi, &mut full, &mut recording_sink(&mut got))
-            .unwrap();
+        let out = handle_sse_line(
+            line,
+            Provider::OpenAi,
+            &mut full,
+            &mut recording_sink(&mut got),
+        )
+        .unwrap();
         assert!(matches!(out, LineOutcome::Continue));
         assert_eq!(full, "hi");
         assert_eq!(got, vec!["hi"]);
@@ -568,8 +584,13 @@ mod tests {
         let mut got = Vec::new();
         let mut full = String::new();
         for line in [": keep-alive comment\n", "data: [DONE]\n", "\n"] {
-            handle_sse_line(line, Provider::OpenAi, &mut full, &mut recording_sink(&mut got))
-                .unwrap();
+            handle_sse_line(
+                line,
+                Provider::OpenAi,
+                &mut full,
+                &mut recording_sink(&mut got),
+            )
+            .unwrap();
         }
         assert!(full.is_empty());
         assert!(got.is_empty());
@@ -579,8 +600,8 @@ mod tests {
     fn sse_line_surfaces_a_mid_stream_error() {
         let mut full = String::new();
         let line = "data: {\"error\":{\"message\":\"rate limited\"}}\n";
-        let err = handle_sse_line(line, Provider::OpenAi, &mut full, &mut |_: &str| true)
-            .unwrap_err();
+        let err =
+            handle_sse_line(line, Provider::OpenAi, &mut full, &mut |_: &str| true).unwrap_err();
         assert!(err.to_string().contains("rate limited"));
     }
 
@@ -602,7 +623,13 @@ mod tests {
         let mut got = Vec::new();
         let mut full = String::new();
         let last = "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}";
-        handle_sse_line(last, Provider::OpenAi, &mut full, &mut recording_sink(&mut got)).unwrap();
+        handle_sse_line(
+            last,
+            Provider::OpenAi,
+            &mut full,
+            &mut recording_sink(&mut got),
+        )
+        .unwrap();
         assert_eq!(full, "!");
         assert_eq!(got, vec!["!"]);
     }
@@ -653,8 +680,8 @@ mod tests {
         // DeepSeek has no model or base URL set, so it must fall back to its
         // own defaults — not OpenAI's — while still speaking the OpenAI wire
         // format (it is OpenAI-compatible).
-        let cfg = AiConfig::new(Some("deepseek".into()), Some("sk-key".into()), None, None)
-            .unwrap();
+        let cfg =
+            AiConfig::new(Some("deepseek".into()), Some("sk-key".into()), None, None).unwrap();
         assert_eq!(cfg.model, "deepseek-chat");
         assert_eq!(cfg.base_url, "https://api.deepseek.com");
         assert!(cfg.provider.is_openai_compatible());
@@ -688,46 +715,152 @@ mod tests {
         assert_eq!(cfg.model, "gpt-4.1-mini");
     }
 
-    async fn connection_fixture(body: &'static str, status: &'static str) -> super::AppResult<super::TestOutcome> {
+    async fn connection_fixture(
+        body: &'static str,
+        status: &'static str,
+    ) -> super::AppResult<super::TestOutcome> {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let mut request = [0; 8192];
-            let count = socket.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..count]);
-            assert!(request.starts_with("POST /v1/chat/completions "));
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer test-key"));
-            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            // Serve every connection until the client stops opening them, and
+            // read each request *completely* (headers then body) before
+            // answering. The previous version answered after one partial
+            // `read` on the first connection only: under parallel test load the
+            // response could race the client's still-in-flight request write
+            // (hyper reports `Parse(Status)`), and any second connection hit a
+            // closed listener. That made this fixture flaky as soon as the suite
+            // grew; full-read + serve-until-idle removes both hazards.
+            // Non-blocking accept with an idle exit: the request count is not
+            // ours to predict, but once the client has stopped connecting for a
+            // moment — or never started within the deadline — the fixture ends
+            // and `join()` returns.
+            listener.set_nonblocking(true).unwrap();
+            const IDLE_EXIT: std::time::Duration = std::time::Duration::from_millis(300);
+            const START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+            let started = std::time::Instant::now();
+            let mut served = 0usize;
+            let mut last_accept: Option<std::time::Instant> = None;
+            loop {
+                let stream = match listener.accept() {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        let done = if served == 0 {
+                            started.elapsed() > START_DEADLINE
+                        } else {
+                            last_accept.is_some_and(|t| t.elapsed() > IDLE_EXIT)
+                        };
+                        if done {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                served += 1;
+                last_accept = Some(std::time::Instant::now());
+                let (mut socket, _) = stream;
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Headers first, then exactly `content-length` body bytes.
+                let header_end = loop {
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break None,
+                        Ok(n) => {
+                            request.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = find_header_end(&request) {
+                                break Some(pos);
+                            }
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let content_length = parse_content_length(&request[..header_end]);
+                while request.len() < header_end + content_length {
+                    match socket.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+
+                let request = String::from_utf8_lossy(&request);
+                assert!(
+                    request.starts_with("POST /v1/chat/completions "),
+                    "{request}"
+                );
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-key"),
+                    "{request}"
+                );
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                socket.flush().ok();
+            }
         });
         let cfg = super::AiConfig::new(
-            Some("openai".into()), Some("test-key".into()),
-            Some("test-model".into()), Some(format!("http://{address}/v1")),
-        ).unwrap();
+            Some("openai".into()),
+            Some("test-key".into()),
+            Some("test-model".into()),
+            Some(format!("http://{address}/v1")),
+        )
+        .unwrap();
         let result = super::test_connection(&reqwest::Client::new(), &cfg).await;
         server.join().unwrap();
         result
     }
 
+    /// Byte offset just past the request's CRLFCRLF header terminator.
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    /// `Content-Length` of a raw request head (0 when absent/unparsable).
+    fn parse_content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0)
+    }
+
     #[tokio::test]
     async fn connection_test_accepts_streamed_text() {
         let result = connection_fixture(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n", "200 OK",
-        ).await.unwrap();
+            "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n",
+            "200 OK",
+        )
+        .await
+        .unwrap();
         assert_eq!(result.reply, "OK");
         assert_eq!(result.model, "test-model");
     }
 
     #[tokio::test]
     async fn connection_test_rejects_empty_stream() {
-        assert!(connection_fixture("data: [DONE]\n\n", "200 OK").await.is_err());
+        assert!(connection_fixture("data: [DONE]\n\n", "200 OK")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn connection_test_rejects_auth_failure() {
-        assert!(connection_fixture("{\"error\":{\"message\":\"invalid key\"}}", "401 Unauthorized").await.is_err());
+        assert!(connection_fixture(
+            "{\"error\":{\"message\":\"invalid key\"}}",
+            "401 Unauthorized"
+        )
+        .await
+        .is_err());
     }
 
     /// Live check against a real provider — the only way to cover the request

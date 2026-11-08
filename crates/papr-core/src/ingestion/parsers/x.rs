@@ -28,7 +28,7 @@
 
 use crate::db;
 use crate::error::AppError;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -371,8 +371,16 @@ pub struct XUserProfile {
 pub struct XTweet {
     /// Tweet snowflake id — the stable dedup key (`articles.guid`).
     pub id: String,
+    /// The followed account whose timeline this came from.
     pub handle: String,
+    /// Display name of the account that *posted* this entry (the retweeter for
+    /// a retweet). `None` when the payload omitted it — the card then falls
+    /// back to the handle.
+    pub author_name: Option<String>,
+    /// The ready-to-render card (head + body + any nested quote).
     pub content_html: String,
+    /// Plain text of the *content*: the original's text for a retweet, so
+    /// list snippets read as the tweet rather than "RT @…".
     pub text: String,
     /// Permalink `https://x.com/<handle>/status/<id>`.
     pub url: String,
@@ -380,6 +388,28 @@ pub struct XTweet {
     /// First photo's CDN URL — the article-list thumbnail.
     pub image_url: Option<String>,
     /// Best-quality mp4 variant, when the tweet carries a video/GIF.
+    pub video_url: Option<String>,
+    /// Set when this entry is a retweet: the original tweet it forwards.
+    pub retweeted: Option<XNestedTweet>,
+    /// Set when this tweet quotes another: that quoted tweet.
+    pub quoted: Option<XNestedTweet>,
+}
+
+/// A tweet embedded inside another one — the retweet target or the quoted
+/// tweet. Carries its own author so a card can say exactly whose tweet it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XNestedTweet {
+    pub id: String,
+    /// Original author's screen name; `None` when the payload omitted it (the
+    /// permalink then falls back to the `/i/status/<id>` form, which resolves
+    /// without one).
+    pub handle: Option<String>,
+    pub author_name: Option<String>,
+    pub content_html: String,
+    pub text: String,
+    pub url: String,
+    pub published_at: Option<String>,
+    pub image_url: Option<String>,
     pub video_url: Option<String>,
 }
 
@@ -730,6 +760,137 @@ fn tweet_text_entities(legacy: &serde_json::Value) -> Vec<TextEntity> {
     entities
 }
 
+/// UTC date (`2026-09-13`) for a card's permalink label. UTC on purpose: the
+/// card is stored at ingest time, so a locally-rendered date would freeze one
+/// machine's time zone into the article forever (and make tests depend on the
+/// host's zone). The reader header still shows the localized full timestamp.
+fn card_date_label(published_at: Option<&str>) -> String {
+    published_at
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// The card's head line: who posted (display name + `@handle`), an optional
+/// chip (the `RT` marker on retweets), and the date as a link to that exact
+/// tweet. Only the posting account appears here — the payload's own text is
+/// rendered below, so the head never repeats content.
+fn card_head(
+    author_name: Option<&str>,
+    handle: Option<&str>,
+    url: &str,
+    published_at: Option<&str>,
+    chip: Option<&str>,
+) -> String {
+    let handle = handle.unwrap_or_default();
+    let name = escape_html_text(
+        author_name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(handle),
+    );
+    let chip_html = chip
+        .map(|c| format!(r#"<span class="x-chip">{}</span>"#, escape_html_text(c)))
+        .unwrap_or_default();
+    let handle_html = if handle.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<span class="x-handle">@{}</span>"#,
+            escape_html_text(handle)
+        )
+    };
+    let date = card_date_label(published_at);
+    let link = if date.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<a class="x-permalink" href="{}">{}</a>"#,
+            escape_html_text(url),
+            escape_html_text(&date)
+        )
+    };
+    format!(
+        r#"<div class="x-tweet-head">{chip_html}<span class="x-author"><strong>{name}</strong>{handle_html}</span>{link}</div>"#
+    )
+}
+
+/// A nested tweet (retweet target or quote) as an indented block: the original
+/// author's head, then the original content. `blockquote` is in ammonia's
+/// default allow-list, so this needs no extra permission.
+fn nested_block(tweet: &XNestedTweet) -> String {
+    format!(
+        r#"<blockquote class="x-quote">{}{}</blockquote>"#,
+        card_head(
+            tweet.author_name.as_deref(),
+            tweet.handle.as_deref(),
+            &tweet.url,
+            tweet.published_at.as_deref(),
+            None,
+        ),
+        format!(r#"<div class="x-tweet-body">{}</div>"#, tweet.content_html)
+    )
+}
+
+/// Read `(display name, screen name)` off a tweet result, modern `core` shape
+/// first, then the legacy one. Screen names are lowercased to match the feed
+/// URL convention; an invalid one is dropped rather than rendered.
+fn result_author(result: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let user = result.pointer("/core/user_results/result");
+    let name = user
+        .and_then(|u| u.pointer("/core/name"))
+        .or_else(|| user.and_then(|u| u.pointer("/legacy/name")))
+        .or_else(|| result.pointer("/user/legacy/name"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let handle = user
+        .and_then(|u| u.pointer("/legacy/screen_name"))
+        .or_else(|| user.and_then(|u| u.pointer("/core/screen_name")))
+        .or_else(|| result.pointer("/user/legacy/screen_name"))
+        .and_then(|v| v.as_str())
+        .filter(|s| is_valid_handle(s))
+        .map(|s| s.to_lowercase());
+    (name, handle)
+}
+
+/// Map a nested tweet result (`retweeted_status_result.result` /
+/// `quoted_status_result.result`) into an [`XNestedTweet`]. Tombstones and
+/// payloads without text yield `None` — the outer card then simply omits the
+/// nested block.
+fn nested_tweet(result: &serde_json::Value) -> Option<XNestedTweet> {
+    if result.get("__typename").and_then(|t| t.as_str()) == Some("TweetTombstone") {
+        return None;
+    }
+    let legacy = result.get("legacy")?;
+    let full_text = legacy.get("full_text").and_then(|t| t.as_str())?;
+    let id = result.get("rest_id").and_then(|v| v.as_str())?;
+    let (author_name, handle) = result_author(result);
+    let media = extract_media(legacy);
+    let entities = tweet_text_entities(legacy);
+    let published_at = legacy
+        .get("created_at")
+        .and_then(|c| c.as_str())
+        .and_then(tweet_created_at_to_rfc3339)
+        .or_else(|| tweet_snowflake_to_rfc3339(id));
+    let url = match &handle {
+        Some(h) => format!("https://x.com/{h}/status/{id}"),
+        // `/i/status/<id>` resolves without a screen name, so a payload that
+        // omits the author still links to the right tweet.
+        None => format!("https://x.com/i/status/{id}"),
+    };
+    Some(XNestedTweet {
+        id: id.to_string(),
+        handle,
+        author_name,
+        content_html: render_tweet_html(full_text, &entities, &media),
+        text: tweet_plain_text(full_text, &entities),
+        url,
+        published_at,
+        image_url: media.iter().find_map(|m| m.image_url.clone()),
+        video_url: media.iter().find_map(|m| m.video_url.clone()),
+    })
+}
+
 /// Map one timeline entry's tweet (`result` value) to an [`XTweet`], or
 /// `None` when the entry is a tombstone / reference without full text.
 fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -> Option<XTweet> {
@@ -752,26 +913,81 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
 
     let media = extract_media(legacy);
     let text_entities = tweet_text_entities(legacy);
-    let content_html = render_tweet_html(full_text, &text_entities, &media);
-    let text = tweet_plain_text(full_text, &text_entities);
+
+    // The two ways another account's tweet rides along: a retweet forwards one
+    // verbatim, a quote adds the author's own commentary above it.
+    let retweeted = legacy
+        .pointer("/retweeted_status_result/result")
+        .and_then(nested_tweet);
+    let quoted = legacy
+        .pointer("/quoted_status_result/result")
+        .and_then(nested_tweet);
+
+    // A retweet's own `full_text` is just "RT @orig: …" — the nested block
+    // carries that exact text, so the card renders no body above it (both
+    // would be the same sentence twice).
+    let body = if retweeted.is_some() {
+        None
+    } else {
+        Some(render_tweet_html(full_text, &text_entities, &media))
+    };
+    // The list snippet reads as the content, not as an "RT @…" notice.
+    let text = match &retweeted {
+        Some(r) => r.text.clone(),
+        None => tweet_plain_text(full_text, &text_entities),
+    };
     let published_at = legacy
         .get("created_at")
         .and_then(|c| c.as_str())
         .and_then(tweet_created_at_to_rfc3339)
         .or_else(|| tweet_snowflake_to_rfc3339(&tweet_id));
-    let image_url = media.iter().find_map(|m| m.image_url.clone());
-    let video_url = media.iter().find_map(|m| m.video_url.clone());
-    let url = format!("https://x.com/{handle}/status/{tweet_id}");
+    let (author_name, author_handle) = result_author(result);
+    let url = format!(
+        "https://x.com/{}/status/{tweet_id}",
+        author_handle.as_deref().unwrap_or(handle)
+    );
+
+    // Thumbnail / player source follow the visible content: for a retweet that
+    // is the original's media, otherwise this tweet's own.
+    let (image_url, video_url) = match &retweeted {
+        Some(r) => (r.image_url.clone(), r.video_url.clone()),
+        None => (
+            media.iter().find_map(|m| m.image_url.clone()),
+            media.iter().find_map(|m| m.video_url.clone()),
+        ),
+    };
+
+    let mut content_html = String::from(r#"<div class="x-tweet">"#);
+    content_html.push_str(&card_head(
+        author_name.as_deref(),
+        author_handle.as_deref().or(Some(handle)),
+        &url,
+        published_at.as_deref(),
+        retweeted.as_ref().map(|_| "RT"),
+    ));
+    if let Some(body) = &body {
+        content_html.push_str(&format!(r#"<div class="x-tweet-body">{body}</div>"#));
+    }
+    if let Some(r) = &retweeted {
+        content_html.push_str(&nested_block(r));
+    }
+    if let Some(q) = &quoted {
+        content_html.push_str(&nested_block(q));
+    }
+    content_html.push_str("</div>");
 
     Some(XTweet {
         id: tweet_id,
         handle: handle.to_string(),
+        author_name,
         content_html,
         text,
         url,
         published_at,
         image_url,
         video_url,
+        retweeted,
+        quoted,
     })
 }
 
@@ -833,13 +1049,14 @@ pub fn parse_user_tweets_json(body: &str, handle: &str) -> XResult<Vec<XTweet>> 
 /// the add flow, the refresh leg (and any future consumer). guid is the tweet
 /// id (stable across fetches, so the (feed_id, guid) dedup makes refreshes
 /// idempotent); the title is the user's handle — the parser's contract — and
-/// media ride along in content_html with the first photo promoted to the
-/// thumbnail and the best mp4 exposed as a video enclosure.
+/// the body is the rendered tweet card (author head, content, any nested
+/// retweet/quote) with the first photo promoted to the thumbnail and the best
+/// mp4 exposed as a video enclosure.
 pub fn tweet_to_article(t: &XTweet) -> crate::db::NewArticle {
     // The HTML is built from escaped fragments above and re-sanitized here
     // with the permalink as base, so the ammonia allow-list has the final say
     // on every tag and URL before storage.
-    let content_html = crate::sanitize::sanitize(&t.content_html, Some(&t.url));
+    let content_html = crate::sanitize::sanitize_parser(&t.content_html, Some(&t.url));
     crate::db::NewArticle {
         guid: t.id.clone(),
         url: Some(t.url.clone()),
@@ -1151,6 +1368,7 @@ pub async fn fetch_user_tweets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn parse_html_from(url: &str) -> Option<String> {
         // Mirror production: the scheme-less case is prepended by the caller
@@ -1348,15 +1566,25 @@ mod tests {
         let tweets = parse_user_tweets_json(USER_TWEETS_FIXTURE, "jack").unwrap();
         assert_eq!(tweets.len(), 3);
 
-        // Text tweet: the t.co link is rewritten to its expanded_url.
+        // Text tweet: a card whose head names the author and links the exact
+        // tweet, and whose body resolves the t.co link to its expanded_url.
         let t = &tweets[0];
         assert_eq!(t.id, "111");
         assert_eq!(t.handle, "jack");
         assert_eq!(t.url, "https://x.com/jack/status/111");
+        assert!(t.content_html.starts_with(r#"<div class="x-tweet">"#));
         assert!(t
             .content_html
-            .contains(r#"<a href="https://example.com/page">https://t.co/abc</a>"#));
-        assert!(t.content_html.starts_with("hello "));
+            .contains(r#"<span class="x-handle">@jack</span>"#));
+        assert!(t.content_html.contains(
+            r#"<a class="x-permalink" href="https://x.com/jack/status/111">2026-09-13</a>"#
+        ));
+        assert!(t
+            .content_html
+            .contains(r#"<div class="x-tweet-body">hello <a href="https://example.com/page">https://t.co/abc</a> world</div>"#));
+        // Only who-posted-what: no duplicated title/handle line inside the body.
+        assert!(!t.content_html.contains("x-chip"));
+        assert!(t.content_html.ends_with("</div>"));
         assert_eq!(t.text, "hello https://example.com/page world");
         assert_eq!(t.published_at.as_deref(), Some("2026-09-13T06:17:25+00:00"));
         assert!(t.image_url.is_none());
@@ -1404,7 +1632,94 @@ mod tests {
         let tweets = parse_user_tweets_json(body, "jack").unwrap();
         assert_eq!(tweets.len(), 1);
         assert_eq!(tweets[0].id, "555");
-        assert_eq!(tweets[0].content_html, "nested text");
+        assert!(tweets[0]
+            .content_html
+            .contains(r#"<div class="x-tweet-body">nested text</div>"#));
+    }
+
+    /// A retweet entry: the timeline entry belongs to the retweeter, the
+    /// forwarded tweet rides under `retweeted_status_result`.
+    fn retweet_fixture() -> String {
+        // Generated as compact JSON so the payload is valid by construction.
+        r#"{"data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [{"type": "TimelineAddEntries", "entries": [{"entryId": "tweet-800", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {"__typename": "Tweet", "rest_id": "800", "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Display Name"}, "legacy": {"screen_name": "jack"}}}}, "legacy": {"full_text": "RT @OrigAuthor: original words https://t.co/orig", "created_at": "Sun Sep 13 06:20:00 +0000 2026", "entities": {}, "retweeted_status_result": {"result": {"rest_id": "900", "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Display Name"}, "legacy": {"screen_name": "OrigAuthor"}}}}, "legacy": {"full_text": "original words https://t.co/orig", "created_at": "Sat Sep 12 10:00:00 +0000 2026", "entities": {"urls": [{"url": "https://t.co/orig", "expanded_url": "https://example.com/orig", "indices": [15, 32]}]}, "extended_entities": {"media": [{"type": "photo", "media_url_https": "https://pbs.twimg.com/media/orig.jpg", "url": "https://t.co/orig", "indices": [15, 32]}]}}}}}}}}}}]}]}}}}}}"#.to_string()
+    }
+
+    #[test]
+    fn retweets_attribute_the_original_tweet_instead_of_rt_text() {
+        let tweets = parse_user_tweets_json(&retweet_fixture(), "jack").unwrap();
+        assert_eq!(tweets.len(), 1);
+        let t = &tweets[0];
+
+        // The retweeter owns the entry, marked with the RT chip...
+        assert!(t.content_html.contains(r#"<span class="x-chip">RT</span>"#));
+        assert!(t
+            .content_html
+            .contains(r#"<span class="x-handle">@jack</span>"#));
+        assert!(t.retweeted.is_some());
+        // ...and the redundant "RT @...: " body is gone: exactly one body
+        // renders, and it is the nested one.
+        assert_eq!(t.content_html.matches("x-tweet-body").count(), 1);
+        assert!(!t.content_html.contains("RT @OrigAuthor:"));
+
+        // The nested block says whose tweet it is, links that exact tweet, and
+        // carries the original content.
+        let nested = t.retweeted.as_ref().unwrap();
+        assert_eq!(nested.id, "900");
+        assert_eq!(nested.handle.as_deref(), Some("origauthor"));
+        assert_eq!(nested.author_name.as_deref(), Some("Display Name"));
+        assert_eq!(nested.url, "https://x.com/origauthor/status/900");
+        assert!(t.content_html.contains(r#"<blockquote class="x-quote">"#));
+        assert!(t
+            .content_html
+            .contains(r#"href="https://x.com/origauthor/status/900">2026-09-12</a>"#));
+        assert!(t
+            .content_html
+            .contains(r#"original words <a href="https://example.com/orig">"#));
+
+        // The list snippet and thumbnail follow the visible content.
+        assert_eq!(t.text, "original words https://example.com/orig");
+        assert_eq!(
+            t.image_url.as_deref(),
+            Some("https://pbs.twimg.com/media/orig.jpg")
+        );
+    }
+
+    #[test]
+    fn quotes_render_the_commentary_above_the_quoted_tweet() {
+        let body = r#"{"data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [{"type": "TimelineAddEntries", "entries": [{"entryId": "tweet-778", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {"__typename": "Tweet", "rest_id": "778", "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Display Name"}, "legacy": {"screen_name": "jack"}}}}, "legacy": {"full_text": "my commentary", "created_at": "Sun Sep 13 06:30:00 +0000 2026", "entities": {}, "quoted_status_result": {"result": {"rest_id": "777", "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Quoted Person"}, "legacy": {"screen_name": "quotedperson"}}}}, "legacy": {"full_text": "quoted words", "created_at": "Fri Sep 11 08:00:00 +0000 2026", "entities": {}}}}}}}}}}]}]}}}}}}"#;
+        let tweets = parse_user_tweets_json(body, "jack").unwrap();
+        let t = &tweets[0];
+        assert!(t.retweeted.is_none());
+        assert_eq!(
+            t.quoted.as_ref().unwrap().handle.as_deref(),
+            Some("quotedperson")
+        );
+        // The author's own words stay visible above the quoted block.
+        assert_eq!(t.content_html.matches("x-tweet-body").count(), 2);
+        assert!(t.content_html.contains("my commentary"));
+        assert!(t
+            .content_html
+            .contains(r#"href="https://x.com/quotedperson/status/777">2026-09-11</a>"#));
+        // A quote is not a retweet: no RT chip, and the snippet keeps the
+        // author's commentary.
+        assert!(!t.content_html.contains("x-chip"));
+        assert_eq!(t.text, "my commentary");
+    }
+
+    #[test]
+    fn tweet_to_article_keeps_the_card_markup_after_sanitizing() {
+        let tweets = parse_user_tweets_json(&retweet_fixture(), "jack").unwrap();
+        let article = tweet_to_article(&tweets[0]);
+        let html = article.content_html.as_deref().unwrap();
+        // The parser sanitizer keeps the x-* classes (that is what makes the
+        // card stylable) while the generic feed sanitizer would drop them.
+        assert!(html.contains(r#"class="x-tweet""#));
+        assert!(html.contains(r#"class="x-quote""#));
+        assert!(!html.contains("<script"));
+        // Title stays the handle contract; the card carries the authorship.
+        assert_eq!(article.title, "jack");
+        assert_eq!(article.guid, "800");
+        assert!(article.enclosures.is_empty());
     }
 
     #[test]
