@@ -18,8 +18,9 @@ use std::sync::LazyLock;
 pub const PREVIEW_SNIPPET_CHARS: usize = 280;
 
 static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
-    Migrations::new(vec![M::up(
-        r#"
+    Migrations::new(vec![
+        M::up(
+            r#"
         CREATE TABLE folders (
             id        INTEGER PRIMARY KEY,
             name      TEXT NOT NULL,
@@ -239,9 +240,7 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         // manual rename on the very next poll. This flag lets `update_feed_meta`
         // leave a user-named feed's title alone while still refreshing every
         // other piece of feed metadata.
-        M::up(
-            "ALTER TABLE feeds ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0;",
-        ),
+        M::up("ALTER TABLE feeds ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0;"),
         // v14 — cache a translated copy of the article body. `translated_lang`
         // records the target language the cache was produced for, so a later
         // change to the translation-target setting is detected as a cache miss.
@@ -255,9 +254,7 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         // v16 — per-feed auto-translate. 0 (the default) shows the original
         // text; 1 translates an article into the configured target language the
         // moment it is opened.
-        M::up(
-            "ALTER TABLE feeds ADD COLUMN auto_translate INTEGER NOT NULL DEFAULT 0;",
-        ),
+        M::up("ALTER TABLE feeds ADD COLUMN auto_translate INTEGER NOT NULL DEFAULT 0;"),
         // v17 — independent list-pane translation cache. Preview translations
         // are keyed by article, target language and engine so switching language
         // or engine never overwrites another cached preview. A source title/body
@@ -451,7 +448,10 @@ pub fn rename_folder(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
     if clash.is_some() {
         return Err(AppError::code("folderNameExists"));
     }
-    conn.execute("UPDATE folders SET name = ?2 WHERE id = ?1", params![id, name])?;
+    conn.execute(
+        "UPDATE folders SET name = ?2 WHERE id = ?1",
+        params![id, name],
+    )?;
     Ok(())
 }
 
@@ -464,9 +464,11 @@ pub fn delete_folder(conn: &Connection, id: i64) -> AppResult<()> {
 
 pub fn find_feed_by_url(conn: &Connection, url: &str) -> AppResult<Option<i64>> {
     Ok(conn
-        .query_row("SELECT id FROM feeds WHERE feed_url = ?1", params![url], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM feeds WHERE feed_url = ?1",
+            params![url],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
@@ -482,7 +484,14 @@ pub fn insert_feed(
     conn.execute(
         "INSERT INTO feeds(feed_url, site_url, title, description, source_type, folder_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![feed_url, site_url, title, description, source_type.as_str(), folder_id],
+        params![
+            feed_url,
+            site_url,
+            title,
+            description,
+            source_type.as_str(),
+            folder_id
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -552,13 +561,14 @@ pub fn list_feeds(conn: &Connection) -> AppResult<Vec<Feed>> {
 /// the last two are the stored revalidators for a conditional GET.
 pub type FeedToRefresh = (i64, String, Option<String>, Option<String>);
 
-/// All feeds that need an HTTP fetch. Newsletter sources are excluded — they
-/// are polled over IMAP separately (see `scheduler::poll_newsletters`); their
-/// synthetic `imap://` feed_url is not an HTTP-fetchable document.
+/// All feeds that need an HTTP fetch. Newsletter and parser sources are
+/// excluded — newsletters are polled over IMAP and parser feeds are fetched
+/// by the parser leg (see `refresh::poll_parsers`); neither feed_url is a
+/// plain feed document a conditional GET could parse.
 pub fn feeds_to_refresh(conn: &Connection) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type != 'newsletter'",
+         WHERE source_type NOT IN ('newsletter', 'x')",
     )?;
     let rows = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -571,19 +581,16 @@ pub fn feeds_to_refresh(conn: &Connection) -> AppResult<Vec<FeedToRefresh>> {
 /// per-feed interval can carry it to opt one feed out of automatic refresh.
 pub const REFRESH_OFF_MINUTES: i64 = 525_600;
 
-/// Non-newsletter feeds that are *due* for a fetch: their effective interval —
+/// Non-parser feeds (newsletters excluded) that are *due* for a fetch: their effective interval —
 /// the per-feed `refresh_interval_min`, or `global_min` when unset — has
 /// elapsed since `last_fetched_at` (a never-fetched feed is always due). Feeds
 /// whose effective interval is the "off" sentinel are excluded entirely. Used
 /// by the background scheduler; the manual refresh still fetches every feed via
 /// `feeds_to_refresh`.
-pub fn feeds_due_for_refresh(
-    conn: &Connection,
-    global_min: i64,
-) -> AppResult<Vec<FeedToRefresh>> {
+pub fn feeds_due_for_refresh(conn: &Connection, global_min: i64) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type != 'newsletter'
+         WHERE source_type NOT IN ('newsletter', 'x')
            AND COALESCE(refresh_interval_min, ?1) < ?2
            AND ( last_fetched_at IS NULL
                  OR (julianday('now') - julianday(last_fetched_at)) * 1440.0
@@ -597,13 +604,13 @@ pub fn feeds_due_for_refresh(
     Ok(rows)
 }
 
-/// Non-newsletter feeds for a single feed id — the per-feed manual refresh.
-/// An empty result means the id is unknown or names a newsletter source (which
-/// is polled over IMAP, not fetched here).
+/// Non-parser feeds for a single feed id — the per-feed manual refresh. An
+/// empty result means the id is unknown or names a source polled elsewhere
+/// (a newsletter over IMAP, or an X timeline via the parser leg).
 pub fn feeds_to_refresh_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type != 'newsletter' AND id = ?1",
+         WHERE source_type NOT IN ('newsletter', 'x') AND id = ?1",
     )?;
     let rows = stmt
         .query_map(params![feed_id], |r| {
@@ -613,14 +620,14 @@ pub fn feeds_to_refresh_for_feed(conn: &Connection, feed_id: i64) -> AppResult<V
     Ok(rows)
 }
 
-/// Non-newsletter feeds in a folder — the per-folder manual refresh.
+/// Non-parser feeds in a folder — the per-folder manual refresh.
 pub fn feeds_to_refresh_in_folder(
     conn: &Connection,
     folder_id: i64,
 ) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type != 'newsletter' AND folder_id = ?1",
+         WHERE source_type NOT IN ('newsletter', 'x') AND folder_id = ?1",
     )?;
     let rows = stmt
         .query_map(params![folder_id], |r| {
@@ -749,16 +756,17 @@ pub fn delete_feed(conn: &Connection, id: i64) -> AppResult<()> {
 }
 
 /// Feeds for OPML export as `(title, feed_url, folder)` tuples. Newsletter
-/// sources are excluded: OPML is an RSS-subscription interchange format, and a
-/// newsletter's `feed_url` is a synthetic `imap://user@host:port/folder`
-/// string — exporting it would emit an `<outline xmlUrl="imap://…">` that any
-/// reader (Papr's own `import_opml` included) would treat as an RSS feed and
-/// then fail to HTTP-fetch forever, with the IMAP credentials not even carried.
+/// sources are excluded, as are parser feeds: OPML is an RSS-subscription
+/// interchange format. A newsletter's `feed_url` is a synthetic `imap://…`
+/// string and a parser feed's `x.com/<user>` URL is not a feed document —
+/// exporting either would emit an `<outline>` any reader (Papr's own
+/// `import_opml` included) would treat as an RSS feed and then fail to
+/// HTTP-fetch forever, with the credentials not even carried.
 pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Option<String>)>> {
     let mut stmt = conn.prepare(
         "SELECT f.title, f.feed_url, fo.name
          FROM feeds f LEFT JOIN folders fo ON fo.id = f.folder_id
-         WHERE f.source_type != 'newsletter'
+         WHERE f.source_type NOT IN ('newsletter', 'x')
          ORDER BY fo.name, f.title",
     )?;
     let rows = stmt
@@ -768,11 +776,11 @@ pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Opt
 }
 
 /// Feed URLs the sync layer should mirror onto the server. Excludes
-/// `newsletter` sources (those have no upstream feed URL the server could
-/// subscribe to), matching the OPML-export filter.
+/// `newsletter` and parser sources (those have no upstream feed URL the
+/// server could subscribe to), matching the OPML-export filter.
 pub fn feed_urls_for_sync(conn: &Connection) -> AppResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT feed_url FROM feeds WHERE source_type != 'newsletter' AND feed_url <> ''",
+        "SELECT feed_url FROM feeds WHERE source_type NOT IN ('newsletter', 'x') AND feed_url <> ''",
     )?;
     let rows = stmt
         .query_map([], |r| r.get(0))?
@@ -791,7 +799,10 @@ pub fn folder_id_by_name(conn: &Connection, name: &str) -> AppResult<i64> {
 }
 
 pub fn move_feed(conn: &Connection, id: i64, folder_id: Option<i64>) -> AppResult<()> {
-    conn.execute("UPDATE feeds SET folder_id = ?2 WHERE id = ?1", params![id, folder_id])?;
+    conn.execute(
+        "UPDATE feeds SET folder_id = ?2 WHERE id = ?1",
+        params![id, folder_id],
+    )?;
     Ok(())
 }
 
@@ -861,7 +872,14 @@ pub fn insert_newsletter_source(
     tx.execute(
         "INSERT INTO newsletter_sources(feed_id, host, port, username, password, folder)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![feed_id, cfg.host, cfg.port, cfg.username, cfg.password, cfg.folder],
+        params![
+            feed_id,
+            cfg.host,
+            cfg.port,
+            cfg.username,
+            cfg.password,
+            cfg.folder
+        ],
     )?;
     tx.commit()?;
     Ok(feed_id)
@@ -1013,6 +1031,136 @@ pub fn delete_newsletter_source(conn: &Connection, feed_id: i64) -> AppResult<()
     Ok(())
 }
 
+/// The `source_type` of the feed an article belongs to, or `None` for an
+/// unknown article id. Lets callers treat parser-served content differently —
+/// most importantly, refuse to web-extract it (see `extract_fulltext`).
+pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.source_type
+         FROM articles a JOIN feeds f ON f.id = a.feed_id
+         WHERE a.id = ?1",
+    )?;
+    let mut rows = stmt.query(params![article_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// Re-render an existing parser article in place, returning whether anything
+/// changed.
+///
+/// Parser feeds generate their body from papr's own renderer, so the stored
+/// markup can go stale when the renderer changes — and a plain re-fetch cannot
+/// fix it, because the same `(feed_id, guid)` is skipped as a duplicate. This
+/// updates the renderer-owned columns for a row that already exists and clears
+/// `extracted_html`: for a parser feed that column can only hold a previous web
+/// extraction of the site's SPA shell, which is exactly what must not win over
+/// the rendered card. Read state, stars, read-later, tags, highlights and the
+/// AI summary are deliberately left alone.
+pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
+    let existing: Option<(i64, Option<String>, Option<String>, String)> = conn
+        .query_row(
+            "SELECT id, content_html, extracted_html, body_text
+             FROM articles WHERE feed_id = ?1 AND guid = ?2",
+            params![feed_id, a.guid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((id, content_html, extracted_html, body_text)) = existing else {
+        return Ok(false);
+    };
+    // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
+    // and rewriting identical bytes would churn WAL pages and re-index FTS.
+    let rendered_differs =
+        content_html.as_deref() != a.content_html.as_deref() || body_text != a.body_text;
+    let stale_extraction = extracted_html.is_some();
+    if !rendered_differs && !stale_extraction {
+        return Ok(false);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE articles
+            SET title = ?2, summary = ?3, content_html = ?4, body_text = ?5,
+                image_url = COALESCE(?6, image_url),
+                published_at = COALESCE(?7, published_at),
+                extracted_html = NULL
+          WHERE id = ?1",
+        params![
+            id,
+            a.title,
+            a.summary,
+            a.content_html,
+            a.body_text,
+            a.image_url,
+            a.published_at
+        ],
+    )?;
+    tx.execute(
+        "UPDATE articles_fts SET title = ?2, body = ?3 WHERE rowid = ?1",
+        params![id, a.title, a.body_text],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// `(feed_id, feed_url)` for every parser feed (`source_type = 'x'`), the
+/// shape the parser leg of `refresh_core` needs — the feed_url carries the
+/// handle, and no revalidators exist because the GraphQL API sends no
+/// conditional-GET headers.
+pub fn parser_feeds_to_refresh(conn: &Connection) -> AppResult<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x'")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Parser feeds that are *due*, applying the same per-feed/global interval
+/// logic as [`feeds_due_for_refresh`]. Used by the background scheduler; the
+/// manual refresh polls every parser feed via [`parser_feeds_to_refresh`].
+pub fn parser_feeds_due_for_refresh(
+    conn: &Connection,
+    global_min: i64,
+) -> AppResult<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_url FROM feeds WHERE source_type = 'x'
+         AND COALESCE(refresh_interval_min, ?1) < ?2
+         AND ( last_fetched_at IS NULL
+               OR (julianday('now') - julianday(last_fetched_at)) * 1440.0
+                  >= COALESCE(refresh_interval_min, ?1) )",
+    )?;
+    let rows = stmt
+        .query_map(params![global_min, REFRESH_OFF_MINUTES], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `(feed_id, feed_url)` for one parser feed by id — the per-feed manual
+/// refresh. Empty when the id is not a parser feed.
+pub fn parser_feeds_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<(i64, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x' AND id = ?1")?;
+    let rows = stmt
+        .query_map(params![feed_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `(feed_id, feed_url)` for the parser feeds in a folder — the per-folder
+/// manual refresh.
+pub fn parser_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Vec<(i64, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x' AND folder_id = ?1")?;
+    let rows = stmt
+        .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ─────────────────────────── articles ───────────────────────────
 
 /// A parsed article ready for insertion.
@@ -1130,9 +1278,18 @@ pub fn upsert_article(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(feed_id, guid) DO NOTHING",
         params![
-            feed_id, a.guid, a.url, a.title, a.author, a.summary,
-            a.content_html, a.body_text, a.image_url, a.published_at,
-            start_read, start_starred
+            feed_id,
+            a.guid,
+            a.url,
+            a.title,
+            a.author,
+            a.summary,
+            a.content_html,
+            a.body_text,
+            a.image_url,
+            a.published_at,
+            start_read,
+            start_starred
         ],
     )?;
     if n == 0 {
@@ -1180,9 +1337,8 @@ fn article_filter(query: &ArticleQuery, unread_only: bool) -> (Vec<String>, Vec<
             binds.push(Value::Integer(*id));
         }
         ArticleQuery::Tag(id) => {
-            where_clauses.push(
-                "a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into(),
-            );
+            where_clauses
+                .push("a.id IN (SELECT article_id FROM article_tags WHERE tag_id = ?)".into());
             binds.push(Value::Integer(*id));
         }
     }
@@ -1332,7 +1488,11 @@ pub fn card_image_backfill_scan(conn: &Connection) -> AppResult<Vec<(i64, String
         let img = content_html
             .as_deref()
             .and_then(crate::sanitize::first_image)
-            .or_else(|| extracted_html.as_deref().and_then(crate::sanitize::first_image));
+            .or_else(|| {
+                extracted_html
+                    .as_deref()
+                    .and_then(crate::sanitize::first_image)
+            });
         if let Some(img) = img {
             out.push((id, img));
         }
@@ -1495,17 +1655,26 @@ pub fn article_text(conn: &Connection, id: i64) -> AppResult<(String, String)> {
 }
 
 pub fn set_read(conn: &Connection, id: i64, read: bool) -> AppResult<()> {
-    conn.execute("UPDATE articles SET is_read = ?2 WHERE id = ?1", params![id, read])?;
+    conn.execute(
+        "UPDATE articles SET is_read = ?2 WHERE id = ?1",
+        params![id, read],
+    )?;
     Ok(())
 }
 
 pub fn set_starred(conn: &Connection, id: i64, starred: bool) -> AppResult<()> {
-    conn.execute("UPDATE articles SET is_starred = ?2 WHERE id = ?1", params![id, starred])?;
+    conn.execute(
+        "UPDATE articles SET is_starred = ?2 WHERE id = ?1",
+        params![id, starred],
+    )?;
     Ok(())
 }
 
 pub fn set_read_later(conn: &Connection, id: i64, v: bool) -> AppResult<()> {
-    conn.execute("UPDATE articles SET read_later = ?2 WHERE id = ?1", params![id, v])?;
+    conn.execute(
+        "UPDATE articles SET read_later = ?2 WHERE id = ?1",
+        params![id, v],
+    )?;
     Ok(())
 }
 
@@ -1539,7 +1708,10 @@ pub fn set_extracted_html(
 }
 
 pub fn set_ai_summary(conn: &Connection, id: i64, summary: &str) -> AppResult<()> {
-    conn.execute("UPDATE articles SET ai_summary = ?2 WHERE id = ?1", params![id, summary])?;
+    conn.execute(
+        "UPDATE articles SET ai_summary = ?2 WHERE id = ?1",
+        params![id, summary],
+    )?;
     Ok(())
 }
 
@@ -1615,8 +1787,7 @@ pub fn mark_all_read(
             Some(*id),
         ),
     };
-    let bind: Vec<&dyn rusqlite::ToSql> =
-        id.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+    let bind: Vec<&dyn rusqlite::ToSql> = id.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
 
     // Queue + flip together: the sync-queue rows and the is_read change must
     // commit atomically, or a mid-way failure leaves the queue claiming a
@@ -1764,7 +1935,10 @@ pub fn rename_tag(conn: &Connection, id: i64, name: &str) -> AppResult<()> {
 }
 
 pub fn set_tag_color(conn: &Connection, id: i64, color: &str) -> AppResult<()> {
-    conn.execute("UPDATE tags SET color = ?2 WHERE id = ?1", params![id, color])?;
+    conn.execute(
+        "UPDATE tags SET color = ?2 WHERE id = ?1",
+        params![id, color],
+    )?;
     Ok(())
 }
 
@@ -1845,8 +2019,9 @@ const RULE_COLS: &str = "id, name, enabled, feed_id, field, query, action, posit
 
 /// Every rule, enabled or not, ordered for the settings list.
 pub fn list_rules(conn: &Connection) -> AppResult<Vec<Rule>> {
-    let mut stmt =
-        conn.prepare(&format!("SELECT {RULE_COLS} FROM rules ORDER BY position, id"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RULE_COLS} FROM rules ORDER BY position, id"
+    ))?;
     let rows = stmt
         .query_map([], row_to_rule)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1959,7 +2134,9 @@ fn rule_match_where(
             .replace('%', "\\%")
             .replace('_', "\\_");
         for col in cols {
-            ors.push(format!("unicode_lower(COALESCE({col},'')) LIKE ? ESCAPE '\\'"));
+            ors.push(format!(
+                "unicode_lower(COALESCE({col},'')) LIKE ? ESCAPE '\\'"
+            ));
             binds.push(Value::Text(format!("%{escaped}%")));
         }
     }
@@ -2158,9 +2335,11 @@ pub fn delete_highlight(conn: &Connection, id: i64) -> AppResult<()> {
 
 pub fn get_setting(conn: &Connection, key: &str) -> AppResult<Option<String>> {
     Ok(conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
         .optional()?)
 }
 
@@ -2176,21 +2355,35 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
 /// Atomically switch AI profiles, preserving legacy and explicitly empty values.
 /// Supplying a model and URL also updates the selected profile in one commit.
 pub fn configure_ai_provider(
-    conn: &Connection, provider: &str, model: Option<&str>, base_url: Option<&str>,
+    conn: &Connection,
+    provider: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
 ) -> AppResult<(String, String)> {
     if !matches!(provider, "anthropic" | "openai" | "deepseek") {
         return Err(AppError::other("invalid AI provider"));
     }
     let tx = conn.unchecked_transaction()?;
     let previous = get_setting(&tx, "ai_provider")?.unwrap_or_default();
-    let previous = match previous.as_str() { "openai" => "openai", "deepseek" => "deepseek", _ => "anthropic" };
+    let previous = match previous.as_str() {
+        "openai" => "openai",
+        "deepseek" => "deepseek",
+        _ => "anthropic",
+    };
     for key in ["ai_model", "ai_base_url"] {
         let value = get_setting(&tx, key)?.unwrap_or_default();
         set_setting(&tx, &format!("{key}_{previous}"), &value)?;
     }
-    let model = model.map(str::to_owned).unwrap_or(get_setting(&tx, &format!("ai_model_{provider}"))?.unwrap_or_default());
-    let base_url = base_url.map(str::to_owned).unwrap_or(get_setting(&tx, &format!("ai_base_url_{provider}"))?.unwrap_or_default());
-    for (key, value) in [("ai_model", model.as_str()), ("ai_base_url", base_url.as_str())] {
+    let model = model
+        .map(str::to_owned)
+        .unwrap_or(get_setting(&tx, &format!("ai_model_{provider}"))?.unwrap_or_default());
+    let base_url = base_url
+        .map(str::to_owned)
+        .unwrap_or(get_setting(&tx, &format!("ai_base_url_{provider}"))?.unwrap_or_default());
+    for (key, value) in [
+        ("ai_model", model.as_str()),
+        ("ai_base_url", base_url.as_str()),
+    ] {
         set_setting(&tx, key, value)?;
         set_setting(&tx, &format!("{key}_{provider}"), value)?;
     }
@@ -2316,7 +2509,11 @@ pub fn reset_settings(conn: &Connection) -> AppResult<()> {
 }
 
 pub fn count_unread(conn: &Connection) -> AppResult<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM articles WHERE is_read = 0", [], |r| r.get(0))?)
+    Ok(
+        conn.query_row("SELECT COUNT(*) FROM articles WHERE is_read = 0", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// Unread article count for a single feed — the same expression `list_feeds`
@@ -2333,9 +2530,11 @@ pub fn count_feed_unread(conn: &Connection, feed_id: i64) -> AppResult<i64> {
 
 /// Timestamp of the most recent successful feed fetch, if any.
 pub fn latest_fetch(conn: &Connection) -> AppResult<Option<String>> {
-    Ok(conn.query_row("SELECT MAX(last_fetched_at) FROM feeds", [], |r| {
-        r.get::<_, Option<String>>(0)
-    })?)
+    Ok(
+        conn.query_row("SELECT MAX(last_fetched_at) FROM feeds", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })?,
+    )
 }
 
 // ─────────────────────────── sync ───────────────────────────
@@ -2446,12 +2645,7 @@ pub fn reconcile_sync_state(
 }
 
 /// Queue a local read/starred change to push on the next sync.
-pub fn enqueue_sync(
-    conn: &Connection,
-    article_id: i64,
-    field: &str,
-    value: bool,
-) -> AppResult<()> {
+pub fn enqueue_sync(conn: &Connection, article_id: i64, field: &str, value: bool) -> AppResult<()> {
     conn.execute(
         "INSERT INTO sync_queue(article_id, field, value) VALUES (?1, ?2, ?3)
          ON CONFLICT(article_id, field) DO UPDATE SET value = excluded.value",
@@ -2518,6 +2712,18 @@ pub fn requeue_sync(conn: &Connection, article_id: i64, field: &str, value: bool
     Ok(())
 }
 
+/// A fully-migrated in-memory connection for tests in other modules that
+/// exercise settings-backed behaviour (parsers, sync, …). Test-only: the
+/// migrations and function registration here mirror [`open`]'s setup.
+#[cfg(test)]
+pub(crate) fn test_conn() -> Connection {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    MIGRATIONS.to_latest(&mut conn).unwrap();
+    register_functions(&conn).unwrap();
+    conn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2525,31 +2731,73 @@ mod tests {
     #[test]
     fn startup_migrations_preserve_existing_databases() {
         for version in [0, 19, 20, 21, 22] {
-            let path = std::env::temp_dir().join(format!("papr-migrations-{}-{}-{}.db",
-                std::process::id(), version,
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let path = std::env::temp_dir().join(format!(
+                "papr-migrations-{}-{}-{}.db",
+                std::process::id(),
+                version,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
             let mut conn = Connection::open(&path).unwrap();
             MIGRATIONS.to_version(&mut conn, version.min(21)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
             }
-            if version >= 20 { conn.execute("UPDATE feeds SET custom_favicon=1", []).unwrap(); }
-            if version >= 21 { conn.execute("UPDATE feeds SET position=42", []).unwrap(); }
-            if version == 22 { conn.pragma_update(None, "user_version", 22).unwrap(); }
+            if version >= 20 {
+                conn.execute("UPDATE feeds SET custom_favicon=1", [])
+                    .unwrap();
+            }
+            if version >= 21 {
+                conn.execute("UPDATE feeds SET position=42", []).unwrap();
+            }
+            if version == 22 {
+                conn.pragma_update(None, "user_version", 22).unwrap();
+            }
             drop(conn);
             let result = open(&path);
             if version == 22 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 22);
+                assert_eq!(
+                    conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    22
+                );
             } else {
                 let conn = result.unwrap();
-                assert_eq!(conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), 21);
+                assert_eq!(
+                    conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    21
+                );
                 if version > 0 {
-                    let values: (String,i64,i64) = conn.query_row("SELECT title,custom_favicon,position FROM feeds WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-                    assert_eq!(values, ("Preserved".into(), i64::from(version>=20), if version>=21 {42} else {0}));
-                    assert_eq!(conn.query_row("SELECT is_starred FROM articles WHERE guid='one'", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+                    let values: (String, i64, i64) = conn
+                        .query_row(
+                            "SELECT title,custom_favicon,position FROM feeds WHERE id=1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        values,
+                        (
+                            "Preserved".into(),
+                            i64::from(version >= 20),
+                            if version >= 21 { 42 } else { 0 }
+                        )
+                    );
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT is_starred FROM articles WHERE guid='one'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        1
+                    );
                 }
             }
             std::fs::remove_file(path).unwrap();
@@ -2562,12 +2810,26 @@ mod tests {
         set_setting(&conn, "ai_provider", "deepseek").unwrap();
         set_setting(&conn, "ai_model", "custom-model").unwrap();
         set_setting(&conn, "ai_base_url", "https://example.com/v1").unwrap();
-        assert_eq!(configure_ai_provider(&conn, "openai", None, None).unwrap(), ("".into(), "".into()));
+        assert_eq!(
+            configure_ai_provider(&conn, "openai", None, None).unwrap(),
+            ("".into(), "".into())
+        );
         configure_ai_provider(&conn, "openai", Some("gpt-custom"), Some("")).unwrap();
-        assert_eq!(configure_ai_provider(&conn, "deepseek", None, None).unwrap(), ("custom-model".into(), "https://example.com/v1".into()));
+        assert_eq!(
+            configure_ai_provider(&conn, "deepseek", None, None).unwrap(),
+            ("custom-model".into(), "https://example.com/v1".into())
+        );
         configure_ai_provider(&conn, "deepseek", Some(""), Some("")).unwrap();
-        assert_eq!(configure_ai_provider(&conn, "openai", None, None).unwrap().0, "gpt-custom");
-        assert_eq!(configure_ai_provider(&conn, "deepseek", None, None).unwrap(), ("".into(), "".into()));
+        assert_eq!(
+            configure_ai_provider(&conn, "openai", None, None)
+                .unwrap()
+                .0,
+            "gpt-custom"
+        );
+        assert_eq!(
+            configure_ai_provider(&conn, "deepseek", None, None).unwrap(),
+            ("".into(), "".into())
+        );
     }
 
     #[test]
@@ -2576,7 +2838,10 @@ mod tests {
         set_setting(&conn, "ai_model", "original").unwrap();
         conn.execute_batch("CREATE TRIGGER fail_provider BEFORE INSERT ON settings WHEN NEW.key = 'ai_provider' BEGIN SELECT RAISE(ABORT, 'write failure'); END;").unwrap();
         assert!(configure_ai_provider(&conn, "openai", Some("new"), Some("new-url")).is_err());
-        assert_eq!(get_setting(&conn, "ai_model").unwrap().as_deref(), Some("original"));
+        assert_eq!(
+            get_setting(&conn, "ai_model").unwrap().as_deref(),
+            Some("original")
+        );
         assert_eq!(get_setting(&conn, "ai_model_openai").unwrap(), None);
     }
 
@@ -2703,7 +2968,10 @@ mod tests {
             get_preview_translation(&conn, id, "ja", "deepl").unwrap(),
             Some(("見出し".into(), "抜粋".into()))
         );
-        assert_eq!(get_preview_translation(&conn, id, "en", "google").unwrap(), None);
+        assert_eq!(
+            get_preview_translation(&conn, id, "en", "google").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2717,7 +2985,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(get_preview_translation(&conn, id, "zh", "google").unwrap(), None);
+        assert_eq!(
+            get_preview_translation(&conn, id, "zh", "google").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2748,8 +3019,13 @@ mod tests {
     #[test]
     fn set_extracted_html_backfills_missing_image_url() {
         let (conn, id) = test_db();
-        set_extracted_html(&conn, id, "<p>full text</p>", Some("https://ex.com/lead.jpg"))
-            .unwrap();
+        set_extracted_html(
+            &conn,
+            id,
+            "<p>full text</p>",
+            Some("https://ex.com/lead.jpg"),
+        )
+        .unwrap();
 
         let after = get_article(&conn, id).unwrap();
         assert_eq!(after.extracted_html.as_deref(), Some("<p>full text</p>"));
@@ -2765,8 +3041,13 @@ mod tests {
         )
         .unwrap();
 
-        set_extracted_html(&conn, id, "<p>full text</p>", Some("https://ex.com/lead.jpg"))
-            .unwrap();
+        set_extracted_html(
+            &conn,
+            id,
+            "<p>full text</p>",
+            Some("https://ex.com/lead.jpg"),
+        )
+        .unwrap();
 
         let after = get_article(&conn, id).unwrap();
         assert_eq!(after.image_url.as_deref(), Some("https://ex.com/feed.jpg"));
@@ -2784,7 +3065,10 @@ mod tests {
         .unwrap();
 
         let updates = card_image_backfill_scan(&conn).unwrap();
-        assert_eq!(updates, vec![(id, "https://ex.com/from-extracted.jpg".into())]);
+        assert_eq!(
+            updates,
+            vec![(id, "https://ex.com/from-extracted.jpg".into())]
+        );
     }
 
     #[test]
@@ -2829,6 +3113,210 @@ mod tests {
     }
 
     #[test]
+    fn parser_article_refresh_updates_markup_clears_junk_and_keeps_user_state() {
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            Some("https://x.com/jack"),
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let mut article = NewArticle {
+            guid: "800".into(),
+            url: Some("https://x.com/jack/status/800".into()),
+            title: "jack".into(),
+            author: None,
+            summary: Some("old summary".into()),
+            content_html: Some("<div>old bare markup</div>".into()),
+            body_text: "old body".into(),
+            image_url: None,
+            published_at: Some("2026-09-13T06:20:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM articles WHERE feed_id = ?1 AND guid = '800'",
+                params![feed_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            article_feed_source_type(&conn, id).unwrap().as_deref(),
+            Some("x")
+        );
+
+        // Unchanged markup is a no-op (a refresh re-renders the same tweet
+        // thousands of times; it must not churn the WAL or re-index FTS).
+        assert!(!refresh_parser_article(&conn, feed_id, &article).unwrap());
+
+        // Simulate an article stored by an older version: a bare body, a web
+        // extraction of x.com's SPA shell in `extracted_html`, and user state.
+        conn.execute(
+            "UPDATE articles SET is_read = 1, is_starred = 1, read_later = 1,
+                    extracted_html = '<p>Log in or sign up for X</p>'
+              WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        article.content_html = Some("<div class=\"x-tweet\">card</div>".into());
+        article.body_text = "new body".into();
+        article.summary = Some("new summary".into());
+        assert!(refresh_parser_article(&conn, feed_id, &article).unwrap());
+
+        let (content, extracted, body, is_read, starred, later, summary): (
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT content_html, extracted_html, body_text, is_read, is_starred,
+                        read_later, summary
+                   FROM articles WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Renderer-owned columns follow the new render.
+        assert_eq!(
+            content.as_deref(),
+            Some("<div class=\"x-tweet\">card</div>")
+        );
+        assert_eq!(body, "new body");
+        assert_eq!(summary.as_deref(), Some("new summary"));
+        // The junk extraction is gone: it can only ever have been the site's
+        // logged-out shell, and it must not win over the card.
+        assert_eq!(extracted, None);
+        // The user's own state survives a re-render.
+        assert_eq!((is_read, starred, later), (1, 1, 1));
+
+        // The search index follows the body it indexes.
+        let indexed: String = conn
+            .query_row(
+                "SELECT body FROM articles_fts WHERE rowid = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, "new body");
+    }
+
+    #[test]
+    fn refresh_parser_article_ignores_unknown_rows() {
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let article = NewArticle {
+            guid: "not-stored".into(),
+            url: None,
+            title: "jack".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(!refresh_parser_article(&conn, feed_id, &article).unwrap());
+        assert!(article_feed_source_type(&conn, 424242).unwrap().is_none());
+    }
+
+    #[test]
+    fn parser_feeds_are_excluded_from_http_refresh_and_selected_by_the_parser_queries() {
+        let conn = test_conn();
+        insert_feed(
+            &conn,
+            "https://example.com/feed.xml",
+            None,
+            "Rss Feed",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+
+        // The plain-HTTP refresh set never sees the X feed: fetching
+        // `x.com/jack` yields profile HTML, not a feed document.
+        let http_urls: Vec<String> = feeds_to_refresh(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(_, url, _, _)| url)
+            .collect();
+        assert_eq!(http_urls, vec!["https://example.com/feed.xml".to_string()]);
+
+        // …and the due query agrees (a fresh feed is always due).
+        let due = feeds_due_for_refresh(&conn, 30).unwrap();
+        assert!(due.iter().all(|(_, url, _, _)| !url.contains("x.com")));
+
+        // The parser leg selects exactly the X feed, in all four scopes.
+        assert_eq!(
+            parser_feeds_to_refresh(&conn).unwrap(),
+            vec![(2, "https://x.com/jack".to_string())]
+        );
+        assert!(!parser_feeds_due_for_refresh(&conn, 30).unwrap().is_empty());
+        assert_eq!(parser_feeds_for_feed(&conn, 2).unwrap().len(), 1);
+        assert_eq!(parser_feeds_for_feed(&conn, 1).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn opml_export_and_sync_omit_parser_feeds_like_newsletters() {
+        let conn = test_conn();
+        insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        // Neither downstream consumer may carry an `x.com/<user>` URL: any
+        // other reader (and papr's own import) would treat it as an RSS feed
+        // and fail on it forever.
+        assert!(feeds_for_export(&conn).unwrap().is_empty());
+        assert!(feed_urls_for_sync(&conn).unwrap().is_empty());
+    }
+
+    #[test]
     fn fresh_feed_has_no_last_fetched_until_touched() {
         let (conn, _) = test_db();
         let feed_id: i64 = conn
@@ -2850,9 +3338,11 @@ mod tests {
             .query_row("SELECT id FROM feeds", [], |r| r.get(0))
             .unwrap();
         let kind = |c: &Connection| -> String {
-            c.query_row("SELECT source_type FROM feeds WHERE id = ?1", params![feed_id], |r| {
-                r.get(0)
-            })
+            c.query_row(
+                "SELECT source_type FROM feeds WHERE id = ?1",
+                params![feed_id],
+                |r| r.get(0),
+            )
             .unwrap()
         };
         // The test feed starts generic.
@@ -2899,7 +3389,9 @@ mod tests {
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].1, "https://example.com/feed.xml");
         assert!(
-            !exported.iter().any(|(_, url, _)| url.starts_with("imap://")),
+            !exported
+                .iter()
+                .any(|(_, url, _)| url.starts_with("imap://")),
             "no synthetic imap:// url should reach the OPML"
         );
     }
@@ -2907,8 +3399,11 @@ mod tests {
     #[test]
     fn insert_and_list_highlight() {
         let (conn, aid) = test_db();
-        let id = insert_highlight(&conn, &hl(aid, "quoted text", "pre", "suf", 12, "yellow", ""))
-            .unwrap();
+        let id = insert_highlight(
+            &conn,
+            &hl(aid, "quoted text", "pre", "suf", 12, "yellow", ""),
+        )
+        .unwrap();
         let all = list_highlights(&conn, aid).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, id);
@@ -3033,8 +3528,20 @@ mod tests {
         let feed_id: i64 = conn
             .query_row("SELECT id FROM feeds", [], |r| r.get(0))
             .unwrap();
-        add_article(&conn, feed_id, "rust", "Rust news", "the borrow checker explained");
-        add_article(&conn, feed_id, "privacy", "Privacy law", "a new data privacy regulation");
+        add_article(
+            &conn,
+            feed_id,
+            "rust",
+            "Rust news",
+            "the borrow checker explained",
+        );
+        add_article(
+            &conn,
+            feed_id,
+            "privacy",
+            "Privacy law",
+            "a new data privacy regulation",
+        );
 
         // A natural-language question shares only *some* words with each
         // article. An AND join would require every word to appear and return
@@ -3055,7 +3562,9 @@ mod tests {
         let (conn, _aid) = test_db();
         // An all-stopword / punctuation-only question must not error and must
         // return nothing (the match-nothing `""` expression).
-        assert!(search_articles_for_rag(&conn, "??? !!!", 6).unwrap().is_empty());
+        assert!(search_articles_for_rag(&conn, "??? !!!", 6)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3120,9 +3629,7 @@ mod tests {
             "a tag created after a middle delete must sort last, got {order:?}",
         );
         // The pre-existing tags keep their relative order.
-        assert!(
-            order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),
-        );
+        assert!(order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),);
     }
 
     #[test]
@@ -3247,14 +3754,13 @@ mod tests {
         };
 
         // Pre-marked read by the rule → not new.
-        assert!(!upsert_article(&conn, feed_id, &mk("g-ad", "Sponsored Item"), false, &rules)
-            .unwrap());
+        assert!(
+            !upsert_article(&conn, feed_id, &mk("g-ad", "Sponsored Item"), false, &rules).unwrap()
+        );
         // A plain article → genuinely new.
-        assert!(upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules)
-            .unwrap());
+        assert!(upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules).unwrap());
         // A duplicate guid → not new (no double count).
-        assert!(!upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules)
-            .unwrap());
+        assert!(!upsert_article(&conn, feed_id, &mk("g-ok", "Real Story"), false, &rules).unwrap());
     }
 
     // ── rule matching ────────────────────────────────────────────────
@@ -3344,9 +3850,11 @@ mod tests {
 
         // Lower-case non-ASCII keywords must still count the article.
         for keyword in ["café", "zürich"] {
-            let (count, samples) =
-                preview_rule(&conn, None, "title", keyword).unwrap();
-            assert_eq!(count, 1, "keyword `{keyword}` should match the CAFÉ article");
+            let (count, samples) = preview_rule(&conn, None, "title", keyword).unwrap();
+            assert_eq!(
+                count, 1,
+                "keyword `{keyword}` should match the CAFÉ article"
+            );
             assert_eq!(samples.len(), 1);
         }
 
@@ -3407,9 +3915,11 @@ mod tests {
         let n = apply_rule_to_existing(&conn, None, "title", "java", "star").unwrap();
         assert_eq!(n, 2, "both Java/JavaScript titles get starred");
         let starred: i64 = conn
-            .query_row("SELECT COUNT(*) FROM articles WHERE is_starred = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM articles WHERE is_starred = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(starred, 2);
 
@@ -3453,7 +3963,10 @@ mod tests {
         let fts: i64 = conn
             .query_row("SELECT COUNT(*) FROM articles_fts", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(arts, fts, "FTS index stays in sync after a skip-rule delete");
+        assert_eq!(
+            arts, fts,
+            "FTS index stays in sync after a skip-rule delete"
+        );
     }
 
     #[test]
@@ -3485,7 +3998,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(starred_in_a, 0, "a feed-scoped rule must not touch other feeds");
+        assert_eq!(
+            starred_in_a, 0,
+            "a feed-scoped rule must not touch other feeds"
+        );
     }
 
     // ── mark_all_read sync queueing ──────────────────────────────────
@@ -3561,16 +4077,23 @@ mod tests {
             ["https://example.com/a3".to_string()].into_iter().collect();
 
         let changed = reconcile_sync_state(&conn, &[feed_id], &unread, &starred).unwrap();
-        assert_eq!(changed, 2, "a1 -> read and a3 -> read+starred; a2 unchanged");
+        assert_eq!(
+            changed, 2,
+            "a1 -> read and a3 -> read+starred; a2 unchanged"
+        );
 
         let read = |g: &str| -> bool {
-            conn.query_row("SELECT is_read FROM articles WHERE guid = ?1", [g], |r| r.get(0))
-                .unwrap()
-        };
-        let is_starred = |g: &str| -> bool {
-            conn.query_row("SELECT is_starred FROM articles WHERE guid = ?1", [g], |r| {
+            conn.query_row("SELECT is_read FROM articles WHERE guid = ?1", [g], |r| {
                 r.get(0)
             })
+            .unwrap()
+        };
+        let is_starred = |g: &str| -> bool {
+            conn.query_row(
+                "SELECT is_starred FROM articles WHERE guid = ?1",
+                [g],
+                |r| r.get(0),
+            )
             .unwrap()
         };
         assert!(read("g1"), "tail item not in unread set is marked read");
@@ -3593,7 +4116,9 @@ mod tests {
         let changed = reconcile_sync_state(&conn, &[feed_id], &empty, &empty).unwrap();
         assert_eq!(changed, 0, "pending article is skipped");
         let read: bool = conn
-            .query_row("SELECT is_read FROM articles WHERE id = ?1", [aid], |r| r.get(0))
+            .query_row("SELECT is_read FROM articles WHERE id = ?1", [aid], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(!read, "a1 keeps its local (unread) state");
     }
@@ -3638,9 +4163,11 @@ mod tests {
         // outside a 30-day window, yet a string compare wrongly keeps it.
         let (conn, fixture) = test_db();
         let feed_id: i64 = conn
-            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                [fixture],
+                |r| r.get(0),
+            )
             .unwrap();
 
         // The cutoff is "now" minus 30 days, kept at the current wall-clock
@@ -3680,10 +4207,16 @@ mod tests {
         let old = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         insert_read_article_published(&conn, feed_id, "starred", &old);
         insert_read_article_published(&conn, feed_id, "later", &old);
-        conn.execute("UPDATE articles SET is_starred = 1 WHERE guid = 'starred'", [])
-            .unwrap();
-        conn.execute("UPDATE articles SET read_later = 1 WHERE guid = 'later'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE articles SET is_starred = 1 WHERE guid = 'starred'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE articles SET read_later = 1 WHERE guid = 'later'",
+            [],
+        )
+        .unwrap();
 
         cleanup_old_articles(&conn, 30).unwrap();
         let kept: i64 = conn
@@ -3711,9 +4244,11 @@ mod tests {
         insert_read_article_published(&conn, feed_id, "plain", &old);
 
         let annotated_id: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'annotated'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM articles WHERE guid = 'annotated'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         insert_highlight(
             &conn,
@@ -3753,8 +4288,16 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         insert_read_article_published(&conn, feed_id, "fresh", &now);
 
-        assert_eq!(cleanup_old_articles(&conn, 0).unwrap(), 0, "0 days deletes nothing");
-        assert_eq!(cleanup_old_articles(&conn, -30).unwrap(), 0, "negative days deletes nothing");
+        assert_eq!(
+            cleanup_old_articles(&conn, 0).unwrap(),
+            0,
+            "0 days deletes nothing"
+        );
+        assert_eq!(
+            cleanup_old_articles(&conn, -30).unwrap(),
+            0,
+            "negative days deletes nothing"
+        );
 
         let kept: i64 = conn
             .query_row(
@@ -3787,16 +4330,22 @@ mod tests {
         // purge records a tombstone so the re-fetch is dropped.
         let (conn, fixture) = test_db();
         let feed_id: i64 = conn
-            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                [fixture],
+                |r| r.get(0),
+            )
             .unwrap();
 
         let old = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
         insert_read_article_published(&conn, feed_id, "archived", &old);
 
         assert_eq!(cleanup_old_articles(&conn, 30).unwrap(), 1);
-        assert_eq!(guid_count(&conn, feed_id, "archived"), 0, "purged by retention");
+        assert_eq!(
+            guid_count(&conn, feed_id, "archived"),
+            0,
+            "purged by retention"
+        );
 
         // The next refresh re-fetches the still-in-feed item. dedup is off (the
         // default), so only the tombstone can suppress the re-insertion.
@@ -3829,9 +4378,11 @@ mod tests {
         // same guid is unaffected — its article ingests normally.
         let (conn, fixture) = test_db();
         let feed_a: i64 = conn
-            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                [fixture],
+                |r| r.get(0),
+            )
             .unwrap();
         let feed_b = insert_feed(
             &conn,
@@ -3883,9 +4434,11 @@ mod tests {
         // string compare the dated row wins (the `T`); `datetime()` fixes it.
         let (conn, fixture) = test_db();
         let feed_id: i64 = conn
-            .query_row("SELECT feed_id FROM articles WHERE id = ?1", [fixture], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT feed_id FROM articles WHERE id = ?1",
+                [fixture],
+                |r| r.get(0),
+            )
             .unwrap();
         // Drop the bare fixture article so only the two controlled rows remain.
         conn.execute("DELETE FROM articles WHERE id = ?1", [fixture])
@@ -3971,9 +4524,11 @@ mod tests {
         .unwrap();
 
         let (title, site_url): (String, Option<String>) = conn
-            .query_row("SELECT title, site_url FROM feeds WHERE id = ?1", [feed_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT title, site_url FROM feeds WHERE id = ?1",
+                [feed_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(
             title, "My Custom Name",
@@ -3997,7 +4552,9 @@ mod tests {
             .query_row("SELECT id FROM feeds", [], |r| r.get(0))
             .unwrap();
         let original: String = conn
-            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| r.get(0))
+            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         for blank in ["", "   ", "\t\n"] {
@@ -4015,8 +4572,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(title, original, "a rejected rename must not alter the title");
-        assert!(!custom, "a rejected rename must not set the custom_title flag");
+        assert_eq!(
+            title, original,
+            "a rejected rename must not alter the title"
+        );
+        assert!(
+            !custom,
+            "a rejected rename must not set the custom_title flag"
+        );
     }
 
     #[test]
@@ -4029,7 +4592,9 @@ mod tests {
             .unwrap();
         rename_feed(&conn, feed_id, "  Tech News  ").unwrap();
         let title: String = conn
-            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| r.get(0))
+            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(title, "Tech News");
     }
@@ -4046,7 +4611,9 @@ mod tests {
         update_feed_meta(&conn, feed_id, Some("Renamed Upstream"), None, None, None).unwrap();
 
         let title: String = conn
-            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| r.get(0))
+            .query_row("SELECT title FROM feeds WHERE id = ?1", [feed_id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(title, "Renamed Upstream");
     }
@@ -4075,15 +4642,7 @@ mod tests {
         .unwrap();
 
         // A later refresh serves empty metadata — every field must be ignored.
-        update_feed_meta(
-            &conn,
-            feed_id,
-            Some(""),
-            Some(""),
-            Some(""),
-            Some(""),
-        )
-        .unwrap();
+        update_feed_meta(&conn, feed_id, Some(""), Some(""), Some(""), Some("")).unwrap();
 
         let (title, site_url, description, favicon): (
             String,

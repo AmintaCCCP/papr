@@ -14,6 +14,7 @@ import type {
   Highlight,
   NewsletterInput,
   NewsletterSource,
+  ParserTestResult,
   RefreshProgress,
   Rule,
   RuleAction,
@@ -203,6 +204,11 @@ export const getSetting = (key: string) =>
   invoke<string | null>("get_setting", { key });
 export const setSetting = (key: string, value: string) =>
   invoke<void>("set_setting", { key, value });
+
+/** Probe one parser's configuration with a real upstream round-trip
+ *  (`test_parser`). Throws a coded error the caller localises. */
+export const testParser = (id: string, handle: string) =>
+  invoke<ParserTestResult>("test_parser", { id, handle });
 
 /** The built-in article-summary system prompt — the prompt editor's
  *  placeholder, so the user can see (and start from) the default. */

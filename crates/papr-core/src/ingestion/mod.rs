@@ -8,5 +8,6 @@ pub mod discovery;
 pub mod fetch;
 pub mod newsletter;
 pub mod parse;
+pub mod parsers;
 pub mod refresh;
 pub mod sources;

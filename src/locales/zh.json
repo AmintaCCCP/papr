@@ -233,7 +233,8 @@
       "shortcuts": "快捷键",
       "notifications": "通知",
       "advanced": "高级",
-      "about": "关于"
+      "about": "关于",
+      "parsers": "解析器"
     },
     "sub": {
       "general": "订阅源刷新、默认行为、启动方式",
@@ -246,7 +247,8 @@
       "shortcuts": "键盘快捷键",
       "notifications": "新文章提醒与角标",
       "advanced": "缓存、网络、实验功能",
-      "about": "版本信息与致谢"
+      "about": "版本信息与致谢",
+      "parsers": "内置解析器与凭据"
     },
     "general": {
       "refresh": "刷新",
@@ -499,6 +501,25 @@
       },
       "obsidianHint": "本地 Vault 文件夹的绝对路径；每次保存会写入一篇带 frontmatter 的 Markdown 笔记。"
     },
+    "parsers": {
+      "title": "内置解析器",
+      "intro": "解析器让 papr 直接抓取不提供 RSS 的站点内容，无需第三方实例。开启后可直接订阅对应的链接。",
+      "x": {
+        "name": "X（Twitter）",
+        "desc": "直接订阅 x.com/用户名，抓取该用户的最新推文。"
+      },
+      "configure": "配置",
+      "field": {
+        "authToken": "auth_token",
+        "ct0": "ct0"
+      },
+      "cookieHint": "凭据为必填项：登录 x.com 后，从浏览器开发者工具（应用 → Cookie）复制 auth_token 与 ct0 两个 Cookie 的值。抓取使用你自己的登录会话，凭据只保存在本机数据库中。",
+      "testHandlePlaceholder": "用户名，如 jack",
+      "test": "测试连接",
+      "testing": "测试中…",
+      "testOk": "连接成功：抓到 {{count}} 条推文",
+      "clear": "清除凭据"
+    },
     "shortcuts": {
       "navigation": "导航",
       "nextArticle": "下一篇",
@@ -711,7 +732,15 @@
     "integrationMethodInvalid": "Webhook 的 HTTP 方法不受支持",
     "integrationSchemeInvalid": "不允许使用该 URL Scheme",
     "obsidianNoteExists": "Vault 中已存在同名笔记",
-    "aiEmptyResponse": "服务商返回了空摘要——请检查模型与提示词"
+    "aiEmptyResponse": "服务商返回了空摘要——请检查模型与提示词",
+    "parserDisabled": "该链接由内置解析器处理，但对应解析器未启用——请到 设置 → 解析器 中开启。",
+    "parserUnknown": "未知的解析器。",
+    "xAuthRequired": "X 解析器需要登录凭据：请到 设置 → 解析器 中配置 auth_token 与 ct0。",
+    "xAuthInvalid": "X 鉴权已失效（auth_token/ct0 无效或过期），请到 设置 → 解析器 中更新凭据。",
+    "xAccountUnavailable": "无法获取该 X 用户的时间线（账号可能不存在、受限或已注销）。",
+    "xBlocked": "X 请求被拒绝（HTTP 403，可能被防火墙拦截、IP 受限或账号受限）——可在 设置 → 高级 中配置网络代理后重试。",
+    "xHandleInvalid": "无效的 X 用户名（1–15 位字母、数字或下划线）。",
+    "parserNoExtract": "该文章由内置解析器生成，已是完整内容——无需也不应再抓取网页正文（站点页面只会返回登录页/页脚）。"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

@@ -18,7 +18,13 @@ pub fn sanitize(html: &str, base: Option<&str>) -> String {
     // drops those attributes — so without this the `<img>` reaches the reader
     // with no usable `src` and silently shows nothing. See `promote_lazy_images`.
     let html = promote_lazy_images(html);
+    clean_with(base_builder(), &html, base)
+}
 
+/// The shared ammonia policy: every tag/attribute allowance and the forced
+/// `referrerpolicy` live here so the parser variant below cannot drift from
+/// the feed policy.
+fn base_builder() -> Builder<'static> {
     let mut builder = Builder::default();
     builder
         .link_rel(Some("noopener noreferrer nofollow"))
@@ -34,7 +40,16 @@ pub fn sanitize(html: &str, base: Option<&str>) -> String {
         .add_tags(["video", "source"])
         .add_tag_attributes(
             "video",
-            ["src", "poster", "width", "height", "preload", "loop", "muted", "playsinline"],
+            [
+                "src",
+                "poster",
+                "width",
+                "height",
+                "preload",
+                "loop",
+                "muted",
+                "playsinline",
+            ],
         )
         .add_tag_attributes("source", ["src", "type", "media"])
         // Always expose player controls: a feed clip with no `controls` (and no
@@ -52,11 +67,65 @@ pub fn sanitize(html: &str, base: Option<&str>) -> String {
         // retry-through-backend path — see `commands::fetch_image`.
         .set_tag_attribute_value("img", "referrerpolicy", "no-referrer");
 
-    let parsed_base = base.and_then(|b| Url::parse(b).ok());
-    if let Some(b) = parsed_base {
+    builder
+}
+
+/// Apply `builder` to already-promoted HTML, rewriting relative URLs against
+/// `base`.
+fn clean_with(mut builder: Builder<'static>, html: &str, base: Option<&str>) -> String {
+    if let Some(b) = base.and_then(|b| Url::parse(b).ok()) {
         builder.url_relative(UrlRelative::RewriteWithBase(b));
     }
-    builder.clean(&html).to_string()
+    builder.clean(html).to_string()
+}
+
+/// Sanitize content that papr itself generated (the built-in parsers' tweet
+/// cards) rather than a feed document.
+///
+/// Identical policy to [`sanitize`] plus one allowance: `class`, so the tweet
+/// card structure (`x-tweet`, `x-quote`, …) survives and can be styled. That
+/// allowance is safe *here* because a parser body carries no untrusted
+/// markup — dynamic text and URLs are escaped when the card is built — but it
+/// is still narrowed: `class` is only a `class` attribute and tokens are
+/// filtered to the `x-` namespace afterwards, so even a future caller that
+/// accidentally funnels third-party HTML through this path cannot reach the
+/// app's own CSS classes.
+pub fn sanitize_parser(html: &str, base: Option<&str>) -> String {
+    // No `promote_lazy_images`: card images are emitted with a real `src` by
+    // construction, and running the feed-image recovery here would only add a
+    // pass over content we authored.
+    let mut builder = base_builder();
+    builder.add_generic_attributes(["class"]);
+    let cleaned = clean_with(builder, html, base);
+    keep_parser_classes(&cleaned)
+}
+
+/// Drop every `class` token outside the `x-` namespace (and the attribute
+/// itself when nothing survives). Runs on sanitized HTML, so only attribute
+/// text is touched — no new markup can appear.
+fn keep_parser_classes(html: &str) -> String {
+    let rewrite = rewrite_str(
+        html,
+        RewriteStrSettings {
+            element_content_handlers: vec![element!("[class]", |el| {
+                let kept: Vec<String> = el
+                    .get_attribute("class")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter(|c| c.starts_with("x-"))
+                    .map(str::to_string)
+                    .collect();
+                if kept.is_empty() {
+                    el.remove_attribute("class");
+                } else {
+                    el.set_attribute("class", &kept.join(" ")).ok();
+                }
+                Ok(())
+            })],
+            ..RewriteStrSettings::default()
+        },
+    );
+    rewrite.unwrap_or_else(|_| html.to_string())
 }
 
 /// Promote a lazy-loaded image's real URL into `src` so it survives `sanitize`.
@@ -313,9 +382,18 @@ mod tests {
         );
         assert!(out.contains("<video"), "video tag dropped: {out}");
         assert!(out.contains("<source"), "source tag dropped: {out}");
-        assert!(out.contains(r#"src="https://ex.com/v.mp4""#), "source src dropped: {out}");
-        assert!(out.contains(r#"type="video/mp4""#), "source type dropped: {out}");
-        assert!(out.contains(r#"poster="https://ex.com/p.jpg""#), "poster dropped: {out}");
+        assert!(
+            out.contains(r#"src="https://ex.com/v.mp4""#),
+            "source src dropped: {out}"
+        );
+        assert!(
+            out.contains(r#"type="video/mp4""#),
+            "source type dropped: {out}"
+        );
+        assert!(
+            out.contains(r#"poster="https://ex.com/p.jpg""#),
+            "poster dropped: {out}"
+        );
     }
 
     #[test]
@@ -353,7 +431,10 @@ mod tests {
     #[test]
     fn sanitize_drops_javascript_video_src() {
         let out = sanitize(r#"<video src="javascript:evil()"></video>"#, None);
-        assert!(!out.contains("javascript:"), "javascript: src survived: {out}");
+        assert!(
+            !out.contains("javascript:"),
+            "javascript: src survived: {out}"
+        );
     }
 
     // --- first_image: card-thumbnail fallback from body HTML. ---
@@ -472,6 +553,43 @@ mod tests {
             !out.contains("other.jpg"),
             "data-src wrongly overrode src: {out}"
         );
+    }
+
+    #[test]
+    fn parser_cards_keep_the_x_class_namespace() {
+        let html = r#"<div class="x-tweet"><div class="x-tweet-head"><span class="x-author"><strong>A</strong><span class="x-handle">@a</span></span><a class="x-permalink" href="https://x.com/a/status/1">2026-09-13</a></div><div class="x-tweet-body">hi</div></div>"#;
+        let out = sanitize_parser(html, None);
+        assert!(out.contains(r#"class="x-tweet""#), "{out}");
+        assert!(out.contains(r#"class="x-tweet-head""#), "{out}");
+        assert!(out.contains(r#"class="x-handle""#), "{out}");
+        assert!(out.contains(r#"class="x-permalink""#), "{out}");
+        assert!(out.contains("https://x.com/a/status/1"), "{out}");
+    }
+
+    #[test]
+    fn parser_sanitize_still_strips_scripts_and_foreign_classes() {
+        // Defence in depth: even if third-party HTML were ever routed through
+        // the parser policy, it could not reach the app's own CSS classes and
+        // scripts still die.
+        let html = r#"<div class="x-tweet article-body settings-window"><script>alert(1)</script>ok</div>"#;
+        let out = sanitize_parser(html, None);
+        assert!(!out.contains("<script"), "{out}");
+        assert!(!out.contains("article-body"), "{out}");
+        assert!(!out.contains("settings-window"), "{out}");
+        assert!(out.contains(r#"class="x-tweet""#), "{out}");
+    }
+
+    #[test]
+    fn parser_sanitize_drops_the_class_attribute_when_nothing_survives() {
+        let out = sanitize_parser(r#"<div class="evil">ok</div>"#, None);
+        assert!(!out.contains("class="), "{out}");
+    }
+
+    #[test]
+    fn feed_sanitize_still_drops_classes_entirely() {
+        // The generic path must not silently inherit the parser allowance.
+        let out = sanitize(r#"<div class="x-tweet">ok</div>"#, None);
+        assert!(!out.contains("class="), "{out}");
     }
 
     #[test]

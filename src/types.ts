@@ -7,7 +7,9 @@ export type SourceType =
   | "mastodon"
   | "bluesky"
   | "reddit"
-  | "newsletter";
+  | "newsletter"
+  /** An X (Twitter) user timeline served by the built-in X parser. */
+  | "x";
 
 /** A configured email-newsletter source (mirrors commands::NewsletterSource). */
 export interface NewsletterSource {
@@ -27,6 +29,11 @@ export interface NewsletterInput {
   username: string;
   password: string;
   folder: string;
+}
+
+/** Result of the settings "test connection" probe for one parser. */
+export interface ParserTestResult {
+  articleCount: number;
 }
 
 /** A feed-discovery result (mirrors discovery::DiscoveryResult). */

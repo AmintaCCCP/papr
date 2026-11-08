@@ -233,7 +233,8 @@
       "shortcuts": "Shortcuts",
       "notifications": "Notifications",
       "advanced": "Advanced",
-      "about": "About"
+      "about": "About",
+      "parsers": "Parsers"
     },
     "sub": {
       "general": "Feed refresh, default behavior, startup",
@@ -246,7 +247,8 @@
       "shortcuts": "Keyboard shortcuts",
       "notifications": "New article alerts and badges",
       "advanced": "Cache, network, experimental features",
-      "about": "Version info and credits"
+      "about": "Version info and credits",
+      "parsers": "Built-in parsers and credentials"
     },
     "general": {
       "refresh": "Refresh",
@@ -499,6 +501,25 @@
       },
       "obsidianHint": "Absolute path of the local vault folder; each save writes a Markdown note with frontmatter."
     },
+    "parsers": {
+      "title": "Built-in parsers",
+      "intro": "Parsers let papr fetch content from sites that offer no RSS, with no third-party instance. Enable one, then subscribe to the matching links directly.",
+      "x": {
+        "name": "X (Twitter)",
+        "desc": "Subscribe to x.com/username and fetch that user's latest tweets."
+      },
+      "configure": "Configure",
+      "field": {
+        "authToken": "auth_token",
+        "ct0": "ct0"
+      },
+      "cookieHint": "Credentials are required: sign in to x.com, then copy the auth_token and ct0 cookie values from your browser's developer tools (Application → Cookies). Fetching uses your own session; credentials never leave this machine.",
+      "testHandlePlaceholder": "username, e.g. jack",
+      "test": "Test connection",
+      "testing": "Testing…",
+      "testOk": "Connection works: fetched {{count}} tweets",
+      "clear": "Clear credentials"
+    },
     "shortcuts": {
       "navigation": "Navigation",
       "nextArticle": "Next article",
@@ -711,7 +732,15 @@
     "integrationMethodInvalid": "The webhook's HTTP method is not supported",
     "integrationSchemeInvalid": "This URL scheme is not allowed",
     "obsidianNoteExists": "A note with this name already exists in the vault",
-    "aiEmptyResponse": "The provider returned an empty summary — check the model and prompt"
+    "aiEmptyResponse": "The provider returned an empty summary — check the model and prompt",
+    "parserDisabled": "This link is handled by a built-in parser that is disabled — enable it in Settings → Parsers.",
+    "parserUnknown": "Unknown parser.",
+    "xAuthRequired": "The X parser requires credentials: configure auth_token and ct0 in Settings → Parsers.",
+    "xAuthInvalid": "X authentication has expired (auth_token/ct0 invalid) — update the credentials in Settings → Parsers.",
+    "xAccountUnavailable": "This X user's timeline is unavailable (the account may not exist, be restricted, or be gone).",
+    "xBlocked": "The X request was refused (HTTP 403 — firewall challenge, IP restriction, or account restriction). Try configuring a network proxy in Settings → Advanced.",
+    "xHandleInvalid": "Invalid X username (1–15 letters, digits or underscores).",
+    "parserNoExtract": "This article is produced by a built-in parser and is already complete — extracting the web page would only return its login shell and footer."
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

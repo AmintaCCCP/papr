@@ -109,9 +109,7 @@ fn mime_from_url(url: &str) -> Option<&'static str> {
 /// to the top of the newest-first list permanently, burying genuinely recent
 /// articles. A 24-hour grace window absorbs harmless publisher/client clock
 /// skew; anything beyond it is clamped down to "now".
-pub fn clamp_publish_date(
-    date: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
+pub fn clamp_publish_date(date: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     let now = chrono::Utc::now();
     let cutoff = now + chrono::Duration::hours(24);
     if date > cutoff {
@@ -271,6 +269,16 @@ pub fn detect_source_type(url: &str) -> SourceType {
         // (`import_opml` only ever sees the URL); `normalize_source` already
         // tags the interactive `add_feed` path.
         SourceType::Reddit
+    } else if parsed
+        .as_ref()
+        .is_some_and(|u| super::parsers::x::normalize_x_url(u).is_some())
+    {
+        // An X profile URL typed into OPML or sync classifies as parser-served
+        // from the URL alone: the refresh leg then handles it correctly (it
+        // works when the parser is enabled, and reports the actionable
+        // auth-required error when not) instead of failing as a broken `rss`
+        // feed forever. Same URL-only visibility constraint as Reddit above.
+        SourceType::X
     } else {
         // Mastodon and podcast detection happen after parsing (see refine_source_type).
         SourceType::Rss
@@ -293,9 +301,12 @@ pub fn refine_source_type(initial: SourceType, parsed: &ParsedFeed, feed_url: &s
         return initial;
     }
     let has_audio = parsed.articles.iter().any(|a| {
-        a.enclosures
-            .iter()
-            .any(|e| e.mime_type.as_deref().map(|m| m.starts_with("audio")).unwrap_or(false))
+        a.enclosures.iter().any(|e| {
+            e.mime_type
+                .as_deref()
+                .map(|m| m.starts_with("audio"))
+                .unwrap_or(false)
+        })
     });
     if has_audio {
         return SourceType::Podcast;
@@ -394,7 +405,10 @@ mod tests {
     #[test]
     fn resolve_url_keeps_absolute_links_unchanged() {
         assert_eq!(
-            resolve_url("https://other.example.com/post/1", "https://feed.example.com/rss"),
+            resolve_url(
+                "https://other.example.com/post/1",
+                "https://feed.example.com/rss"
+            ),
             "https://other.example.com/post/1"
         );
     }
@@ -441,7 +455,10 @@ mod tests {
 
     #[test]
     fn infers_audio_and_video_from_extension() {
-        assert_eq!(mime_from_url("https://cdn.example.com/ep1.mp3"), Some("audio/mpeg"));
+        assert_eq!(
+            mime_from_url("https://cdn.example.com/ep1.mp3"),
+            Some("audio/mpeg")
+        );
         assert_eq!(mime_from_url("http://x/y/show.m4a"), Some("audio/aac"));
         assert_eq!(mime_from_url("https://x/clip.MP4"), Some("video/mp4"));
         assert_eq!(mime_from_url("https://x/clip.webm"), Some("video/webm"));
@@ -453,7 +470,10 @@ mod tests {
             mime_from_url("https://traffic.example.com/ep.mp3?token=abc&t=1"),
             Some("audio/mpeg")
         );
-        assert_eq!(mime_from_url("https://x/ep.m4a#chapter2"), Some("audio/aac"));
+        assert_eq!(
+            mime_from_url("https://x/ep.m4a#chapter2"),
+            Some("audio/aac")
+        );
     }
 
     #[test]
