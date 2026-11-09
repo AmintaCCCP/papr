@@ -41,9 +41,13 @@ pub(crate) async fn read_capped(mut resp: reqwest::Response) -> AppResult<Vec<u8
 /// (honour `HTTP(S)_PROXY` env vars), `"none"` (bypass all proxies), or an
 /// explicit proxy URL.
 pub fn build_client(timeout_secs: u64, proxy: &str) -> Client {
+    build_client_inner(timeout_secs.clamp(5, 300), proxy)
+}
+
+fn build_client_inner(timeout_secs: u64, proxy: &str) -> Client {
     let mut builder = Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(timeout_secs.clamp(5, 300)))
+        .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10));
 
     match proxy {
@@ -66,6 +70,20 @@ pub fn build_client_from_settings(conn: &Connection) -> Client {
         .flatten()
         .unwrap_or_else(|| "system".to_string());
     build_client(timeout, &proxy)
+}
+
+/// Build the client for large engine downloads: the user's proxy settings
+/// (a release archive may well be behind the same network that needs the
+/// proxy), but a far longer whole-request budget than the feed client's
+/// default 30 s — a full engine archive is >100 MB and the download would
+/// otherwise die mid-transfer. The transfer is still bounded by the
+/// extractor's archive-size cap.
+pub fn build_download_client(conn: &Connection) -> Client {
+    let proxy = db::get_setting(conn, "net_proxy")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "system".to_string());
+    build_client_inner(30 * 60, &proxy)
 }
 
 /// Result of a conditional GET against a feed URL.

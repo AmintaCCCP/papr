@@ -355,7 +355,12 @@ pub async fn rsshub_route_install(state: State<'_, AppState>, path: String) -> A
         return Err(AppError::code("rsshubRouteUnknown"));
     }
     let conn = state.db.lock().await;
-    db::rsshub_route_upsert(&conn, &path)
+    db::rsshub_route_upsert(&conn, &path)?;
+    drop(conn);
+    // The engine only reads the registry at spawn: stop it so the next
+    // ensure() picks up a newly installed route's environment variables.
+    state.engine.shutdown().await;
+    Ok(())
 }
 
 /// Uninstall a route template. Its subscriptions stay in the sidebar but stop
@@ -363,7 +368,10 @@ pub async fn rsshub_route_install(state: State<'_, AppState>, path: String) -> A
 #[tauri::command]
 pub async fn rsshub_route_uninstall(state: State<'_, AppState>, path: String) -> AppResult<()> {
     let conn = state.db.lock().await;
-    db::rsshub_route_delete(&conn, &normalize_route_path(&path))
+    db::rsshub_route_delete(&conn, &normalize_route_path(&path))?;
+    drop(conn);
+    state.engine.shutdown().await;
+    Ok(())
 }
 
 /// Toggle a route. Disabled routes keep their env vars but stop refreshing
@@ -379,19 +387,30 @@ pub async fn rsshub_route_set_enabled(
     if db::rsshub_route_get(&conn, &path)?.is_none() {
         return Err(AppError::code("rsshubRouteUnknown"));
     }
-    db::rsshub_route_set_enabled(&conn, &path, enabled)
+    db::rsshub_route_set_enabled(&conn, &path, enabled)?;
+    drop(conn);
+    // The merged environment (`db::rsshub_enabled_env`) is a spawn-time
+    // snapshot — dropping the process makes the toggle effective immediately.
+    state.engine.shutdown().await;
+    Ok(())
 }
 
 /// Replace a route's environment variables. Values must all be strings — the
-/// engine passes them straight into the child process environment.
+/// engine passes them straight into the child process environment. Names are
+/// restricted to what a process environment can carry on every platform
+/// (letters, digits, underscores) so a typo cannot break the engine spawn.
 #[tauri::command]
 pub async fn rsshub_route_set_env(
     state: State<'_, AppState>,
     path: String,
     env: BTreeMap<String, String>,
 ) -> AppResult<()> {
+    const MAX_ENV_KEY_BYTES: usize = 128;
     let path = normalize_route_path(&path);
-    if env.keys().any(|k| k.trim().is_empty()) {
+    if env
+        .keys()
+        .any(|k| k.len() > MAX_ENV_KEY_BYTES || !valid_env_key(k))
+    {
         return Err(AppError::code("rsshubEnvInvalid"));
     }
     let json =
@@ -400,14 +419,39 @@ pub async fn rsshub_route_set_env(
     if db::rsshub_route_get(&conn, &path)?.is_none() {
         return Err(AppError::code("rsshubRouteUnknown"));
     }
-    db::rsshub_route_set_env(&conn, &path, &json)
+    db::rsshub_route_set_env(&conn, &path, &json)?;
+    drop(conn);
+    // The engine spawns with the merged env read once — restart it so the
+    // new variables are actually in its process environment.
+    state.engine.shutdown().await;
+    Ok(())
+}
+
+/// `true` for environment variable names a child process can carry:
+/// `[A-Za-z_][A-Za-z0-9_]*` — the shape of every variable RSSHub documents
+/// (`BILIBILI_COOKIE_<uid>`, `GITHUB_TOKEN`, …). Anything else (`=`, spaces,
+/// control characters) is refused at save time rather than failing the
+/// engine spawn later with a cryptic OS error.
+fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Route paths come in both key forms — normalize to the catalog's canonical
-/// leading-slash template form so registry keys are stable.
+/// leading-slash template form so registry keys are stable. Bounded and
+/// control-character-free: registry keys are stored verbatim, so an absurd
+/// or unprintable IPC payload must not land in the database.
 fn normalize_route_path(path: &str) -> String {
+    const MAX_ROUTE_PATH_BYTES: usize = 512;
     let trimmed = path.trim().trim_matches('/');
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.len() > MAX_ROUTE_PATH_BYTES {
+        return String::new();
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
         return String::new();
     }
     format!("/{trimmed}")
@@ -427,12 +471,20 @@ pub async fn engine_status(state: State<'_, AppState>) -> AppResult<rsshub::engi
 pub async fn engine_install_from_dialog(
     app: AppHandle,
 ) -> AppResult<Option<rsshub::engine::EngineInfo>> {
-    let Some(path) = app
-        .dialog()
-        .file()
-        .add_filter("RSSHub engine archive", &["tar.gz", "tgz", "zip"])
-        .blocking_pick_file()
-    else {
+    // `blocking_pick_file` parks its caller until the user closes the dialog
+    // — run it on the blocking pool so a tokio worker is not held hostage
+    // while the dialog sits open.
+    let app_for_dialog = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app_for_dialog
+            .dialog()
+            .file()
+            .add_filter("RSSHub engine archive", &["tar.gz", "tgz", "zip"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|e| AppError::other(format!("engine dialog task: {e}")))?;
+    let Some(path) = picked else {
         return Ok(None); // user cancelled
     };
     let path = path
@@ -442,31 +494,23 @@ pub async fn engine_install_from_dialog(
     engine.install_from_archive(&path).await.map(Some)
 }
 
-/// Install the engine from a local archive path (already-known paths, e.g. a
-/// freshly built `target/engine/*.tar.gz`).
-#[tauri::command]
-pub async fn engine_install_from_path(
-    state: State<'_, AppState>,
-    path: String,
-) -> AppResult<rsshub::engine::EngineInfo> {
-    let path = PathBuf::from(path);
-    if !path.is_file() {
-        return Err(AppError::code(rsshub::engine::CODE_ARCHIVE_INVALID));
-    }
-    state.engine.install_from_archive(&path).await
-}
-
 /// Download and install the engine from a URL, optionally verifying the
-/// archive's sha256 (`sha256sum` of the artifact, hex).
+/// archive's sha256 (`sha256sum` of the artifact, hex). Uses a dedicated
+/// download client — the shared feed client's whole-request timeout (30 s by
+/// default) would abort a >100 MB archive mid-transfer.
 #[tauri::command]
 pub async fn engine_install_from_url(
     state: State<'_, AppState>,
     url: String,
     sha256: Option<String>,
 ) -> AppResult<rsshub::engine::EngineInfo> {
+    let client = {
+        let conn = state.db.lock().await;
+        fetch::build_download_client(&conn)
+    };
     state
         .engine
-        .install_from_url(&url, &state.http(), sha256.as_deref())
+        .install_from_url(&url, &client, sha256.as_deref())
         .await
 }
 
@@ -503,7 +547,8 @@ pub async fn rsshub_test_route(
     let port = engine.ensure(&env).await?;
     let url = format!("http://127.0.0.1:{port}/{}", route.trim_start_matches('/'));
 
-    let client = state.http();
+    // Loopback fetch — never through a configured proxy (see `loopback_client`).
+    let client = rsshub::engine::loopback_client().clone();
     let (bytes, _ct, _final) = fetch::get(&client, &url).await.map_err(|e| {
         log::warn!("rsshub test route {route}: {e}");
         AppError::code(rsshub::engine::CODE_ROUTE_FETCH)
@@ -550,7 +595,8 @@ async fn add_rsshub_feed(
     let port = engine.ensure(&env).await?;
     let fetch_url = format!("http://127.0.0.1:{port}/{}", route.trim_start_matches('/'));
 
-    let client = state.http();
+    // Loopback fetch — never through a configured proxy (see `loopback_client`).
+    let client = rsshub::engine::loopback_client().clone();
     let (bytes, _ct, _final) = fetch::get(&client, &fetch_url).await.map_err(|e| {
         log::warn!("rsshub add {route}: {e}");
         AppError::code(rsshub::engine::CODE_ROUTE_FETCH)

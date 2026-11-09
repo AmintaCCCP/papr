@@ -338,7 +338,6 @@ pub fn run() {
             commands::rsshub_test_route,
             commands::engine_status,
             commands::engine_install_from_dialog,
-            commands::engine_install_from_path,
             commands::engine_install_from_url,
             commands::engine_uninstall,
             integrations::run_integration,
