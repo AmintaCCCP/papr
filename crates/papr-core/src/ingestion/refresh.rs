@@ -291,7 +291,7 @@ pub async fn refresh_core(
 
     // rsshub feeds: run each route through the bundled local engine, same
     // cadence as the RSS refresh above.
-    total_new += poll_rsshub(db, client, engine, rsshub_feeds, concurrency, dedup, &rules).await;
+    total_new += poll_rsshub(db, engine, rsshub_feeds, concurrency, dedup, &rules).await;
 
     // Retention: drop old read articles when a finite window is configured. The
     // DELETE scans the whole table, so throttle it to once per day rather than
@@ -523,16 +523,16 @@ const RSSHUB_ENGINE_CONCURRENCY: usize = 4;
 /// subscriptions refresh on the same cadence as RSS feeds. Returns the
 /// new-article count.
 ///
-/// Gating: a feed refreshes only when its route template is installed *and*
-/// enabled in the `rsshub_routes` registry. A disabled (or uninstalled)
-/// template silently skips its feeds — the marketplace UI's toggle and
+/// Gating: a feed refreshes when at least one installed template it
+/// instantiates is enabled in the `rsshub_routes` registry. A feed whose
+/// matching templates are all disabled — or that matches none (uninstalled
+/// route) — is silently skipped: the marketplace UI's toggle and
 /// uninstall-confirmation are the visible controls; the refresh leg just
 /// goes quiet. A feed's failure (engine will not start, route error) is
 /// recorded as that feed's `fetch_error` — with the coded key where one
 /// exists, so the sidebar tooltip localizes — and does not abort the others.
 async fn poll_rsshub(
     db: &Mutex<Connection>,
-    client: &reqwest::Client,
     engine: Option<&EngineManager>,
     feeds: Vec<db::FeedToRefresh>,
     concurrency: usize,
@@ -578,14 +578,16 @@ async fn poll_rsshub(
                 let _ = db::set_feed_error(&conn, feed_id, "malformed rsshub:// feed URL");
                 continue;
             };
-            let gated_off = templates
-                .iter()
-                .any(|t| rsshub::template_matches(&route, &t.route_path) && !t.enabled);
+            // Gating: the feed refreshes when *any* installed template it
+            // instantiates is enabled. Overlapping templates exist (a route
+            // and a longer sibling can both match one concrete path), and a
+            // disabled sibling must not silence a feed an enabled template
+            // serves; "no matching template at all" (uninstalled route) is
+            // covered by the same condition — quiet skip either way.
             let gated_on = templates
                 .iter()
                 .any(|t| rsshub::template_matches(&route, &t.route_path) && t.enabled);
-            if gated_off || !gated_on {
-                // Disabled template, or no installed template: quiet skip.
+            if !gated_on {
                 continue;
             }
             runnable.push((feed_id, url, etag, last_modified));
@@ -610,6 +612,10 @@ async fn poll_rsshub(
         }
     };
     let base = format!("http://127.0.0.1:{port}");
+    // The engine is loopback-only; requests to it must never go through a
+    // configured proxy (the shared feed client honours the user's `net_proxy`
+    // setting for every URL, which would send 127.0.0.1 out to the proxy).
+    let client = rsshub::engine::loopback_client().clone();
 
     let sem = Arc::new(Semaphore::new(concurrency.min(RSSHUB_ENGINE_CONCURRENCY)));
     let mut set: JoinSet<(i64, String, Outcome)> = JoinSet::new();
