@@ -22,13 +22,13 @@ echo "==> smoke-testing $ARCHIVE"
 WORK="$(mktemp -d /tmp/papr-engine-smoke.XXXXXX)"
 trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
-# Install the archive exactly like the app does: unpack → <root>/<version>
-# layout with engine.json at the root.
-mkdir -p "$WORK/root"
-tar -xzf "$ARCHIVE" -C "$WORK/root"
-cat "$WORK/root/engine.json"
-VERSION="$(python3 -c "import json;print(json.load(open('$WORK/root/engine.json'))['version'])")"
-ENGINE_DIR="$WORK/root/$VERSION"
+# The archive is the *contents* of one version dir (the app's installer
+# stages + renames it into <root>/<version>; that step is covered by the
+# engine unit tests). Unpack it as-is and read its manifest.
+mkdir -p "$WORK/engine"
+tar -xzf "$ARCHIVE" -C "$WORK/engine"
+cat "$WORK/engine/engine.json"
+ENGINE_DIR="$WORK/engine"
 NODE_BIN="$ENGINE_DIR/bin/node"
 ENTRY=""
 for candidate in app/dist/index.js app/dist/index.mjs app/dist/index.cjs; do

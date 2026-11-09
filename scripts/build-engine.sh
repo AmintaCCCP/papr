@@ -153,8 +153,12 @@ cp "$RSSHUB/package.json" "$RSSHUB/pnpm-lock.yaml" "$STAGING/app/" 2>/dev/null \
 # blockExoticSubdeps: false — the lockfile contains one git-hosted dep);
 # without it the filtered prod install refuses to resolve.
 [ -f "$RSSHUB/pnpm-workspace.yaml" ] && cp "$RSSHUB/pnpm-workspace.yaml" "$STAGING/app/"
-mkdir -p "$STAGING/app/$(dirname "$ENTRY")"
-cp -R "$RSSHUB/$(dirname "$ENTRY")" "$STAGING/app/$(dirname "$ENTRY")"
+# patchedDependencies (package.json → pnpm.patchedDependencies) points at
+# patches/<pkg>.patch — the install fails without the patch files.
+[ -d "$RSSHUB/patches" ] && cp -R "$RSSHUB/patches" "$STAGING/app/patches"
+# Copy the built output into staging/app/<entry-dir>. cp into the *parent* —
+# pre-creating the destination dir would nest it (app/dist/dist).
+cp -R "$RSSHUB/$(dirname "$ENTRY")" "$STAGING/app/"
 (
   cd "$STAGING/app"
   # Production install into the staging copy: pulls only runtime deps with
