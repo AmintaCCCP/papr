@@ -53,8 +53,7 @@ async function fetchCatalog() {
 }
 
 /** Route features we keep — the badges/gating the marketplace UI shows. */
-function slimFeatures(raw) {
-  const f = raw?.features ?? {};
+function slimFeatures(raw) {  const f = raw?.features ?? {};
   // requireConfig is `false` or an array of { name, optional, description }.
   // Normalize `true` (never emitted by the docs build, but harmless) to false:
   // only a concrete list is actionable.
@@ -78,13 +77,48 @@ function slimFeatures(raw) {
   };
 }
 
+/**
+ * Normalize one parameter description to a plain string. The docs build
+ * usually emits a string, but some routes describe parameters as rich
+ * objects ({ description, default, options: [{value, label}] }); flatten
+ * those into one readable line for the marketplace's parameter hints.
+ */
+function paramText(v) {
+  if (typeof v === "string") return v;
+  if (v && typeof v === "object") {
+    const parts = [];
+    if (typeof v.description === "string") parts.push(v.description);
+    if (typeof v.default === "string") parts.push(`default: ${v.default}`);
+    if (Array.isArray(v.options) && v.options.length > 0) {
+      const opts = v.options
+        .map((o) => {
+          if (!o || typeof o.value !== "string") return JSON.stringify(o);
+          return typeof o.label === "string" && o.label !== o.value
+            ? `${o.value} (${o.label})`
+            : o.value;
+        })
+        .join(", ");
+      parts.push(`options: ${opts}`);
+    }
+    if (parts.length > 0) return parts.join(" · ");
+    return JSON.stringify(v);
+  }
+  return String(v);
+}
+
 function slimRoute(rawPath, raw) {
   return {
     path: typeof raw.path === "string" ? raw.path : rawPath,
     name: typeof raw.name === "string" ? raw.name : "",
     ...(typeof raw.example === "string" && raw.example ? { example: raw.example } : {}),
     ...(raw.parameters && typeof raw.parameters === "object"
-      ? { parameters: raw.parameters }
+      ? {
+          parameters: Object.fromEntries(
+            Object.entries(raw.parameters)
+              .filter(([k]) => typeof k === "string" && k !== "")
+              .map(([k, v]) => [k, paramText(v)]),
+          ),
+        }
       : {}),
     ...(typeof raw.description === "string" ? { description: raw.description } : {}),
     features: slimFeatures(raw),

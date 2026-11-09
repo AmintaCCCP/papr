@@ -44,7 +44,7 @@ impl AppError {
     }
 
     /// Stable error code consumed by the frontend i18n layer.
-    fn code_str(&self) -> &str {
+    pub fn code_str(&self) -> &str {
         match self {
             AppError::Db(_) => "db",
             AppError::Migration(_) => "migration",
