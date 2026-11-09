@@ -1156,8 +1156,8 @@ function RsshubEngineGroup() {
           <input
             value={sha}
             onChange={(e) => setSha(e.target.value)}
-            placeholder="sha256 (optional)"
-            aria-label="sha256"
+            placeholder={t("settings.rsshub.engineShaPlaceholder")}
+            aria-label={t("settings.rsshub.engineShaPlaceholder")}
             {...NO_AUTOCORRECT}
             style={{
               width: 150,

@@ -685,7 +685,7 @@ function EnvEditorModal({
           <div key={i} className="rsshub-env-row">
             <input
               value={row.key}
-              placeholder="NAME"
+              placeholder={t("settings.rsshub.envName")}
               aria-label={t("settings.rsshub.envName")}
               onChange={(e) =>
                 setRows((rs) =>

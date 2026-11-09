@@ -574,7 +574,8 @@
       "engineReinstall": "重新安装",
       "engineUninstall": "卸载引擎",
       "engineUrlLabel": "从 URL 安装",
-      "engineUrlDesc": "从 URL 下载引擎包；可选填 sha256，安装前会校验。"
+      "engineUrlDesc": "从 URL 下载引擎包；可选填 sha256，安装前会校验。",
+      "engineShaPlaceholder": "sha256（可选）"
     },
     "shortcuts": {
       "navigation": "导航",
@@ -802,7 +803,7 @@
     "rsshubRouteFetch": "无法从本地引擎获取该路由——路由可能暂时不可用、被限流，或目标站点拒绝了请求。",
     "rsshubRouteInvalid": "该 rsshub:// 链接缺少路由路径。",
     "rsshubRouteUnknown": "该路由不在内置目录中。",
-    "rsshubEnvInvalid": "环境变量名不能为空。",
+    "rsshubEnvInvalid": "环境变量名只能包含字母、数字和下划线，且以字母或下划线开头。",
     "rsshubEngineArchiveInvalid": "该文件不是有效的引擎包（.tar.gz / .zip）。",
     "rsshubEngineChecksum": "下载的引擎包未通过 sha256 校验。"
   },

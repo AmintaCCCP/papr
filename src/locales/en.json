@@ -574,7 +574,8 @@
       "engineReinstall": "Reinstall",
       "engineUninstall": "Uninstall the engine",
       "engineUrlLabel": "Install from URL",
-      "engineUrlDesc": "Download an engine archive from a URL; the optional sha256 is verified before installing."
+      "engineUrlDesc": "Download an engine archive from a URL; the optional sha256 is verified before installing.",
+      "engineShaPlaceholder": "sha256 (optional)"
     },
     "shortcuts": {
       "navigation": "Navigation",
@@ -802,7 +803,7 @@
     "rsshubRouteFetch": "The route could not be fetched from the local engine — it may be unavailable, rate-limited, or the site refused the request.",
     "rsshubRouteInvalid": "That rsshub:// link has no route path.",
     "rsshubRouteUnknown": "That route is not in the bundled catalog.",
-    "rsshubEnvInvalid": "Environment variable names can't be empty.",
+    "rsshubEnvInvalid": "Environment variable names may only contain letters, digits and underscores (starting with a letter or underscore).",
     "rsshubEngineArchiveInvalid": "That file is not a valid engine archive (.tar.gz / .zip).",
     "rsshubEngineChecksum": "The downloaded engine archive failed the sha256 check."
   },

@@ -574,7 +574,8 @@
       "engineReinstall": "再インストール",
       "engineUninstall": "エンジンをアンインストール",
       "engineUrlLabel": "URL からインストール",
-      "engineUrlDesc": "URL からエンジンアーカイブをダウンロードします。任意の sha256 はインストール前に検証されます。"
+      "engineUrlDesc": "URL からエンジンアーカイブをダウンロードします。任意の sha256 はインストール前に検証されます。",
+      "engineShaPlaceholder": "sha256（任意）"
     },
     "shortcuts": {
       "navigation": "ナビゲーション",
@@ -802,7 +803,7 @@
     "rsshubRouteFetch": "ローカルエンジンからルートを取得できませんでした — ルートが一時的に利用できない、レート制限中、または対象サイトに拒否された可能性があります。",
     "rsshubRouteInvalid": "この rsshub:// リンクにはルートパスがありません。",
     "rsshubRouteUnknown": "そのルートは同梱カタログにありません。",
-    "rsshubEnvInvalid": "環境変数名を空にすることはできません。",
+    "rsshubEnvInvalid": "環境変数名には英字・数字・アンダースコアのみ使用できます（先頭は英字またはアンダースコア）。",
     "rsshubEngineArchiveInvalid": "そのファイルは有効なエンジンアーカイブ（.tar.gz / .zip）ではありません。",
     "rsshubEngineChecksum": "ダウンロードしたエンジンアーカイブが sha256 チェックに失敗しました。"
   },
