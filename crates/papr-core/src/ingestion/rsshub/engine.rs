@@ -20,13 +20,15 @@
 //! port with a minimal environment whitelist plus the route environment
 //! variables the user configured in the marketplace, waits for the HTTP
 //! server to answer (60 s budget), and an idle watchdog tears the process
-//! down after 10 idle minutes. Nothing ever binds beyond 127.0.0.1.
+//! down after 10 idle minutes. Nothing ever binds beyond 127.0.0.1: the
+//! spawn pins `LISTEN_INADDR_ANY=0` *after* the user's variables (RSSHub's
+//! own default is to bind every interface).
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -61,6 +63,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// bundle is a few hundred MB compressed; 1 GiB leaves generous headroom while
 /// still refusing a runaway download).
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Hard cap on the *extracted* tree. A real install is ~1.1 GB (measured:
+/// RSSHub node_modules ≈ 900 MB + Node); the cap mainly refuses a crafted
+/// zip/tar bomb whose compressed form fits under [`MAX_ARCHIVE_BYTES`].
+const MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Environment variables the engine process may inherit. Everything else is
 /// stripped: the child runs arbitrary scraping code with credentials the user
@@ -149,6 +155,12 @@ struct Running {
 pub struct EngineManager {
     root: PathBuf,
     running: std::sync::Arc<Mutex<Option<Running>>>,
+    /// Serializes cold starts. The `running` slot must not be held across the
+    /// up-to-a-minute start budget (the `engine_status` command polls it), so
+    /// this separate lock stops concurrent `ensure()` callers — the refresh
+    /// leg's tasks and the `rsshub_test_route` command — from each spawning a
+    /// full Node process.
+    spawn_lock: std::sync::Arc<Mutex<()>>,
 }
 
 impl EngineManager {
@@ -158,6 +170,7 @@ impl EngineManager {
         Self {
             root,
             running: std::sync::Arc::new(Mutex::new(None)),
+            spawn_lock: std::sync::Arc::new(Mutex::new(())),
         }
     }
 
@@ -241,25 +254,41 @@ impl EngineManager {
     /// enabled marketplace routes (see `db::rsshub_enabled_env`); it is applied
     /// on top of the allowlisted host environment at spawn time.
     pub async fn ensure(&self, user_env: &BTreeMap<String, String>) -> AppResult<u16> {
-        // Fast path: something is running, alive and answering — touch and go.
-        {
-            let mut guard = self.running.lock().await;
-            if let Some(r) = guard.as_mut() {
-                let alive = r.child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-                if alive && wait_healthy(r.port, PING_BUDGET).await {
-                    r.last_used = Instant::now();
-                    return Ok(r.port);
-                }
-                // Dead or wedged — tear down and restart below.
-                log::info!("rsshub engine not healthy; restarting");
-                let dead = guard.take();
-                if let Some(mut r) = dead {
-                    r.watcher.abort();
-                    let _ = r.child.kill().await;
-                }
-            }
+        if let Some(port) = self.try_running().await {
+            return Ok(port);
+        }
+        // Serialize cold starts: concurrent callers (the refresh leg's tasks
+        // racing the `rsshub_test_route` command) queue here instead of each
+        // spawning a several-hundred-MB Node process. Whoever wakes second
+        // re-checks the fast path and reuses the winner's engine.
+        let _spawn = self.spawn_lock.lock().await;
+        if let Some(port) = self.try_running().await {
+            return Ok(port);
         }
         self.cold_start(user_env, START_BUDGET).await
+    }
+
+    /// The fast half of [`ensure`](Self::ensure): when a healthy engine is
+    /// already running, touch its idle timer and return its port. A dead,
+    /// exited or wedged (alive but not answering) engine is torn down and
+    /// `None` returned so a cold start can proceed with a clean slot.
+    async fn try_running(&self) -> Option<u16> {
+        let mut guard = self.running.lock().await;
+        let r = guard.as_mut()?;
+        let alive = r.child.try_wait().map(|s| s.is_none()).unwrap_or(false);
+        if alive && wait_healthy(r.port, PING_BUDGET).await {
+            r.last_used = Instant::now();
+            return Some(r.port);
+        }
+        log::info!("rsshub engine not healthy; restarting");
+        let dead = guard.take();
+        if let Some(mut r) = dead {
+            r.watcher.abort();
+            let _ = r.child.kill().await;
+            // Reap so the killed process cannot linger as a zombie.
+            let _ = r.child.wait().await;
+        }
+        None
     }
 
     /// The slow path behind [`ensure`](Self::ensure): validate the install,
@@ -303,11 +332,6 @@ impl EngineManager {
         cmd.current_dir(&dir)
             .arg(entry)
             .env_clear()
-            .env("PORT", port.to_string())
-            .env("NODE_ENV", "production")
-            // RSSHub's own production start command raises the HTTP header
-            // size limit (some upstream responses carry long headers).
-            .env("NODE_OPTIONS", "--max-http-header-size=32768")
             .stdout(std::process::Stdio::from(log_out))
             .stderr(std::process::Stdio::from(log_err))
             .kill_on_drop(true);
@@ -317,10 +341,22 @@ impl EngineManager {
                 cmd.env(key, value);
             }
         }
-        // …then the user's route variables, which win on collision.
+        // …then the user's route variables, which win on collision with the
+        // host environment…
         for (k, v) in user_env {
             cmd.env(k, v);
         }
+        // …and finally the manager's own variables, which the user's route
+        // variables must NOT override: `PORT` must match the port the health
+        // check probes, and `LISTEN_INADDR_ANY=0` is what keeps RSSHub bound
+        // to 127.0.0.1 — its default (bind any) would expose the engine, user
+        // cookies included, to the whole network. (RSSHub's `toBoolean` reads
+        // "0" as false; `lib/index.ts` then binds `127.0.0.1`.) The header
+        // size matches RSSHub's own production start command.
+        cmd.env("PORT", port.to_string())
+            .env("NODE_ENV", "production")
+            .env("LISTEN_INADDR_ANY", "0")
+            .env("NODE_OPTIONS", "--max-http-header-size=32768");
 
         log::info!(
             "rsshub engine: starting {} on 127.0.0.1:{port}",
@@ -388,6 +424,9 @@ impl EngineManager {
     /// Remove the installed engine (and any staging remnants). Stops a
     /// running engine first.
     pub async fn uninstall(&self) -> AppResult<()> {
+        // Serialize against a cold start: it may be mid-health-wait about to
+        // register a child under the root this call is about to wipe.
+        let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
@@ -422,6 +461,11 @@ impl EngineManager {
     /// Blocking filesystem work runs on the blocking pool; a running engine is
     /// stopped first because its version directory is replaced.
     pub async fn install_from_archive(&self, archive: &Path) -> AppResult<EngineInfo> {
+        // Serialize against a cold start: a spawn that is mid-health-wait
+        // would otherwise register a child running from the version directory
+        // this install is about to replace (a sharing violation on Windows,
+        // a zombie engine on Unix).
+        let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
         let root = self.root.clone();
         let archive = archive.to_path_buf();
@@ -478,30 +522,46 @@ impl EngineManager {
     }
 }
 
+/// A client for requests to the engine's loopback port (route fetches, health
+/// probes). It deliberately bypasses every configured proxy: a loopback
+/// address is never reachable *through* a proxy, and a user with `HTTP_PROXY`
+/// — or an in-app `net_proxy` setting, which `fetch::build_client` applies to
+/// every URL — would otherwise have engine requests leave the machine or fail
+/// against the proxy's own error page. The timeout is generous because a
+/// route scrape fetches the upstream site inside the request.
+pub fn loopback_client() -> &'static reqwest::Client {
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(ENGINE_REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build engine loopback client")
+    });
+    &CLIENT
+}
+
+/// Per-request budget for a route fetch through the engine. The request
+/// includes the route's own upstream scrape (possibly a slow site), so this
+/// is deliberately wider than the feed client's default.
+const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Poll the engine's health endpoint until it answers or the budget runs out.
 ///
 /// Any HTTP response counts — even a 404 — because the question is "is an
 /// HTTP server listening on that port", not "does this exact route exist".
-///
-/// The probes deliberately bypass any configured proxy (a dedicated no-proxy
-/// client): a loopback address is never reachable *through* a proxy, and a
-/// user with `HTTP_PROXY` set would otherwise have every health check fail
-/// or — worse — "succeed" against the proxy's own error page.
 pub(crate) async fn wait_healthy(port: u16, budget: Duration) -> bool {
-    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .no_proxy()
-            .timeout(PROBE_TIMEOUT)
-            .build()
-            .expect("failed to build health-check client")
-    });
+    let client = loopback_client();
     let url = format!("http://127.0.0.1:{port}/healthz");
     let deadline = Instant::now() + budget;
     loop {
         if Instant::now() >= deadline {
             return false;
         }
-        if let Ok(_resp) = CLIENT.get(&url).send().await {
+        // A short per-request timeout: a probe answers "is a server there",
+        // and a wedged process must not hold the probe for the route-fetch
+        // budget the client defaults to.
+        if let Ok(_resp) = client.get(&url).timeout(PROBE_TIMEOUT).send().await {
             return true;
         }
         tokio::time::sleep(PROBE_INTERVAL).await;
@@ -558,7 +618,12 @@ fn validate_staging(staging: &Path) -> AppResult<EngineInfo> {
     } else {
         staging.join("bin").join("node")
     };
-    if !node.is_file() || EngineManager::entry_script(staging).is_none() {
+    // The two executed files must be *regular* files, not symlinks: a link
+    // would be followed at spawn/parse time, letting a crafted archive run a
+    // host binary instead of the bundled runtime. (`is_file` follows links.)
+    let is_regular = |p: &Path| p.symlink_metadata().map(|m| m.is_file()).unwrap_or(false);
+    let entry = EngineManager::entry_script(staging);
+    if !is_regular(&node) || !entry.as_ref().is_some_and(|p| is_regular(p)) {
         return Err(AppError::code(CODE_ARCHIVE_INVALID));
     }
     Ok(info)
@@ -641,12 +706,57 @@ fn stays_within(dest: &Path, candidate: &Path) -> bool {
     candidate.starts_with(dest)
 }
 
+/// `true` when a link entry's *target*, resolved lexically against the
+/// directory holding the link, stays inside `dest`.
+///
+/// The engine archive legitimately contains symlinks (pnpm's `node_modules`
+/// layout is built from relative links), so links cannot simply be refused —
+/// but a link whose target escapes the staging tree would let a crafted
+/// archive point `bin/node` or `app/dist/index.js` at any host executable,
+/// which the manager then runs. Absolute targets and `..`-escapes are
+/// rejected; relative targets that resolve inside the tree pass.
+fn link_stays_within(dest: &Path, link_dir: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+    let mut resolved = link_dir.to_path_buf();
+    for part in target.components() {
+        match part {
+            std::path::Component::Normal(p) => resolved.push(p),
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            // A relative link target cannot contain RootDir/Prefix, but if a
+            // crafted one does, refuse it outright.
+            _ => return false,
+        }
+    }
+    stays_within(dest, &resolved)
+}
+
+/// Running total of extracted bytes, shared by both extractors. Refuses a
+/// compressed bomb whose declared sizes blow past [`MAX_EXTRACTED_BYTES`].
+#[derive(Default)]
+struct ExtractBudget(u64);
+
+impl ExtractBudget {
+    /// Charge `n` bytes; `false` when the cap is exceeded.
+    fn charge(&mut self, n: u64) -> bool {
+        self.0 = self.0.saturating_add(n);
+        self.0 <= MAX_EXTRACTED_BYTES
+    }
+}
+
 fn extract_tar_gz(archive: &Path, dest: &Path) -> AppResult<()> {
     let file = std::fs::File::open(archive)
         .map_err(|e| AppError::other(format!("rsshub engine: open archive: {e}")))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut tar = tar::Archive::new(gz);
     tar.set_preserve_permissions(true);
+    let mut budget = ExtractBudget::default();
     for entry in tar
         .entries()
         .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?
@@ -662,6 +772,37 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> AppResult<()> {
             log::warn!("rsshub engine: skipping archive entry outside root: {path:?}");
             continue;
         }
+        // Link entries need their target validated too — `unpack` would
+        // happily create a symlink pointing anywhere on the host, and a link
+        // on `bin/node` or the entry script would redirect execution. Real
+        // archives only ever carry in-tree relative links, so an escaping
+        // link fails the install instead of being silently skipped.
+        let header_type = entry.header().entry_type();
+        if header_type.is_symlink() || header_type.is_hard_link() {
+            let link_target = entry
+                .link_name()
+                .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?
+                .ok_or_else(|| AppError::code(CODE_ARCHIVE_INVALID))?;
+            let link_dir = target.parent().unwrap_or(dest).to_path_buf();
+            if !link_stays_within(dest, &link_dir, &link_target) {
+                log::warn!(
+                    "rsshub engine: refusing link entry escaping the root: {path:?} -> {link_target:?}"
+                );
+                return Err(AppError::code(CODE_ARCHIVE_INVALID));
+            }
+            entry
+                .unpack(&target)
+                .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
+            continue;
+        }
+        let entry_size = entry
+            .header()
+            .size()
+            .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?;
+        if !budget.charge(entry_size) {
+            log::warn!("rsshub engine: archive expands past the extraction cap");
+            return Err(AppError::code(CODE_ARCHIVE_INVALID));
+        }
         entry
             .unpack(&target)
             .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
@@ -674,6 +815,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> AppResult<()> {
         .map_err(|e| AppError::other(format!("rsshub engine: open archive: {e}")))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?;
+    let mut budget = ExtractBudget::default();
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
@@ -690,14 +832,29 @@ fn extract_zip(archive: &Path, dest: &Path) -> AppResult<()> {
             std::fs::create_dir_all(&target)
                 .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
         } else {
+            // The zip crate reports the *declared* uncompressed size up front;
+            // counting actual copied bytes guards against a lying header.
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
             }
             let mut out = std::fs::File::create(&target)
                 .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-            std::io::copy(&mut entry, &mut out)
-                .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let n = entry
+                    .read(&mut chunk)
+                    .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                if !budget.charge(n as u64) {
+                    log::warn!("rsshub engine: archive expands past the extraction cap");
+                    return Err(AppError::code(CODE_ARCHIVE_INVALID));
+                }
+                out.write_all(&chunk[..n])
+                    .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
+            }
         }
     }
     Ok(())
@@ -993,6 +1150,112 @@ mod tests {
             EngineManager::version_dir(&ok, root).unwrap(),
             root.join("1.2.3-beta_1")
         );
+    }
+
+    /// A tar.gz containing one symlink entry. `target` is the link's target.
+    fn tar_with_symlink(root: &Path, link: &str, target: &str) -> PathBuf {
+        let build = root.join("build-link");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin").join("node"), "binary").unwrap();
+        let app = build.join("app").join("dist");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("index.js"), "// entry\n").unwrap();
+        let info = EngineInfo {
+            version: "1".into(),
+            rsshub_revision: "rev".into(),
+            node_version: "v22".into(),
+            installed_at: "x".into(),
+        };
+        std::fs::write(
+            build.join("engine.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+
+        let archive = root.join(format!("link-{}.tar.gz", link.replace('/', "_")));
+        let f = std::fs::File::create(&archive).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        tar.append_dir_all(".", &build).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        header.set_path(Path::new(link)).unwrap();
+        header.set_link_name(Path::new(target)).unwrap();
+        header.set_cksum();
+        tar.append(&header, std::io::empty()).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        archive
+    }
+
+    #[tokio::test]
+    async fn install_rejects_symlink_escaping_the_staging_tree() {
+        let root = temp_root("symlink-escape");
+        let archive = tar_with_symlink(&root, "bin/node-evil", "/etc/passwd");
+        let mgr = EngineManager::new(root.join("install"));
+        let err = mgr.install_from_archive(&archive).await.unwrap_err();
+        assert_eq!(err.code_str(), CODE_ARCHIVE_INVALID);
+        // The failing install leaves no half-extracted version dir, so the
+        // absolute-target symlink is never live on disk.
+        assert!(!root.join("install").join("1").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_rejects_dotdot_symlink_targets() {
+        let root = temp_root("symlink-dotdot");
+        let archive = tar_with_symlink(&root, "app/dist/escape.js", "../../../outside.js");
+        let mgr = EngineManager::new(root.join("install"));
+        let err = mgr.install_from_archive(&archive).await.unwrap_err();
+        assert_eq!(err.code_str(), CODE_ARCHIVE_INVALID);
+        // The failing install leaves no half-extracted version dir.
+        assert!(!root.join("install").join("1").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_keeps_relative_symlinks_inside_the_tree() {
+        // Real pnpm archives are full of relative links — they must survive.
+        let root = temp_root("symlink-ok");
+        let archive = tar_with_symlink(&root, "app/dist/linked.js", "index.js");
+        let mgr = EngineManager::new(root.join("install"));
+        mgr.install_from_archive(&archive).await.unwrap();
+        assert!(root
+            .join("install")
+            .join("1")
+            .join("app")
+            .join("dist")
+            .join("linked.js")
+            .symlink_metadata()
+            .is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn link_guard_decides_lexically() {
+        let dest = Path::new("/tmp/eng");
+        let inside = dest.join("bin");
+        assert!(link_stays_within(dest, &inside, Path::new("node")));
+        assert!(link_stays_within(
+            dest,
+            &inside,
+            Path::new("../app/dist/index.js")
+        ));
+        assert!(!link_stays_within(
+            dest,
+            &inside,
+            Path::new("../../../etc/passwd")
+        ));
+        // An absolute target is always refused — on every platform.
+        assert!(!link_stays_within(dest, &inside, Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn extract_budget_refuses_overruns() {
+        let mut b = ExtractBudget::default();
+        assert!(b.charge(MAX_EXTRACTED_BYTES));
+        assert!(!b.charge(1));
     }
 
     /// A minimal HTTP server on a random loopback port that answers 200 with
