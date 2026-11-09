@@ -44,13 +44,20 @@ jobs:
           version: 12
 
       # The build caches (RSSHub clone, pnpm store, Node distribution) live
-      # under target/engine-cache keyed by a rolling week — cheap rebuilds,
-      # no unbounded growth.
+      # under target/engine-cache keyed by a rolling ISO week — cheap
+      # rebuilds, no unbounded growth. The exact key only matches within one
+      # week, so the cache is saved once per week per platform instead of on
+      # every run; the restore-keys prefix still picks up the previous week's
+      # cache for a fresh build.
+      - name: Compute cache key (ISO week)
+        shell: bash
+        run: echo "ENGINE_WEEK=$(date +%G-W%V)" >> "$GITHUB_ENV"
+
       - name: Restore engine build cache
         uses: actions/cache@v4
         with:
           path: target/engine-cache
-          key: engine-cache-${{ matrix.platform }}-${{ github.run_id }}
+          key: engine-cache-${{ matrix.platform }}-${{ env.ENGINE_WEEK }}
           restore-keys: engine-cache-${{ matrix.platform }}-
 
       - name: Build engine

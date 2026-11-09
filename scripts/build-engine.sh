@@ -124,7 +124,12 @@ if [ ! -d "$NODE_DIST" ]; then
     echo "==> nodejs.org unreachable, falling back to npmmirror"
     curl -fsSL "$MIRROR_URL" -o "$NODE_DIST.dl/archive"
   fi
-  tar -xzf "$NODE_DIST.dl/archive" -C "$NODE_DIST.dl"
+  # The Windows distribution is a zip — Git Bash's GNU tar cannot read it.
+  if [ "$os" = "win" ]; then
+    unzip -q "$NODE_DIST.dl/archive" -d "$NODE_DIST.dl"
+  else
+    tar -xzf "$NODE_DIST.dl/archive" -C "$NODE_DIST.dl"
+  fi
   mv "$NODE_DIST.dl/node-$NODE_VERSION-$PLATFORM" "$NODE_DIST"
   rm -rf "$NODE_DIST.dl"
 fi
@@ -190,10 +195,20 @@ cat > "$STAGING/engine.json" <<JSON
 JSON
 
 # ── archive ───────────────────────────────────────────────────────────────
+# sha256 with a portable fallback: `sha256sum` ships with GNU/MSYS coreutils,
+# macOS only carries `shasum`.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 ARCHIVE="$OUT/rsshub-engine-$PLATFORM-$NODE_VERSION-${RSSHUB_REV:0:12}.tar.gz"
 echo "==> packing $ARCHIVE"
 tar -czf "$ARCHIVE" -C "$STAGING" .
-SHASUM="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+SHASUM="$(sha256_of "$ARCHIVE")"
 printf '%s  %s\n' "$SHASUM" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
 rm -rf "$STAGING"
 
