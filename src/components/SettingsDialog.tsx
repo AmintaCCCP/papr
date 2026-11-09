@@ -56,6 +56,9 @@ interface Props {
   onToast: (msg: string) => void;
   initialSection?: string;
   onAddFeed: () => void;
+  /** Open the RSSHub route marketplace (owned by App, alongside the other
+   *  top-level dialogs). */
+  onOpenMarketplace: () => void;
 }
 
 // `labelKey` holds an i18n key — resolved with t() at render time. Nav icons
@@ -101,6 +104,7 @@ export default function SettingsDialog({
   onToast,
   initialSection,
   onAddFeed,
+  onOpenMarketplace,
 }: Props) {
   const { t } = useTranslation();
   const [section, setSection] = useState(initialSection ?? "general");
@@ -200,7 +204,9 @@ export default function SettingsDialog({
             )}
             {section === "sync" && <SyncSection onToast={onToast} />}
             {section === "integrations" && <IntegrationsSection />}
-            {section === "parsers" && <ParsersSection />}
+            {section === "parsers" && (
+              <ParsersSection onOpenMarketplace={onOpenMarketplace} />
+            )}
             {section === "shortcuts" && <ShortcutsSection />}
             {section === "notifications" && <NotificationsSection />}
             {section === "advanced" && <AdvancedSection onToast={onToast} />}
@@ -954,7 +960,7 @@ function SubscriptionsSection({
           </button>
         </div>
       </div>
-      <RsshubInstanceGroup />
+      <RsshubEngineGroup />
       <div className="settings-group">
         <h3 className="settings-group-title">
           {t("settings.subscriptions.feedsCount", { count: filtered.length })}
@@ -1018,53 +1024,161 @@ function SubscriptionsSection({
 }
 
 /**
- * RSSHub instance for expanding `rsshub://route` short links. Blank uses the
- * public rsshub.app; self-hosters point it at their own instance. Persisted to
- * the `rsshub_instance` setting that `add_feed` reads server-side.
+ * The local RSSHub engine (route marketplace): installs the bundled
+ * Node + RSSHub runtime into the app data dir and executes `rsshub://`
+ * subscriptions on this machine. No hosted instance is ever contacted.
  */
-function RsshubInstanceGroup() {
+function RsshubEngineGroup() {
   const { t } = useTranslation();
-  const [value, setValue] = useState("");
+  const qc = useQueryClient();
+  const status = useQuery({
+    queryKey: ["rsshub-engine"],
+    queryFn: api.engineStatus,
+  });
+  const [url, setUrl] = useState("");
+  const [sha, setSha] = useState("");
+  const [busy, setBusy] = useState(false);
+  const info = status.data?.info ?? null;
+  const installed = status.data?.installed ?? false;
 
-  useEffect(() => {
-    api
-      .getSetting("rsshub_instance")
-      .then((v) => setValue(v ?? ""))
-      .catch(() => {});
-  }, []);
+  const refresh = () =>
+    qc.invalidateQueries({ queryKey: ["rsshub-engine"] });
 
-  const commit = () => {
-    api.setSetting("rsshub_instance", value.trim()).catch(() => {});
+  const installDialog = async () => {
+    setBusy(true);
+    try {
+      const res = await api.engineInstallFromDialog();
+      if (res) refresh();
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const installFromUrl = async () => {
+    if (!url.trim() || busy) return;
+    setBusy(true);
+    try {
+      await api.engineInstallFromUrl(url.trim(), sha.trim() || undefined);
+      setUrl("");
+      setSha("");
+      refresh();
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uninstall = async () => {
+    setBusy(true);
+    try {
+      await api.engineUninstall();
+      refresh();
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div className="settings-group" style={{ marginBottom: 18 }}>
-      <h3 className="settings-group-title">{t("settings.subscriptions.rsshubTitle")}</h3>
+      <h3 className="settings-group-title">{t("settings.rsshub.engineTitle")}</h3>
+      <p className="settings-group-desc">{t("settings.rsshub.engineDesc")}</p>
       <Row
-        label={t("settings.subscriptions.rsshubInstance")}
-        desc={t("settings.subscriptions.rsshubInstanceDesc")}
+        label={
+          installed
+            ? t("settings.rsshub.engineVersion", {
+                version: info?.version ?? "",
+                revision: info?.rsshubRevision?.slice(0, 7) ?? "",
+                node: info?.nodeVersion ?? "",
+              })
+            : t("settings.rsshub.engineNotInstalled")
+        }
+        desc={
+          installed
+            ? t(
+                status.data?.running
+                  ? "settings.rsshub.engineRunning"
+                  : "settings.rsshub.engineIdle",
+              )
+            : t("settings.rsshub.engineNotInstalledDesc")
+        }
       >
-        <input
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") e.currentTarget.blur();
-          }}
-          placeholder="https://rsshub.app"
-          {...NO_AUTOCORRECT}
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button className="s-btn" disabled={busy} onClick={installDialog}>
+            <Icon name="arrow-down" size={12} />
+            {t(installed ? "settings.rsshub.engineReinstall" : "settings.rsshub.engineInstall")}
+          </button>
+          {installed && (
+            <button
+              className="icon-btn"
+              title={t("settings.rsshub.engineUninstall")}
+              disabled={busy}
+              onClick={uninstall}
+            >
+              <Icon name="trash" size={13} />
+            </button>
+          )}
+        </div>
+      </Row>
+      <Row
+        label={t("settings.rsshub.engineUrlLabel")}
+        desc={t("settings.rsshub.engineUrlDesc")}
+      >
+        <div
           style={{
-            width: 220,
-            padding: "5px 9px",
-            borderRadius: 7,
-            border: "1px solid var(--hair-strong)",
-            background: "var(--panel)",
-            fontFamily: "inherit",
-            fontSize: 12.5,
-            color: "var(--ink)",
-            outline: 0,
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            flexWrap: "wrap",
           }}
-        />
+        >
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://…/rsshub-engine-darwin-arm64.tar.gz"
+            {...NO_AUTOCORRECT}
+            style={{
+              width: 240,
+              padding: "5px 9px",
+              borderRadius: 7,
+              border: "1px solid var(--hair-strong)",
+              background: "var(--panel)",
+              fontFamily: "inherit",
+              fontSize: 12.5,
+              color: "var(--ink)",
+              outline: 0,
+            }}
+          />
+          <input
+            value={sha}
+            onChange={(e) => setSha(e.target.value)}
+            placeholder="sha256 (optional)"
+            aria-label="sha256"
+            {...NO_AUTOCORRECT}
+            style={{
+              width: 150,
+              padding: "5px 9px",
+              borderRadius: 7,
+              border: "1px solid var(--hair-strong)",
+              background: "var(--panel)",
+              fontFamily: "inherit",
+              fontSize: 12.5,
+              color: "var(--ink)",
+              outline: 0,
+            }}
+          />
+          <button
+            className="s-btn"
+            disabled={busy || !url.trim()}
+            onClick={installFromUrl}
+          >
+            {t("settings.rsshub.engineInstall")}
+          </button>
+        </div>
       </Row>
     </div>
   );
@@ -1579,7 +1693,7 @@ function IntegTextField({
 // persists as one JSON blob under the `parsers` setting, read back by the
 // Rust ingestion side — the same shape/trade-off as the `integrations` blob.
 
-function ParsersSection() {
+function ParsersSection({ onOpenMarketplace }: { onOpenMarketplace: () => void }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const settingsQ = useQuery({
@@ -1591,6 +1705,18 @@ function ParsersSection() {
     [settingsQ.data],
   );
   const [configuring, setConfiguring] = useState<ParserKey | null>(null);
+  // Marketplace entry: installed route count + engine presence, so the card
+  // can warn before the user goes hunting for routes they cannot run yet.
+  const routes = useQuery({
+    queryKey: ["rsshub-routes"],
+    queryFn: api.rsshubRoutesInstalled,
+  });
+  const engine = useQuery({
+    queryKey: ["rsshub-engine"],
+    queryFn: api.engineStatus,
+  });
+  const routeCount = routes.data?.length ?? 0;
+  const engineReady = engine.data?.installed ?? false;
 
   /** Persist a new blob. The query cache is patched optimistically first, so
    *  edits that land before the refetch compose instead of clobbering. */
@@ -1621,6 +1747,39 @@ function ParsersSection() {
             onConfigure={() => setConfiguring(key)}
           />
         ))}
+        <div className="integ-card">
+          <div className="s-service">
+            <div className="logo" style={{ background: "#F1471D" }}>
+              <span
+                style={{
+                  color: "#fff",
+                  fontWeight: 700,
+                  fontSize: 15,
+                  lineHeight: 1,
+                }}
+                aria-hidden="true"
+              >
+                R
+              </span>
+            </div>
+            <div className="info">
+              <div className="title">{t("settings.rsshub.entryTitle")}</div>
+              <div className="desc">{t("settings.rsshub.entryDesc")}</div>
+            </div>
+            <span className={`status ${engineReady ? "on" : ""}`}>
+              {engineReady
+                ? t("settings.rsshub.entryCount", { count: routeCount })
+                : t("settings.rsshub.entryEngineMissing")}
+            </span>
+            <button
+              className="s-btn"
+              onClick={onOpenMarketplace}
+              aria-label={t("settings.rsshub.entryOpen")}
+            >
+              {t("settings.rsshub.entryOpen")}
+            </button>
+          </div>
+        </div>
       </div>
       {configuring && (
         <ParserSettingsModal

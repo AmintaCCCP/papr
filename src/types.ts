@@ -9,7 +9,70 @@ export type SourceType =
   | "reddit"
   | "newsletter"
   /** An X (Twitter) user timeline served by the built-in X parser. */
-  | "x";
+  | "x"
+  /** An RSSHub route executed by the bundled local engine. */
+  | "rsshub";
+
+/** ── RSSHub route marketplace (mirrors rsshub::catalog + db) ──────────
+ *  The wire shape of the bundled catalog snapshot: one entry per namespace,
+ *  routes keyed by their canonical full path (`/bilibili/user/video/:id`). */
+export interface RsshubConfigItem {
+  name: string;
+  optional: boolean;
+  description?: string | null;
+}
+/** `false` (nothing required) or the list of required env vars. */
+export type RsshubRequireConfig = false | RsshubConfigItem[];
+export interface RsshubRouteFeatures {
+  requireConfig: RsshubRequireConfig;
+  requirePuppeteer: boolean;
+  antiCrawler: boolean;
+  supportBT: boolean;
+  supportPodcast: boolean;
+  supportScihub: boolean;
+}
+export interface RsshubRoute {
+  path: string;
+  name: string;
+  example?: string | null;
+  parameters?: Record<string, string> | null;
+  description?: string | null;
+  features: RsshubRouteFeatures;
+}
+export interface RsshubNamespace {
+  name: string;
+  url?: string | null;
+  description?: string | null;
+  categories: string[];
+  heat: number;
+  routes: Record<string, RsshubRoute>;
+}
+export interface RsshubCatalog {
+  generatedAt: string;
+  namespaces: Record<string, RsshubNamespace>;
+}
+/** One installed route (mirrors db::RsshubRouteRow). `routePath` is the
+ *  template; subscriptions instantiate it with concrete values. */
+export interface RsshubRouteRow {
+  routePath: string;
+  enabled: boolean;
+  /** JSON object of string environment variables. */
+  envJson: string;
+  installedAt: string;
+}
+/** What engine_status reports (mirrors rsshub::engine::EngineStatus). */
+export interface RsshubEngineInfo {
+  version: string;
+  rsshubRevision: string;
+  nodeVersion: string;
+  installedAt: string;
+}
+export interface RsshubEngineStatus {
+  installed: boolean;
+  running: boolean;
+  port: number | null;
+  info: RsshubEngineInfo | null;
+}
 
 /** A configured email-newsletter source (mirrors commands::NewsletterSource). */
 export interface NewsletterSource {
