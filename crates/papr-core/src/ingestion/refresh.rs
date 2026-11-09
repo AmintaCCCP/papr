@@ -181,7 +181,15 @@ pub async fn refresh_core(
             db::setting_parsed::<i64>(&conn, "net_concurrency", 6).clamp(1, 16) as usize;
         let dedup = db::setting_flag(&conn, "dedup_enabled", false);
         let rules = db::active_rules(&conn).unwrap_or_default();
-        (feeds, newsletters, parser_feeds, rsshub_feeds, concurrency, dedup, rules)
+        (
+            feeds,
+            newsletters,
+            parser_feeds,
+            rsshub_feeds,
+            concurrency,
+            dedup,
+            rules,
+        )
     };
 
     // Nothing due this cycle: emit a no-op Started/Finished and bow out before
@@ -570,12 +578,12 @@ async fn poll_rsshub(
                 let _ = db::set_feed_error(&conn, feed_id, "malformed rsshub:// feed URL");
                 continue;
             };
-            let gated_off = templates.iter().any(|t| {
-                rsshub::template_matches(&route, &t.route_path) && !t.enabled
-            });
-            let gated_on = templates.iter().any(|t| {
-                rsshub::template_matches(&route, &t.route_path) && t.enabled
-            });
+            let gated_off = templates
+                .iter()
+                .any(|t| rsshub::template_matches(&route, &t.route_path) && !t.enabled);
+            let gated_on = templates
+                .iter()
+                .any(|t| rsshub::template_matches(&route, &t.route_path) && t.enabled);
             if gated_off || !gated_on {
                 // Disabled template, or no installed template: quiet skip.
                 continue;

@@ -93,10 +93,7 @@ pub fn directory() -> Vec<DirectoryEntry> {
 /// `"ZH"` both reduce to `"zh"`. Used to match a UI locale against the
 /// directory's coarser per-language tags.
 fn primary_lang(tag: &str) -> String {
-    tag.split(['-', '_'])
-        .next()
-        .unwrap_or(tag)
-        .to_lowercase()
+    tag.split(['-', '_']).next().unwrap_or(tag).to_lowercase()
 }
 
 /// Case-insensitive search of the curated directory, scoped to one language.
@@ -228,8 +225,16 @@ mod tests {
         // Every entry must have the required, non-empty fields.
         for e in &dir {
             assert!(!e.title.is_empty(), "entry missing title");
-            assert!(e.feed_url.starts_with("http"), "bad feed url: {}", e.feed_url);
-            assert!(!e.category.is_empty(), "entry missing category: {}", e.title);
+            assert!(
+                e.feed_url.starts_with("http"),
+                "bad feed url: {}",
+                e.feed_url
+            );
+            assert!(
+                !e.category.is_empty(),
+                "entry missing category: {}",
+                e.title
+            );
             assert!(!e.lang.is_empty(), "entry missing lang: {}", e.title);
         }
     }
@@ -250,7 +255,11 @@ mod tests {
         let dir = directory();
         let mut seen = std::collections::HashSet::new();
         for e in &dir {
-            assert!(seen.insert(&e.feed_url), "duplicate feed url: {}", e.feed_url);
+            assert!(
+                seen.insert(&e.feed_url),
+                "duplicate feed url: {}",
+                e.feed_url
+            );
         }
     }
 
@@ -277,8 +286,10 @@ mod tests {
         let zh = search_directory("", "zh");
         assert!(!zh.is_empty());
         assert!(zh.iter().all(|r| r.from_directory));
-        let en_titles: std::collections::HashSet<_> =
-            search_directory("", "en").into_iter().map(|r| r.title).collect();
+        let en_titles: std::collections::HashSet<_> = search_directory("", "en")
+            .into_iter()
+            .map(|r| r.title)
+            .collect();
         assert!(
             zh.iter().all(|r| !en_titles.contains(&r.title)),
             "zh slice must not contain English feeds"

@@ -132,25 +132,40 @@ mod tests {
         // A literal segment must not be matched by a different literal.
         assert!(!template_matches("/github/issue/x/y", "/github/pull/x/y"));
         // Route prefixes must not shadow each other.
-        assert!(!template_matches("/bilibili/user/video/1/extra", "/bilibili/user/video/:id"));
+        assert!(!template_matches(
+            "/bilibili/user/video/1/extra",
+            "/bilibili/user/video/:id"
+        ));
     }
 
     #[test]
     fn template_matches_optional_params() {
         // `:seg?` may be omitted (an empty segment or simply absent).
-        assert!(template_matches("/bilibili/platform/-1", "/bilibili/platform/:area?"));
+        assert!(template_matches(
+            "/bilibili/platform/-1",
+            "/bilibili/platform/:area?"
+        ));
         assert!(template_matches(
             "/bilibili/platform/-1/all",
             "/bilibili/platform/:area?/:type?"
         ));
         // …but a required `:seg` with no value is not a match.
-        assert!(!template_matches("/bilibili/user/video/", "/bilibili/user/video/:id"));
-        assert!(!template_matches("/bilibili/user/video", "/bilibili/user/video/:id"));
+        assert!(!template_matches(
+            "/bilibili/user/video/",
+            "/bilibili/user/video/:id"
+        ));
+        assert!(!template_matches(
+            "/bilibili/user/video",
+            "/bilibili/user/video/:id"
+        ));
     }
 
     #[test]
     fn template_matches_exact_route_without_params() {
-        assert!(template_matches("/github/activity/DIYgod", "/github/activity/:user"));
+        assert!(template_matches(
+            "/github/activity/DIYgod",
+            "/github/activity/:user"
+        ));
         assert!(template_matches("/slack/user/:id", "/slack/user/:id"));
         assert!(!template_matches("/slack/user/", "/slack/user/:id"));
     }

@@ -6,8 +6,8 @@
 
 use crate::db;
 use crate::models::ArticleQuery;
-use crate::scheduler;
 use crate::notify;
+use crate::scheduler;
 use crate::state::AppState;
 use chrono::{NaiveDateTime, Utc};
 use tauri::image::Image;
@@ -147,8 +147,7 @@ fn build_menu(
     let l = labels(lang, unread, last);
     // The two status lines are disabled — they are read-only labels.
     let status = MenuItem::with_id(app, "tray_unread", &l.unread, false, None::<&str>)?;
-    let refreshed =
-        MenuItem::with_id(app, "tray_refreshed", &l.refreshed, false, None::<&str>)?;
+    let refreshed = MenuItem::with_id(app, "tray_refreshed", &l.refreshed, false, None::<&str>)?;
     let open = MenuItem::with_id(app, "tray_open", l.open, true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "tray_refresh", l.refresh, true, None::<&str>)?;
     let mark = MenuItem::with_id(app, "tray_markall", l.mark_all, true, None::<&str>)?;
@@ -161,8 +160,7 @@ fn build_menu(
     Menu::with_items(
         app,
         &[
-            &status, &refreshed, &s1, &open, &s2, &refresh, &mark, &s3, &settings, &s4,
-            &quit,
+            &status, &refreshed, &s1, &open, &s2, &refresh, &mark, &s3, &settings, &s4, &quit,
         ],
     )
 }
@@ -181,8 +179,7 @@ fn handle_event(app: &AppHandle, event: MenuEvent) {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let _ =
-                    scheduler::refresh_all(&app, None, false, scheduler::RefreshScope::All)
-                        .await;
+                    scheduler::refresh_all(&app, None, false, scheduler::RefreshScope::All).await;
             });
         }
         "tray_markall" => {
@@ -213,12 +210,7 @@ fn handle_event(app: &AppHandle, event: MenuEvent) {
 
 /// Install the tray icon at startup. `lang`, `unread` and `last` are read from
 /// the database by the caller (the connection is not yet behind the mutex).
-pub fn build(
-    app: &AppHandle,
-    lang: &str,
-    unread: i64,
-    last: Option<&str>,
-) -> tauri::Result<()> {
+pub fn build(app: &AppHandle, lang: &str, unread: i64, last: Option<&str>) -> tauri::Result<()> {
     let menu = build_menu(app, lang, unread, last)?;
     let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(Image::from_bytes(ICON)?)

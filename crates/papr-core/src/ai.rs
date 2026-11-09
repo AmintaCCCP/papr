@@ -812,7 +812,11 @@ mod tests {
             Some(format!("http://{address}/v1")),
         )
         .unwrap();
-        let result = super::test_connection(&reqwest::Client::new(), &cfg).await;
+        // A no-proxy client: the default client picks up the OS system proxy
+        // (Surge, ClashX, …) and a system proxy will not — or worse,
+        // intercepts — the loopback request this fixture serves itself.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result = super::test_connection(&client, &cfg).await;
         server.join().unwrap();
         result
     }

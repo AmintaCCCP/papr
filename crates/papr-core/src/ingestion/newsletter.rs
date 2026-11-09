@@ -147,16 +147,14 @@ pub fn email_to_article(raw: &[u8]) -> Option<ParsedEmail> {
         .attachments()
         .filter_map(|att| {
             let name = att.attachment_name()?;
-            let mime = att
-                .content_type()
-                .map(|c| {
-                    let mut t = c.ctype().to_string();
-                    if let Some(sub) = c.subtype() {
-                        t.push('/');
-                        t.push_str(sub);
-                    }
-                    t
-                });
+            let mime = att.content_type().map(|c| {
+                let mut t = c.ctype().to_string();
+                if let Some(sub) = c.subtype() {
+                    t.push('/');
+                    t.push_str(sub);
+                }
+                t
+            });
             // Emails embed attachment bytes inline; we only surface a
             // descriptive pseudo-URL (there is nothing to link to).
             Some(Enclosure {
@@ -327,7 +325,9 @@ body\r\n";
         let published = p.article.published_at.expect("has a date");
         let parsed = chrono::DateTime::parse_from_rfc3339(&published).expect("rfc3339");
         // Clamped to roughly "now", well short of the year-2099 header.
-        assert!(parsed.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::days(2));
+        assert!(
+            parsed.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::days(2)
+        );
     }
 
     #[test]

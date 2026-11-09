@@ -34,22 +34,12 @@ impl Default for RequireConfig {
 }
 
 /// A single environment variable a route may need.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ConfigItem {
     pub name: String,
     pub optional: bool,
     pub description: Option<String>,
-}
-
-impl Default for ConfigItem {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            optional: false,
-            description: None,
-        }
-    }
 }
 
 /// Route feature flags — the badges the marketplace UI renders.
@@ -170,9 +160,7 @@ impl CatalogHit {
 
 /// True when `categories` carries the NSFW tag (case-insensitive).
 fn is_nsfw(categories: &[String]) -> bool {
-    categories
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(NSFW_TAG))
+    categories.iter().any(|c| c.eq_ignore_ascii_case(NSFW_TAG))
 }
 
 /// Case-insensitive search over the whole catalog.
@@ -215,7 +203,8 @@ pub fn search_catalog(
         let ns_match = !needle.is_empty()
             && (ns_key.to_lowercase().contains(&needle)
                 || ns.name.to_lowercase().contains(&needle)
-                || ns.url
+                || ns
+                    .url
                     .as_deref()
                     .is_some_and(|u| u.to_lowercase().contains(&needle)));
         let ns_nsfw = is_nsfw(&ns.categories);
@@ -239,12 +228,7 @@ pub fn search_catalog(
                     .as_deref()
                     .is_some_and(|d| d.to_lowercase().contains(&needle));
             if route_match {
-                hits.push(CatalogHit::from(
-                    ns_key,
-                    ns,
-                    route_path.clone(),
-                    route,
-                ));
+                hits.push(CatalogHit::from(ns_key, ns, route_path.clone(), route));
                 if limit > 0 && hits.len() >= limit {
                     // Early exit preserves the heat ordering: the walk is
                     // already in sort order, so the first `limit` hits are
@@ -285,7 +269,11 @@ mod tests {
     #[test]
     fn bundled_catalog_parses_with_content() {
         let cat = catalog();
-        assert!(cat.namespaces.len() > 1_000, "namespaces: {}", cat.namespaces.len());
+        assert!(
+            cat.namespaces.len() > 1_000,
+            "namespaces: {}",
+            cat.namespaces.len()
+        );
         let routes: usize = cat.namespaces.values().map(|n| n.routes.len()).sum();
         assert!(routes > 3_000, "routes: {routes}");
         assert!(cat.namespaces.contains_key("bilibili"));
@@ -299,8 +287,8 @@ mod tests {
 
     #[test]
     fn route_lookup_finds_by_full_path() {
-        let (ns, route) = route_lookup("/163/music/user/playrecords/:uid/:type?")
-            .expect("163 route present");
+        let (ns, route) =
+            route_lookup("/163/music/user/playrecords/:uid/:type?").expect("163 route present");
         assert_eq!(ns, "163");
         assert!(route.features.require_config != RequireConfig::None(false));
         assert_eq!(route_lookup("/definitely/not/a/route"), None);

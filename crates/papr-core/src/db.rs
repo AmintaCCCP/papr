@@ -1248,7 +1248,11 @@ pub fn rsshub_route_get(conn: &Connection, route_path: &str) -> AppResult<Option
 
 /// Toggle a route. Disabled routes stop refreshing their subscriptions but
 /// keep their environment variables.
-pub fn rsshub_route_set_enabled(conn: &Connection, route_path: &str, enabled: bool) -> AppResult<()> {
+pub fn rsshub_route_set_enabled(
+    conn: &Connection,
+    route_path: &str,
+    enabled: bool,
+) -> AppResult<()> {
     conn.execute(
         "UPDATE rsshub_routes SET enabled = ?2 WHERE route_path = ?1",
         params![route_path, enabled as i64],
@@ -1289,7 +1293,8 @@ pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
         if !row.enabled {
             continue;
         }
-        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&row.env_json)
+        let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(&row.env_json)
         else {
             continue;
         };
@@ -5067,8 +5072,12 @@ mod tests {
         assert!(rows.iter().all(|r| r.enabled));
 
         // Re-installing keeps the configuration (enabled + env).
-        rsshub_route_set_env(&conn, "/bilibili/user/video/:id", r#"{"BILIBILI_COOKIE_1":"x"}"#)
-            .unwrap();
+        rsshub_route_set_env(
+            &conn,
+            "/bilibili/user/video/:id",
+            r#"{"BILIBILI_COOKIE_1":"x"}"#,
+        )
+        .unwrap();
         rsshub_route_set_enabled(&conn, "/bilibili/user/video/:id", false).unwrap();
         rsshub_route_upsert(&conn, "/bilibili/user/video/:id").unwrap();
         let row = rsshub_route_get(&conn, "/bilibili/user/video/:id")
@@ -5078,7 +5087,9 @@ mod tests {
         assert_eq!(row.env_json, r#"{"BILIBILI_COOKIE_1":"x"}"#);
 
         rsshub_route_delete(&conn, "/github/activity/:user").unwrap();
-        assert!(rsshub_route_get(&conn, "/github/activity/:user").unwrap().is_none());
+        assert!(rsshub_route_get(&conn, "/github/activity/:user")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -5116,13 +5127,53 @@ mod tests {
     #[test]
     fn rsshub_feed_queries_track_the_dedicated_source_type() {
         let conn = test_conn();
-        let rss = insert_feed(&conn, "https://example.com/rss", None, "rss", None, SourceType::Rss, None).unwrap();
-        let hub = insert_feed(&conn, "rsshub:///github/activity/DIYgod", None, "hub", None, SourceType::Rsshub, None).unwrap();
-        let nl = insert_feed(&conn, "imap://box", None, "nl", None, SourceType::Newsletter, None).unwrap();
-        let x = insert_feed(&conn, "https://x.com/jack", None, "x", None, SourceType::X, None).unwrap();
+        let rss = insert_feed(
+            &conn,
+            "https://example.com/rss",
+            None,
+            "rss",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let hub = insert_feed(
+            &conn,
+            "rsshub:///github/activity/DIYgod",
+            None,
+            "hub",
+            None,
+            SourceType::Rsshub,
+            None,
+        )
+        .unwrap();
+        let nl = insert_feed(
+            &conn,
+            "imap://box",
+            None,
+            "nl",
+            None,
+            SourceType::Newsletter,
+            None,
+        )
+        .unwrap();
+        let x = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "x",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
 
         // The plain-HTTP set excludes newsletters, parser and rsshub sources.
-        let http: Vec<i64> = feeds_to_refresh(&conn).unwrap().into_iter().map(|(id, _, _, _)| id).collect();
+        let http: Vec<i64> = feeds_to_refresh(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect();
         assert_eq!(http, vec![rss]);
 
         // The engine leg sees exactly the rsshub feeds, with revalidators.
@@ -5137,7 +5188,9 @@ mod tests {
         assert_eq!(rsshub_feeds_for_feed(&conn, hub).unwrap().len(), 1);
         // OPML export and sync never leak rsshub:// URLs.
         let export = feeds_for_export(&conn).unwrap();
-        assert!(export.iter().all(|(_, url, _)| !url.starts_with("rsshub://")));
+        assert!(export
+            .iter()
+            .all(|(_, url, _)| !url.starts_with("rsshub://")));
         assert_eq!(export.len(), 1, "only the plain rss feed exports");
         let sync = feed_urls_for_sync(&conn).unwrap();
         assert!(sync.iter().all(|u| !u.starts_with("rsshub://")));

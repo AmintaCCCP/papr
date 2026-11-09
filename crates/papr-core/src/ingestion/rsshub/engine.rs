@@ -70,14 +70,40 @@ const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 /// RSSHub's own proxy setting).
 const ENV_ALLOWLIST: &[&str] = &[
     // Unix basics.
-    "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "SHELL",
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "USER",
+    "LOGNAME",
+    "SHELL",
     // TLS trust store overrides (custom CAs).
-    "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
     // Windows basics Node's `os`/`child_process` modules expect.
-    "SYSTEMROOT", "COMSPEC", "PATHEXT", "PROGRAMFILES", "PROGRAMDATA", "SYSTEMDRIVE",
-    "HOMEDRIVE", "HOMEPATH", "ALLUSERSPROFILE", "APPDATA", "LOCALAPPDATA", "WINDIR",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "PATHEXT",
+    "PROGRAMFILES",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "WINDIR",
     // Proxy egress.
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
     "PROXY_URI",
 ];
 
@@ -185,10 +211,7 @@ impl EngineManager {
             "app/dist/index.cjs",
             "app/lib/index.js",
         ];
-        CANDIDATES
-            .iter()
-            .map(|c| dir.join(c))
-            .find(|p| p.is_file())
+        CANDIDATES.iter().map(|c| dir.join(c)).find(|p| p.is_file())
     }
 
     /// Current status for the settings UI.
@@ -198,10 +221,7 @@ impl EngineManager {
             let mut guard = self.running.lock().await;
             match guard.as_mut() {
                 Some(r) => (
-                    r.child
-                        .try_wait()
-                        .map(|s| s.is_none())
-                        .unwrap_or(false),
+                    r.child.try_wait().map(|s| s.is_none()).unwrap_or(false),
                     Some(r.port),
                 ),
                 None => (false, None),
@@ -250,19 +270,22 @@ impl EngineManager {
         user_env: &BTreeMap<String, String>,
         budget: Duration,
     ) -> AppResult<u16> {
-        let info = self.info().ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
+        let info = self
+            .info()
+            .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
         let dir = Self::version_dir(&info, &self.root)?;
         let node_bin = Self::node_bin(&dir);
-        let entry = Self::entry_script(&dir)
-            .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
+        let entry = Self::entry_script(&dir).ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
         if !node_bin.is_file() {
-            log::error!("rsshub engine: node binary missing at {}", node_bin.display());
+            log::error!(
+                "rsshub engine: node binary missing at {}",
+                node_bin.display()
+            );
             return Err(AppError::code(CODE_ENGINE_MISSING));
         }
 
-        let port = free_port().map_err(|e| {
-            AppError::other(format!("rsshub engine: no free port: {e}"))
-        })?;
+        let port = free_port()
+            .map_err(|e| AppError::other(format!("rsshub engine: no free port: {e}")))?;
         let log_path = self.root.join("engine.log");
 
         // The log file is opened twice (stdout + stderr share it in append
@@ -282,6 +305,9 @@ impl EngineManager {
             .env_clear()
             .env("PORT", port.to_string())
             .env("NODE_ENV", "production")
+            // RSSHub's own production start command raises the HTTP header
+            // size limit (some upstream responses carry long headers).
+            .env("NODE_OPTIONS", "--max-http-header-size=32768")
             .stdout(std::process::Stdio::from(log_out))
             .stderr(std::process::Stdio::from(log_err))
             .kill_on_drop(true);
@@ -296,7 +322,10 @@ impl EngineManager {
             cmd.env(k, v);
         }
 
-        log::info!("rsshub engine: starting {} on 127.0.0.1:{port}", node_bin.display());
+        log::info!(
+            "rsshub engine: starting {} on 127.0.0.1:{port}",
+            node_bin.display()
+        );
         let child = cmd
             .spawn()
             .map_err(|e| AppError::other(format!("rsshub engine: spawn: {e}")))?;
@@ -362,9 +391,8 @@ impl EngineManager {
         self.shutdown().await;
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
-            std::fs::create_dir_all(&root).map_err(|e| {
-                AppError::other(format!("rsshub engine: create root: {e}"))
-            })?;
+            std::fs::create_dir_all(&root)
+                .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
             for entry in std::fs::read_dir(&root)
                 .map_err(|e| AppError::other(format!("rsshub engine: read root: {e}")))?
             {
@@ -523,8 +551,8 @@ fn validate_staging(staging: &Path) -> AppResult<EngineInfo> {
     let manifest_path = staging.join("engine.json");
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|_| AppError::code(CODE_ARCHIVE_INVALID))?;
-    let info: EngineInfo = serde_json::from_str(&raw)
-        .map_err(|_| AppError::code(CODE_ARCHIVE_INVALID))?;
+    let info: EngineInfo =
+        serde_json::from_str(&raw).map_err(|_| AppError::code(CODE_ARCHIVE_INVALID))?;
     let node = if cfg!(windows) {
         staging.join("bin").join("node.exe")
     } else {
@@ -557,13 +585,11 @@ fn install_archive_blocking(root: &Path, archive: &Path) -> AppResult<EngineInfo
             // Replace any previous build of the same version atomically
             // enough for our purposes: stage fully, then a single rename.
             if dest.exists() {
-                std::fs::remove_dir_all(&dest).map_err(|e| {
-                    AppError::other(format!("rsshub engine: replace old: {e}"))
-                })?;
+                std::fs::remove_dir_all(&dest)
+                    .map_err(|e| AppError::other(format!("rsshub engine: replace old: {e}")))?;
             }
-            std::fs::rename(&staging, &dest).map_err(|e| {
-                AppError::other(format!("rsshub engine: finalize: {e}"))
-            })?;
+            std::fs::rename(&staging, &dest)
+                .map_err(|e| AppError::other(format!("rsshub engine: finalize: {e}")))?;
             let manifest = EngineInfo {
                 installed_at: chrono::Utc::now().to_rfc3339(),
                 ..info
@@ -683,10 +709,8 @@ mod tests {
     use std::io::Write;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "papr-engine-test-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("papr-engine-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -788,8 +812,19 @@ mod tests {
         let mgr = EngineManager::new(root.join("install"));
         let info = mgr.install_from_archive(&archive).await.unwrap();
         assert_eq!(info.version, "2");
-        assert!(root.join("install").join("2").join("bin").join("node.exe").is_file()
-            || root.join("install").join("2").join("bin").join("node").is_file());
+        assert!(
+            root.join("install")
+                .join("2")
+                .join("bin")
+                .join("node.exe")
+                .is_file()
+                || root
+                    .join("install")
+                    .join("2")
+                    .join("bin")
+                    .join("node")
+                    .is_file()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -814,10 +849,8 @@ mod tests {
         // Rebuild the archive with different content, same version.
         let (archive2, _) = make_targz(&root, "v2 body");
         mgr.install_from_archive(&archive2).await.unwrap();
-        let body = std::fs::read_to_string(
-            root.join("install").join("1").join("bin").join("node"),
-        )
-        .unwrap();
+        let body = std::fs::read_to_string(root.join("install").join("1").join("bin").join("node"))
+            .unwrap();
         assert_eq!(body, "v2 body");
         std::fs::remove_dir_all(&root).unwrap();
     }

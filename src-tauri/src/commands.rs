@@ -394,8 +394,8 @@ pub async fn rsshub_route_set_env(
     if env.keys().any(|k| k.trim().is_empty()) {
         return Err(AppError::code("rsshubEnvInvalid"));
     }
-    let json = serde_json::to_string(&env)
-        .map_err(|e| AppError::other(format!("rsshub env: {e}")))?;
+    let json =
+        serde_json::to_string(&env).map_err(|e| AppError::other(format!("rsshub env: {e}")))?;
     let conn = state.db.lock().await;
     if db::rsshub_route_get(&conn, &path)?.is_none() {
         return Err(AppError::code("rsshubRouteUnknown"));
@@ -603,7 +603,8 @@ async fn add_rsshub_feed(
         auto_translate: false,
         open_mode: None,
     })
-}/// Validate a parser's configuration with a real upstream round-trip. For the
+}
+/// Validate a parser's configuration with a real upstream round-trip. For the
 /// X parser this fetches `handle`'s latest timeline page; success means the
 /// cookies work and the queryId chain resolved. Errors surface as coded
 /// errors the frontend localises (`xAuthInvalid`, `xBlocked`, …).

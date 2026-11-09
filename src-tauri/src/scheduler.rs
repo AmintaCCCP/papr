@@ -51,19 +51,18 @@ pub async fn refresh_all(
     };
 
     let client = state.http();
-    let summary =
-        refresh::refresh_core(
-            &state.db,
-            &client,
-            Some(state.engine.as_ref()),
-            scope,
-            |event| {
-                if let Some(p) = &progress {
-                    let _ = p.send(event);
-                }
-            },
-        )
-        .await?;
+    let summary = refresh::refresh_core(
+        &state.db,
+        &client,
+        Some(state.engine.as_ref()),
+        scope,
+        |event| {
+            if let Some(p) = &progress {
+                let _ = p.send(event);
+            }
+        },
+    )
+    .await?;
 
     // Background scheduler with nothing due this cycle: bow out before the
     // heavier tail (sync, notifications, tray) so an idle tick is genuinely idle.
