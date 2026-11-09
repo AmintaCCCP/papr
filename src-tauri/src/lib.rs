@@ -114,6 +114,12 @@ pub fn run() {
             };
             // The HTTP client honours the persisted proxy / timeout settings.
             let http = ingestion::fetch::build_client_from_settings(&conn);
+            // The local RSSHub engine root lives next to the database; the
+            // route marketplace installs engine archives into it and the
+            // refresh scheduler spawns the engine from here.
+            let engine = std::sync::Arc::new(ingestion::rsshub::engine::EngineManager::new(
+                app.path().app_data_dir()?.join("rsshub-engine"),
+            ));
             // Snapshot the state the tray menu needs (read before the
             // connection moves behind the async mutex).
             let lang = db::get_setting(&conn, "language")
@@ -131,7 +137,7 @@ pub fn run() {
             let theme = db::get_setting(&conn, "theme").ok().flatten();
             let dark_shade = db::get_setting(&conn, "dark_shade").ok().flatten();
 
-            app.manage(AppState::new(conn, readers, http));
+            app.manage(AppState::new(conn, readers, http, engine));
 
             // ── papr:// deep links (feature F6) ───────────────────────
             // Registered after `app.manage` so the handler can always reach
@@ -323,12 +329,32 @@ pub fn run() {
             commands::update_highlight_note,
             commands::set_highlight_color,
             commands::delete_highlight,
+            commands::rsshub_marketplace_catalog,
+            commands::rsshub_routes_installed,
+            commands::rsshub_route_install,
+            commands::rsshub_route_uninstall,
+            commands::rsshub_route_set_enabled,
+            commands::rsshub_route_set_env,
+            commands::rsshub_test_route,
+            commands::engine_status,
+            commands::engine_install_from_dialog,
+            commands::engine_install_from_path,
+            commands::engine_install_from_url,
+            commands::engine_uninstall,
             integrations::run_integration,
             page_view::open_page_view,
             page_view::set_page_view_bounds,
             page_view::set_page_view_visible,
             page_view::close_page_view,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Papr");
+        .build(tauri::generate_context!())
+        .expect("error while building Papr")
+        .run(|app_handle, event| {
+            // The local RSSHub engine is a child process — on quit it must be
+            // killed, or it would outlive the app holding its port and memory.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let engine = app_handle.state::<AppState>().engine.clone();
+                tauri::async_runtime::block_on(engine.shutdown());
+            }
+        });
 }

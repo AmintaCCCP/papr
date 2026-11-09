@@ -253,6 +253,17 @@ fn map_entry(e: &Entry, base: &str) -> Option<NewArticle> {
 
 /// Detect the source type from a feed/site URL — drives differentiated UI.
 pub fn detect_source_type(url: &str) -> SourceType {
+    // `rsshub://` short links classify from the scheme alone — the URL crate
+    // would read the route's first segment as a host. An OPML-imported
+    // rsshub:// subscription then lands on the engine refresh leg correctly
+    // (URL-only visibility constraint, same as Reddit / X above).
+    if url
+        .trim()
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("rsshub://"))
+    {
+        return SourceType::Rsshub;
+    }
     let parsed = Url::parse(url).ok();
     let host = parsed
         .as_ref()

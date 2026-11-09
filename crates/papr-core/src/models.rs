@@ -20,6 +20,11 @@ pub enum SourceType {
     /// `ingestion::parsers::x`) instead of a feed document. The feed's URL is
     /// the profile URL itself; authentication lives in the `parsers` setting.
     X,
+    /// An RSSHub route executed by the bundled local engine (see
+    /// `ingestion::rsshub`). The feed's URL is the `rsshub://<route path>`
+    /// short link the user subscribed with; which routes are installed and
+    /// their environment variables live in the `rsshub_routes` table.
+    Rsshub,
 }
 
 impl SourceType {
@@ -33,6 +38,7 @@ impl SourceType {
             SourceType::Reddit => "reddit",
             SourceType::Newsletter => "newsletter",
             SourceType::X => "x",
+            SourceType::Rsshub => "rsshub",
         }
     }
 }

@@ -1,10 +1,11 @@
 //! Shared application state, registered via `Builder::manage` and injected into
 //! commands as `tauri::State<AppState>`.
 
+use papr_core::ingestion::rsshub::engine::EngineManager;
 use reqwest::Client;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 pub struct AppState {
@@ -28,6 +29,10 @@ pub struct AppState {
     /// command and the periodic scheduler can otherwise fire concurrently —
     /// `try_lock` lets a second run bow out instead of duplicating the work.
     pub refresh_lock: Mutex<()>,
+    /// The local RSSHub engine manager (route marketplace). The root lives in
+    /// the app data dir next to the database. Shared with the refresh
+    /// scheduler so rsshub feeds poll through the same engine instance.
+    pub engine: Arc<EngineManager>,
     /// A `papr://subscribe` URL delivered before the webview registered its
     /// `deep-link-subscribe` listener — typically a cold-start launch where the
     /// link arrives during `setup()`. The frontend drains this once on mount
@@ -38,7 +43,7 @@ pub struct AppState {
 
 impl AppState {
     /// Build the shared state. `readers` must be non-empty.
-    pub fn new(db: Connection, readers: Vec<Connection>, http: Client) -> Self {
+    pub fn new(db: Connection, readers: Vec<Connection>, http: Client, engine: Arc<EngineManager>) -> Self {
         assert!(!readers.is_empty(), "read pool must have at least one connection");
         Self {
             db: Mutex::new(db),
@@ -46,6 +51,7 @@ impl AppState {
             next_reader: AtomicUsize::new(0),
             http: RwLock::new(http),
             refresh_lock: Mutex::new(()),
+            engine,
             pending_deep_link: std::sync::Mutex::new(None),
         }
     }

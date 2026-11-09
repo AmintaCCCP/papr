@@ -1003,7 +1003,9 @@ async fn cmd_refresh(
     };
 
     // Progress is diagnostic — it goes to stderr so stdout stays pure data.
-    let summary = refresh::refresh_core(&dbm, &client, scope, |event| {
+    // The agent CLI has no bundled engine, so rsshub feeds report their
+    // actionable `rsshubEngineMissing` error instead of fetching.
+    let summary = refresh::refresh_core(&dbm, &client, None, scope, |event| {
         use papr_core::models::RefreshProgress::*;
         match event {
             Started { total } => eprintln!("refreshing {total} feed(s)…"),

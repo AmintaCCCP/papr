@@ -8,6 +8,7 @@ use crate::extraction;
 use crate::ingestion::discovery::{self, DiscoveryResult};
 use crate::ingestion::newsletter::{self, NewsletterConfig};
 use crate::ingestion::parsers;
+use crate::ingestion::rsshub;
 use crate::ingestion::sources::{self, Normalized};
 use crate::ingestion::{fetch, parse};
 
@@ -18,6 +19,7 @@ use crate::scheduler;
 use crate::state::AppState;
 use crate::translate;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -82,31 +84,13 @@ pub async fn add_feed(
 ) -> AppResult<Feed> {
     let client = state.http();
 
-    // Step 0a: expand an `rsshub://route` short link into a normal feed URL on
-    // the configured RSSHub instance (default: the public rsshub.app). The
-    // expansion is a plain HTTP feed URL, so the rest of the pipeline handles
-    // it with no further special-casing. Only touch the DB when it's actually
-    // an rsshub link, so the common case pays nothing.
-    let url = if url
-        .trim()
-        .get(..9)
-        .is_some_and(|s| s.eq_ignore_ascii_case("rsshub://"))
-    {
-        let instance = {
-            let conn = state.db.lock().await;
-            db::get_setting(&conn, "rsshub_instance")?
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| sources::DEFAULT_RSSHUB_INSTANCE.to_string())
-        };
-        sources::expand_rsshub(&url, &instance).unwrap_or(url)
-    } else {
-        url
-    };
-
     // Step 0: multi-source normalization. If the pasted URL is a known
     // special source, rewrite it to its real feed URL. A YouTube vanity URL
     // needs the channel page fetched to learn its channel id; that single
     // network call lives here (the extraction logic itself is pure).
+    //
+    // `rsshub://` links are kept verbatim and routed to the engine add flow
+    // below — they never go through the plain feed-document fetch.
     let (effective_url, forced_type): (String, Option<SourceType>) =
         match sources::normalize_source(&url) {
             Normalized::Feed { url, source_type } => (url, Some(source_type)),
@@ -127,6 +111,11 @@ pub async fn add_feed(
     // built-in X parser produces the feed data instead (see `add_x_feed`).
     if forced_type == Some(SourceType::X) {
         return add_x_feed(state, &effective_url, folder_id).await;
+    }
+    // An `rsshub://` short link runs through the local engine (the route
+    // marketplace), never through a hosted RSSHub instance.
+    if forced_type == Some(SourceType::Rsshub) {
+        return add_rsshub_feed(state, &effective_url, folder_id).await;
     }
 
     // Step 1: fetch whatever the user gave us (or the normalized feed URL).
@@ -329,7 +318,292 @@ pub struct ParserTestResult {
     pub article_count: usize,
 }
 
-/// Validate a parser's configuration with a real upstream round-trip. For the
+// ─────────────────────────── RSSHub route marketplace ───────────────────────────
+//
+// The marketplace lets the user browse the bundled route catalog, install
+// routes (with per-route environment variables) and subscribe to them with
+// `rsshub://<route path>` links. All route execution goes through the bundled
+// local engine (see `ingestion::rsshub::engine`) — papr never talks to a
+// hosted RSSHub instance.
+
+/// The whole bundled route catalog (slim JSON). The frontend loads it once
+/// per session and filters client-side, so search/category/heat react
+/// instantly without backend round-trips.
+#[tauri::command]
+pub async fn rsshub_marketplace_catalog() -> AppResult<rsshub::catalog::Catalog> {
+    Ok(rsshub::catalog::catalog().clone())
+}
+
+/// Every installed route (the marketplace's "installed" tab).
+#[tauri::command]
+pub async fn rsshub_routes_installed(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<db::RsshubRouteRow>> {
+    let conn = state.read().await;
+    db::rsshub_routes_list(&conn)
+}
+
+/// Install a route template from the bundled catalog. Re-installing an
+/// installed route keeps its enablement and environment variables.
+#[tauri::command]
+pub async fn rsshub_route_install(state: State<'_, AppState>, path: String) -> AppResult<()> {
+    // Only catalog-documented routes can be installed: the marketplace UI
+    // only ever passes those, and the guard keeps a crafted IPC call from
+    // registering arbitrary paths as "installed".
+    let path = normalize_route_path(&path);
+    if rsshub::catalog::route_lookup(&path).is_none() {
+        return Err(AppError::code("rsshubRouteUnknown"));
+    }
+    let conn = state.db.lock().await;
+    db::rsshub_route_upsert(&conn, &path)
+}
+
+/// Uninstall a route template. Its subscriptions stay in the sidebar but stop
+/// refreshing (the UI confirms before calling this).
+#[tauri::command]
+pub async fn rsshub_route_uninstall(state: State<'_, AppState>, path: String) -> AppResult<()> {
+    let conn = state.db.lock().await;
+    db::rsshub_route_delete(&conn, &normalize_route_path(&path))
+}
+
+/// Toggle a route. Disabled routes keep their env vars but stop refreshing
+/// their subscriptions.
+#[tauri::command]
+pub async fn rsshub_route_set_enabled(
+    state: State<'_, AppState>,
+    path: String,
+    enabled: bool,
+) -> AppResult<()> {
+    let path = normalize_route_path(&path);
+    let conn = state.db.lock().await;
+    if db::rsshub_route_get(&conn, &path)?.is_none() {
+        return Err(AppError::code("rsshubRouteUnknown"));
+    }
+    db::rsshub_route_set_enabled(&conn, &path, enabled)
+}
+
+/// Replace a route's environment variables. Values must all be strings — the
+/// engine passes them straight into the child process environment.
+#[tauri::command]
+pub async fn rsshub_route_set_env(
+    state: State<'_, AppState>,
+    path: String,
+    env: BTreeMap<String, String>,
+) -> AppResult<()> {
+    let path = normalize_route_path(&path);
+    if env.keys().any(|k| k.trim().is_empty()) {
+        return Err(AppError::code("rsshubEnvInvalid"));
+    }
+    let json = serde_json::to_string(&env)
+        .map_err(|e| AppError::other(format!("rsshub env: {e}")))?;
+    let conn = state.db.lock().await;
+    if db::rsshub_route_get(&conn, &path)?.is_none() {
+        return Err(AppError::code("rsshubRouteUnknown"));
+    }
+    db::rsshub_route_set_env(&conn, &path, &json)
+}
+
+/// Route paths come in both key forms — normalize to the catalog's canonical
+/// leading-slash template form so registry keys are stable.
+fn normalize_route_path(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("/{trimmed}")
+}
+
+/// The engine's settings-page status: installed version/revision and whether
+/// the process is currently running.
+#[tauri::command]
+pub async fn engine_status(state: State<'_, AppState>) -> AppResult<rsshub::engine::EngineStatus> {
+    Ok(state.engine.status().await)
+}
+
+/// Install the engine from a local archive picked in a native dialog (the
+/// settings card's primary path — no JS dialog plugin needed). `None` when
+/// the user cancels.
+#[tauri::command]
+pub async fn engine_install_from_dialog(
+    app: AppHandle,
+) -> AppResult<Option<rsshub::engine::EngineInfo>> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .add_filter("RSSHub engine archive", &["tar.gz", "tgz", "zip"])
+        .blocking_pick_file()
+    else {
+        return Ok(None); // user cancelled
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| AppError::other("engine dialog returned a non-file path"))?;
+    let engine = app.state::<AppState>().engine.clone();
+    engine.install_from_archive(&path).await.map(Some)
+}
+
+/// Install the engine from a local archive path (already-known paths, e.g. a
+/// freshly built `target/engine/*.tar.gz`).
+#[tauri::command]
+pub async fn engine_install_from_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> AppResult<rsshub::engine::EngineInfo> {
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(AppError::code(rsshub::engine::CODE_ARCHIVE_INVALID));
+    }
+    state.engine.install_from_archive(&path).await
+}
+
+/// Download and install the engine from a URL, optionally verifying the
+/// archive's sha256 (`sha256sum` of the artifact, hex).
+#[tauri::command]
+pub async fn engine_install_from_url(
+    state: State<'_, AppState>,
+    url: String,
+    sha256: Option<String>,
+) -> AppResult<rsshub::engine::EngineInfo> {
+    state
+        .engine
+        .install_from_url(&url, &state.http(), sha256.as_deref())
+        .await
+}
+
+/// Remove the installed engine (and its archives) from disk. Subscriptions
+/// keep their rows but error on refresh until an engine is back.
+#[tauri::command]
+pub async fn engine_uninstall(state: State<'_, AppState>) -> AppResult<()> {
+    state.engine.uninstall().await
+}
+
+/// Probe one route through the local engine — the marketplace's "test"
+/// button. Ensures the engine is running (starting it with the user's merged
+/// route environment), fetches the route with the concrete values the
+/// marketplace filled in and reports how many entries the feed document had.
+/// `path` is the concrete route invocation, e.g. `/github/activity/DIYgod`.
+#[tauri::command]
+pub async fn rsshub_test_route(
+    state: State<'_, AppState>,
+    path: String,
+) -> AppResult<ParserTestResult> {
+    let route = rsshub::route_from_url(&path)
+        .or_else(|| {
+            let normalized = normalize_route_path(&path);
+            rsshub::route_from_url(&normalized)
+        })
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| AppError::code("rsshubRouteInvalid"))?;
+
+    let env = {
+        let conn = state.read().await;
+        db::rsshub_enabled_env(&conn)
+    };
+    let engine = state.engine.clone();
+    let port = engine.ensure(&env).await?;
+    let url = format!("http://127.0.0.1:{port}/{}", route.trim_start_matches('/'));
+
+    let client = state.http();
+    let (bytes, _ct, _final) = fetch::get(&client, &url).await.map_err(|e| {
+        log::warn!("rsshub test route {route}: {e}");
+        AppError::code(rsshub::engine::CODE_ROUTE_FETCH)
+    })?;
+    engine.touch().await;
+    let parsed = parse::parse_feed(&bytes, &url)
+        .map_err(|_| AppError::code(rsshub::engine::CODE_ROUTE_FETCH))?;
+    Ok(ParserTestResult {
+        article_count: parsed.articles.len(),
+    })
+}
+
+/// The rsshub add flow: `rsshub://<route path>` → the local engine's feed
+/// document for that route → a feed row (`source_type = 'rsshub'`) plus the
+/// newest articles. The engine must be installed; a missing engine is a hard,
+/// coded error (`rsshubEngineMissing`) the add dialog localizes.
+///
+/// The gate order mirrors `add_x_feed`: engine → duplicate → fetch.
+async fn add_rsshub_feed(
+    state: State<'_, AppState>,
+    feed_url: &str,
+    folder_id: Option<i64>,
+) -> AppResult<Feed> {
+    // Engine + duplicate checks come from the read pool; only the persist
+    // step takes the writer.
+    {
+        let conn = state.read().await;
+        if !state.engine.installed() {
+            return Err(AppError::code(rsshub::engine::CODE_ENGINE_MISSING));
+        }
+        if db::find_feed_by_url(&conn, feed_url)?.is_some() {
+            return Err(AppError::code("alreadySubscribed"));
+        }
+    }
+    let route = rsshub::route_from_url(feed_url)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| AppError::code("rsshubRouteInvalid"))?;
+
+    let env = {
+        let conn = state.read().await;
+        db::rsshub_enabled_env(&conn)
+    };
+    let engine = state.engine.clone();
+    let port = engine.ensure(&env).await?;
+    let fetch_url = format!("http://127.0.0.1:{port}/{}", route.trim_start_matches('/'));
+
+    let client = state.http();
+    let (bytes, _ct, _final) = fetch::get(&client, &fetch_url).await.map_err(|e| {
+        log::warn!("rsshub add {route}: {e}");
+        AppError::code(rsshub::engine::CODE_ROUTE_FETCH)
+    })?;
+    engine.touch().await;
+    let parsed = parse::parse_feed(&bytes, &fetch_url)
+        .map_err(|_| AppError::code(rsshub::engine::CODE_ROUTE_FETCH))?;
+
+    let title = parsed
+        .title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| route.clone());
+
+    let conn = state.db.lock().await;
+    let feed_id = db::insert_feed(
+        &conn,
+        feed_url,
+        None,
+        &title,
+        parsed.description.as_deref(),
+        SourceType::Rsshub,
+        folder_id,
+    )?;
+    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let rules = db::active_rules(&conn).unwrap_or_default();
+    for article in &parsed.articles {
+        db::upsert_article(&conn, feed_id, article, dedup, &rules)?;
+    }
+    let unread = db::count_feed_unread(&conn, feed_id)?;
+    // The route fetch above is a genuine refresh — record it so the
+    // scheduler does not immediately re-fetch (mirrors `add_feed`).
+    let _ = db::touch_feed(&conn, feed_id);
+    let last_fetched_at = db::feed_last_fetched(&conn, feed_id).ok().flatten();
+    drop(conn);
+
+    Ok(Feed {
+        id: feed_id,
+        feed_url: feed_url.to_string(),
+        site_url: None,
+        title,
+        description: parsed.description,
+        favicon_url: None,
+        folder_id,
+        source_type: SourceType::Rsshub.as_str().to_string(),
+        last_fetched_at,
+        fetch_error: None,
+        unread_count: unread,
+        refresh_interval_min: None,
+        auto_translate: false,
+        open_mode: None,
+    })
+}/// Validate a parser's configuration with a real upstream round-trip. For the
 /// X parser this fetches `handle`'s latest timeline page; success means the
 /// cookies work and the queryId chain resolved. Errors surface as coded
 /// errors the frontend localises (`xAuthInvalid`, `xBlocked`, …).
