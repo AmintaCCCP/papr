@@ -2,6 +2,7 @@
 //! All SQL lives here; commands call typed functions, never raw SQL.
 
 use crate::error::{AppError, AppResult};
+use crate::ingestion::rsshub;
 use crate::models::*;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
@@ -1287,10 +1288,11 @@ pub fn rsshub_route_delete(conn: &Connection, route_path: &str) -> AppResult<()>
 /// because `rsshub_routes_list` orders by `installed_at`). Malformed JSON is
 /// skipped defensively — one corrupted row must not break engine start for
 /// every route; the marketplace UI rewrites `env_json` on the next save.
-/// Entries whose key or value could never survive an `execve` (NUL anywhere,
-/// `=` in a name) are dropped for the same reason: the command layer
-/// validates on save, but a stale or hand-edited row must not wedge the
-/// spawn either.
+/// Entries a child process could never carry are dropped for the same
+/// reason — `rsshub::valid_env_key` / `valid_env_value` re-apply the save
+/// path's limits here, because older rows may predate them (an over-long
+/// value past the ~128 KiB `execve` E2BIG threshold would otherwise fail
+/// the spawn and stall every RSSHub subscription).
 pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
     let mut merged = BTreeMap::new();
     for row in rsshub_routes_list(conn).unwrap_or_default() {
@@ -1304,7 +1306,7 @@ pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
         };
         for (k, v) in map {
             if let Some(s) = v.as_str() {
-                if k.is_empty() || k.contains(['\0', '=']) || s.contains('\0') {
+                if !rsshub::valid_env_key(&k) || !rsshub::valid_env_value(s) {
                     continue;
                 }
                 merged.insert(k, s.to_string());
@@ -5133,8 +5135,8 @@ mod tests {
 
     #[test]
     fn rsshub_enabled_env_drops_entries_exec_cannot_carry() {
-        // The command layer validates on save; a stale or hand-edited row
-        // must not wedge the engine spawn with an unexplainable OS error.
+        // The command layer validates on save; a stale, older or hand-edited
+        // row must not wedge the engine spawn with an unexplainable OS error.
         let conn = test_conn();
         rsshub_route_upsert(&conn, "/a/hostile/:id").unwrap();
         rsshub_route_set_env(
@@ -5143,6 +5145,22 @@ mod tests {
             r#"{"GOOD":"1","BAD\u0000KEY":"2","EQ=KEY":"3","NUL_VAL":"a\u0000b"}"#,
         )
         .unwrap();
+        let env = rsshub_enabled_env(&conn);
+        assert_eq!(env.get("GOOD").map(String::as_str), Some("1"));
+        assert_eq!(env.len(), 1);
+    }
+
+    #[test]
+    fn rsshub_enabled_env_drops_over_long_entries_from_old_rows() {
+        // Rows written before the save path grew its length limits may carry
+        // entries past the execve E2BIG threshold — filtered at merge time so
+        // one bad value cannot stall every RSSHub subscription.
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/a/legacy/:id").unwrap();
+        let long_key = "K".repeat(rsshub::MAX_ENV_KEY_BYTES + 1);
+        let long_value = "v".repeat(rsshub::MAX_ENV_VALUE_BYTES + 1);
+        let json = format!(r#"{{"GOOD":"1","{long_key}":"2","LONG_VAL":"{long_value}"}}"#);
+        rsshub_route_set_env(&conn, "/a/legacy/:id", &json).unwrap();
         let env = rsshub_enabled_env(&conn);
         assert_eq!(env.get("GOOD").map(String::as_str), Some("1"));
         assert_eq!(env.len(), 1);

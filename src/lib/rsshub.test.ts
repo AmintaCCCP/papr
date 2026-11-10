@@ -266,6 +266,19 @@ describe("extractParams / concretePath", () => {
     );
   });
 
+  it("handles a regex constraint containing a slash (npm scoped packages)", () => {
+    // The npm template's regex carries a literal `/` inside the braces —
+    // splitting there produced garbage literal fragments in the path.
+    const npm = "/npm/package/:name{(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*}";
+    expect(concretePath(npm, { name: "react" })).toBe("/npm/package/react");
+    expect(concretePath(npm, { name: "@rsshub/app" })).toBe("/npm/package/%40rsshub/app");
+    expect(paramsFromExample(npm, "/npm/package/react")).toEqual({ name: "react" });
+    expect(templateMatches("/npm/package/react", npm)).toBe(true);
+    expect(templateMatches("/npm/package/@rsshub/app", npm)).toBe(true);
+    expect(templateMatches("/npm/package", npm)).toBe(false);
+    expect(templateMatches("/npm/other/react", npm)).toBe(false);
+  });
+
   it("keeps slashes in catch-all values, encoding each segment", () => {
     // The catalog's catch-all routes take a multi-segment value — the
     // separators must survive (encoded slashes made these routes unusable).

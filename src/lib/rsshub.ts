@@ -239,6 +239,29 @@ export interface RouteParam {
   catchAll: boolean;
 }
 
+/** Split a route template into segments, treating a slash inside a `{…}`
+ *  regex constraint as part of the segment rather than a separator: hono
+ *  applies the brace regex to the remaining path, and the npm scoped-package
+ *  template carries a literal slash inside the braces that must not split it
+ *  into a param fragment plus a garbage literal. */
+function splitTemplateSegments(template: string): string[] {
+  const segments: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of template) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth = Math.max(0, depth - 1);
+    if (ch === "/" && depth === 0) {
+      segments.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  segments.push(current);
+  return segments;
+}
+
 /** Parse one template segment into its parameter shape, or `null` when the
  *  segment is a literal. Handles hono's suffixes: the optional `?` trails
  *  everything (`:name?`, `:name{.+}?`) and the regex constraint sits in
@@ -264,7 +287,7 @@ function parseParamSegment(seg: string): RouteParam | null {
  *  template, in order of appearance. */
 export function extractParams(template: string): RouteParam[] {
   const out: RouteParam[] = [];
-  for (const seg of template.split("/")) {
+  for (const seg of splitTemplateSegments(template)) {
     const p = parseParamSegment(seg);
     if (p && p.name) out.push(p);
   }
@@ -282,7 +305,7 @@ export function concretePath(
   values: Record<string, string>,
 ): string | null {
   const segments: string[] = [];
-  for (const seg of template.split("/")) {
+  for (const seg of splitTemplateSegments(template)) {
     const p = parseParamSegment(seg);
     if (!p) {
       segments.push(seg);
@@ -338,7 +361,9 @@ export function paramsFromExample(
     }
   }
   const exampleSegments = path.split("/").filter((s) => s !== "");
-  const templateSegments = template.split("/").filter((s) => s !== "");
+  const templateSegments = splitTemplateSegments(template).filter(
+    (s) => s !== "",
+  );
   const parsed = templateSegments.map(parseParamSegment);
   // A catch-all parameter eats the rest of the example: everything from its
   // position on (joined back with slashes, the shape concretePath keeps).
@@ -392,7 +417,7 @@ export function paramsFromExample(
 export function templateMatches(concrete: string, template: string): boolean {
   const path = (concrete.split(/[?#]/)[0] ?? "").replace(/^\/+|\/+$/g, "");
   const c = path === "" ? [""] : path.split("/");
-  const t = template.replace(/^\/+|\/+$/g, "").split("/");
+  const t = splitTemplateSegments(template.replace(/^\/+|\/+$/g, ""));
   let i = 0;
   for (; i < t.length; i++) {
     const seg = t[i];

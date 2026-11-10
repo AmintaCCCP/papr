@@ -36,6 +36,62 @@ pub fn route_from_url(input: &str) -> Option<String> {
     Some(route.to_string())
 }
 
+/// Environment-variable entry limits, shared by the marketplace's save path
+/// (the Tauri command validates against them) and the engine's env merge
+/// (`rsshub_enabled_env` filters stale or hand-edited rows against them, so
+/// one bad row cannot wedge the spawn with an unexplainable OS error).
+/// The value ceiling keeps a single entry clear of the `execve` E2BIG
+/// threshold (~128 KiB on 4 KiB-page Linux systems) with room to spare.
+pub const MAX_ENV_KEY_BYTES: usize = 128;
+pub const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
+
+/// `true` for environment variable names a child process can carry:
+/// `[A-Za-z_][A-Za-z0-9_]*` — the shape of every variable RSSHub documents
+/// (`BILIBILI_COOKIE_<uid>`, `GITHUB_TOKEN`, …). Anything else (`=`, spaces,
+/// control characters, the empty name) is refused.
+pub fn valid_env_key(key: &str) -> bool {
+    if key.len() > MAX_ENV_KEY_BYTES {
+        return false;
+    }
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `true` for environment values an `execve` can carry: no NUL (it
+/// terminates the C string) and within the length ceiling.
+pub fn valid_env_value(value: &str) -> bool {
+    !value.contains('\0') && value.len() <= MAX_ENV_VALUE_BYTES
+}
+
+/// Split a route template into segments, treating a `/` inside a `{…}`
+/// regex constraint as part of the segment rather than a separator: hono
+/// applies the brace regex to the remaining path, and the npm scoped-package
+/// template (`:name{(@[a-z0-9-~][a-z0-9-._~]*/)?…}`) carries a literal `/`
+/// inside the braces that must not split it into a param fragment plus a
+/// garbage literal.
+fn split_template_segments(template: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in template.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => {
+                segments.push(&template[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&template[start..]);
+    segments
+}
+
 /// True when a concrete route invocation (`concrete`, e.g. a feed's
 /// `rsshub://<path>` path part) instantiates the installed route `template`.
 ///
@@ -60,7 +116,7 @@ pub fn route_from_url(input: &str) -> Option<String> {
 pub fn template_matches(concrete: &str, template: &str) -> bool {
     let path = concrete.split(['?', '#']).next().unwrap_or("");
     let c_segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let t_segments: Vec<&str> = template.trim_matches('/').split('/').collect();
+    let t_segments: Vec<&str> = split_template_segments(template.trim_matches('/'));
     let mut consumed = 0usize;
     for (index, t) in t_segments.iter().enumerate() {
         let is_param = t.starts_with(':');
@@ -250,5 +306,32 @@ mod tests {
             "/bangumi.moe/tag1/tag2",
             "/bangumi.moe/:tags{.+}?"
         ));
+    }
+
+    #[test]
+    fn template_matches_does_not_split_inside_braces() {
+        // The npm scoped-package template carries a literal `/` inside its
+        // regex: splitting there would turn the tail into a garbage literal
+        // segment no concrete path could satisfy.
+        let npm = "/npm/package/:name{(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*}";
+        assert!(template_matches("/npm/package/react", npm));
+        assert!(template_matches("/npm/package/@rsshub/app", npm));
+        assert!(!template_matches("/npm/package", npm));
+        assert!(!template_matches("/npm/other/react", npm));
+    }
+
+    #[test]
+    fn valid_env_keys_and_values_reject_what_exec_cannot_carry() {
+        assert!(valid_env_key("GITHUB_TOKEN"));
+        assert!(valid_env_key("_X"));
+        assert!(valid_env_key("BILIBILI_COOKIE_123"));
+        assert!(!valid_env_key(""));
+        assert!(!valid_env_key("9BAD"));
+        assert!(!valid_env_key("A=B"));
+        assert!(!valid_env_key("A B"));
+        assert!(!valid_env_key(&"x".repeat(MAX_ENV_KEY_BYTES + 1)));
+        assert!(valid_env_value("token-value with spaces"));
+        assert!(!valid_env_value("a\0b"));
+        assert!(!valid_env_value(&"x".repeat(MAX_ENV_VALUE_BYTES + 1)));
     }
 }

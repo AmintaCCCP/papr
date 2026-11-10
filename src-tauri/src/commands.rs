@@ -396,24 +396,20 @@ pub async fn rsshub_route_set_enabled(
 }
 
 /// Replace a route's environment variables. Values must all be strings — the
-/// engine passes them straight into the child process environment. Names are
-/// restricted to what a process environment can carry on every platform
-/// (letters, digits, underscores) and values may not contain NUL or exceed a
-/// sane ceiling, so a stray paste cannot break the engine spawn with a
-/// cryptic OS error.
+/// engine passes them straight into the child process environment. The
+/// shared `rsshub::valid_env_key` / `valid_env_value` limits apply (names a
+/// process environment can carry, values free of NUL and within the execve
+/// E2BIG headroom) so a stray paste cannot break the engine spawn with a
+/// cryptic OS error; the engine's env merge re-applies them to stale rows.
 #[tauri::command]
 pub async fn rsshub_route_set_env(
     state: State<'_, AppState>,
     path: String,
     env: BTreeMap<String, String>,
 ) -> AppResult<()> {
-    const MAX_ENV_KEY_BYTES: usize = 128;
-    const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
     let path = normalize_route_path(&path);
-    if env
-        .keys()
-        .any(|k| k.len() > MAX_ENV_KEY_BYTES || !valid_env_key(k))
-        || env.values().any(|v| v.contains('\0') || v.len() > MAX_ENV_VALUE_BYTES)
+    if env.keys().any(|k| !rsshub::valid_env_key(k))
+        || env.values().any(|v| !rsshub::valid_env_value(v))
     {
         return Err(AppError::code("rsshubEnvInvalid"));
     }
@@ -429,20 +425,6 @@ pub async fn rsshub_route_set_env(
     // new variables are actually in its process environment.
     state.engine.shutdown().await;
     Ok(())
-}
-
-/// `true` for environment variable names a child process can carry:
-/// `[A-Za-z_][A-Za-z0-9_]*` — the shape of every variable RSSHub documents
-/// (`BILIBILI_COOKIE_<uid>`, `GITHUB_TOKEN`, …). Anything else (`=`, spaces,
-/// control characters) is refused at save time rather than failing the
-/// engine spawn later with a cryptic OS error.
-fn valid_env_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Route paths come in both key forms — normalize to the catalog's canonical
@@ -591,18 +573,18 @@ async fn add_rsshub_feed(
         .filter(|r| !r.is_empty())
         .ok_or_else(|| AppError::code("rsshubRouteInvalid"))?;
 
-    // A subscription only ever refreshes when an installed route template
-    // covers its path — the engine refresh leg gates on the registry and
-    // quietly skips a feed that matches nothing. Refusing here turns that
-    // silent never-refresh trap into an actionable error at add time (the
-    // marketplace installs the template before subscribing, so its flow is
-    // unaffected).
+    // A subscription only ever refreshes when an *enabled* installed route
+    // template covers its path — the engine refresh leg gates on the
+    // registry (enabled templates only) and quietly skips a feed that
+    // matches nothing. Refusing here turns that silent never-refresh trap
+    // into an actionable error at add time (the marketplace installs the
+    // template before subscribing, so its flow is unaffected). The DB read
+    // propagates: a read failure is not "route not installed".
     {
         let conn = state.read().await;
-        let covered = db::rsshub_routes_list(&conn)
-            .unwrap_or_default()
+        let covered = db::rsshub_routes_list(&conn)?
             .iter()
-            .any(|t| rsshub::template_matches(&route, &t.route_path));
+            .any(|t| t.enabled && rsshub::template_matches(&route, &t.route_path));
         if !covered {
             return Err(AppError::code("rsshubRouteNotInstalled"));
         }
