@@ -127,8 +127,10 @@ pub struct EngineInfo {
     /// The bundled Node runtime version.
     #[serde(alias = "node_version")]
     pub node_version: String,
-    /// When this engine was installed into the local root.
-    #[serde(alias = "installed_at")]
+    /// When this engine was installed into the local root. Build-time
+    /// manifests don't carry it (the installer stamps it), so reading an
+    /// archive manifest must tolerate its absence.
+    #[serde(default, alias = "installed_at")]
     pub installed_at: String,
 }
 

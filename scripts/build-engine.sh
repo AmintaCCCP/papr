@@ -207,7 +207,9 @@ sha256_of() {
 
 ARCHIVE="$OUT/rsshub-engine-$PLATFORM-$NODE_VERSION-${RSSHUB_REV:0:12}.tar.gz"
 echo "==> packing $ARCHIVE"
-tar -czf "$ARCHIVE" -C "$STAGING" .
+# COPYFILE_DISABLE keeps macOS BSD tar from packing AppleDouble `._` files
+# for every extended-attribute entry (pure junk in the distributed archive).
+COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" -C "$STAGING" .
 SHASUM="$(sha256_of "$ARCHIVE")"
 printf '%s  %s\n' "$SHASUM" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
 rm -rf "$STAGING"
