@@ -39,5 +39,11 @@ flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 
+# Unix only: `sysconf(_SC_ARG_MAX)` sizes the engine child's environment
+# budget to what execve on this kernel actually accepts (RLIMIT_STACK can
+# push it far below any fixed ceiling on Linux).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

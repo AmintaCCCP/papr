@@ -114,14 +114,63 @@ const ENV_ALLOWLIST: &[&str] = &[
     "PROXY_URI",
 ];
 
-/// Ceiling on the engine child's *total* environment size (names + values,
-/// bytes, including the C-string separators). `execve` caps argv + env
-/// together (`E2BIG` past the platform limit — Linux ≈ 2 MiB via
-/// `_SC_ARG_MAX`), so individually valid values (`rsshub::MAX_ENV_VALUE_BYTES`
-/// each) can still accumulate past it once merged across routes. A 1 MiB
-/// budget leaves generous room for argv while turning an over-limit spawn
-/// into a coded, actionable error instead of a cryptic OS failure.
+/// Sanity ceiling on the engine child's *total* environment size (names +
+/// values, bytes, including the C-string separators). `execve` caps argv +
+/// env together (`E2BIG` past the platform limit), so individually valid
+/// values (`rsshub::MAX_ENV_VALUE_BYTES` each) can still accumulate past it
+/// once merged across routes. The *effective* budget adapts to what this
+/// kernel actually accepts ([`execve_budget`]); this fixed ceiling only
+/// keeps a host with a huge `ARG_MAX` from accepting environments that are
+/// almost certainly a mistake.
 const MAX_TOTAL_ENV_BYTES: usize = 1024 * 1024;
+/// Headroom subtracted from the platform's `ARG_MAX` for argv (the node
+/// binary + entry path) and the kernel's per-string accounting slop.
+const ARGV_HEADROOM_BYTES: usize = 64 * 1024;
+/// Floor for the effective budget: even a tiny `RLIMIT_STACK`-derived
+/// `ARG_MAX` (Linux: soft stack / 4, floored at 32 pages ≈ 128 KiB) leaves
+/// this much room for a real environment, and a budget of zero would error
+/// every start regardless of configuration.
+const MIN_ENV_BUDGET_BYTES: usize = 96 * 1024;
+/// `E2BIG` — the errno `execve` returns when argv+env exceed the platform
+/// limit. The number is the same across the Unix targets we ship (Linux,
+/// macOS).
+#[cfg(unix)]
+const E2BIG: i32 = libc::E2BIG;
+
+/// The environment size this process's `execve` actually accepts, as a
+/// budget: `ARG_MAX − argv headroom`, clamped to the sanity ceiling. On
+/// Linux `_SC_ARG_MAX` already reflects the current `RLIMIT_STACK` (soft
+/// stack / 4, floored at 32 pages), so a low stack limit shrinks the budget
+/// instead of failing the spawn with `E2BIG`. Non-Unix platforms have no
+/// portable `ARG_MAX`; they get the fixed ceiling.
+fn execve_budget() -> usize {
+    budget_for(platform_arg_max())
+}
+
+/// The budget arithmetic, parameterized over the platform's `ARG_MAX` so the
+/// low-stack shape is testable without mutating this process's rlimits.
+fn budget_for(arg_max: Option<usize>) -> usize {
+    let budget = match arg_max {
+        Some(arg_max) => arg_max.saturating_sub(ARGV_HEADROOM_BYTES),
+        None => MAX_TOTAL_ENV_BYTES,
+    };
+    budget.clamp(MIN_ENV_BUDGET_BYTES, MAX_TOTAL_ENV_BYTES)
+}
+
+#[cfg(unix)]
+fn platform_arg_max() -> Option<usize> {
+    // `sysconf(_SC_ARG_MAX)` ≥ 1 MiB on macOS; on Linux it tracks
+    // `RLIMIT_STACK`. A negative or failed query falls back to the ceiling.
+    match unsafe { libc::sysconf(libc::_SC_ARG_MAX) } {
+        n if n > 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_arg_max() -> Option<usize> {
+    None
+}
 
 /// The `engine.json` manifest. Written by `scripts/build-engine.sh` (camelCase)
 /// and by the installer after a successful install; snake_case aliases are
@@ -359,9 +408,7 @@ impl EngineManager {
             "rsshub engine: starting {} on 127.0.0.1:{port}",
             node_bin.display()
         );
-        let child = cmd
-            .spawn()
-            .map_err(|e| AppError::other(format!("rsshub engine: spawn: {e}")))?;
+        let child = cmd.spawn().map_err(|e| map_spawn_error(&e))?;
 
         if wait_healthy(port, budget).await {
             let mut guard = self.running.lock().await;
@@ -556,7 +603,7 @@ const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// and `lib/index.ts` then binds 127.0.0.1. The header size matches RSSHub's
 /// own production start command). Returns the coded
 /// [`CODE_ENV_TOO_LARGE`](CODE_ENV_TOO_LARGE) error when the merged size
-/// exceeds [`MAX_TOTAL_ENV_BYTES`].
+/// exceeds what this platform's `execve` accepts ([`execve_budget`]).
 fn build_child_env(
     user_env: &BTreeMap<String, String>,
     port: u16,
@@ -576,14 +623,28 @@ fn build_child_env(
     env.insert("NODE_OPTIONS".into(), "--max-http-header-size=32768".into());
 
     // NAME + '=' + value + NUL per entry — the layout execve charges for.
+    let budget = execve_budget();
     let total: usize = env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
-    if total > MAX_TOTAL_ENV_BYTES {
+    if total > budget {
         log::error!(
-            "rsshub engine: merged environment is {total} bytes, over the {MAX_TOTAL_ENV_BYTES}-byte budget"
+            "rsshub engine: merged environment is {total} bytes, over the {budget}-byte budget"
         );
         return Err(AppError::code(CODE_ENV_TOO_LARGE));
     }
     Ok(env)
+}
+
+/// Map a spawn failure onto the coded error space: `E2BIG` means the
+/// environment/argv budget check above was still too permissive for what
+/// this kernel accepts right now (budgets are advisory limits, errno is the
+/// truth) — surface the same actionable code instead of a cryptic OS error.
+fn map_spawn_error(err: &std::io::Error) -> AppError {
+    #[cfg(unix)]
+    if err.raw_os_error().is_some_and(|code| code == E2BIG) {
+        log::error!("rsshub engine: spawn failed with E2BIG — environment over the kernel's limit");
+        return AppError::code(CODE_ENV_TOO_LARGE);
+    }
+    AppError::other(format!("rsshub engine: spawn: {err}"))
 }
 
 /// Poll the engine's health endpoint until it answers or the budget runs out.
@@ -1130,6 +1191,39 @@ mod tests {
         }
         let err = build_child_env(&user, 49152).unwrap_err();
         assert_eq!(err.code_str(), CODE_ENV_TOO_LARGE);
+    }
+
+    #[test]
+    fn budget_tracks_the_platform_arg_max() {
+        // A generous ARG_MAX (macOS: 1 MiB) is capped by the sanity ceiling;
+        // Linux's big-stack 2 MiB case likewise.
+        assert_eq!(
+            budget_for(Some(1024 * 1024)),
+            MAX_TOTAL_ENV_BYTES - ARGV_HEADROOM_BYTES
+        );
+        assert_eq!(budget_for(Some(4 * 1024 * 1024)), MAX_TOTAL_ENV_BYTES);
+        // A small RLIMIT_STACK (512 KiB → ARG_MAX 128 KiB on Linux) shrinks
+        // the budget instead of letting the spawn fail with E2BIG; the floor
+        // keeps it above zero. The Linux kernel floors ARG_MAX at 32 pages
+        // (128 KiB), which stays above the floor budget.
+        assert_eq!(budget_for(Some(32 * 4096)), MIN_ENV_BUDGET_BYTES);
+        // No portable ARG_MAX (non-Unix, or a failed sysconf): the ceiling.
+        assert_eq!(budget_for(None), MAX_TOTAL_ENV_BYTES);
+        // The live budget never exceeds what this process's execve accepts.
+        if let Some(arg_max) = platform_arg_max() {
+            assert!(execve_budget() <= arg_max);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_error_maps_e2big_to_the_coded_key() {
+        let e2big = std::io::Error::from_raw_os_error(libc::E2BIG);
+        assert_eq!(map_spawn_error(&e2big).code_str(), CODE_ENV_TOO_LARGE);
+        let other = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_ne!(map_spawn_error(&other).code_str(), CODE_ENV_TOO_LARGE);
+        let plain = std::io::Error::other("pathological");
+        assert_ne!(map_spawn_error(&plain).code_str(), CODE_ENV_TOO_LARGE);
     }
 
     #[cfg(unix)]
