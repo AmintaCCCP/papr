@@ -44,6 +44,7 @@ pub const CODE_ENGINE_START: &str = "rsshubEngineStart";
 pub const CODE_ROUTE_FETCH: &str = "rsshubRouteFetch";
 pub const CODE_ARCHIVE_INVALID: &str = "rsshubEngineArchiveInvalid";
 pub const CODE_ARCHIVE_CHECKSUM: &str = "rsshubEngineChecksum";
+pub const CODE_ENV_TOO_LARGE: &str = "rsshubEngineEnvTooLarge";
 
 /// Health-check budget when *starting* the engine. First launch loads
 /// thousands of route modules; a cold start can take tens of seconds.
@@ -112,6 +113,15 @@ const ENV_ALLOWLIST: &[&str] = &[
     "no_proxy",
     "PROXY_URI",
 ];
+
+/// Ceiling on the engine child's *total* environment size (names + values,
+/// bytes, including the C-string separators). `execve` caps argv + env
+/// together (`E2BIG` past the platform limit — Linux ≈ 2 MiB via
+/// `_SC_ARG_MAX`), so individually valid values (`rsshub::MAX_ENV_VALUE_BYTES`
+/// each) can still accumulate past it once merged across routes. A 1 MiB
+/// budget leaves generous room for argv while turning an over-limit spawn
+/// into a coded, actionable error instead of a cryptic OS failure.
+const MAX_TOTAL_ENV_BYTES: usize = 1024 * 1024;
 
 /// The `engine.json` manifest. Written by `scripts/build-engine.sh` (camelCase)
 /// and by the installer after a successful install; snake_case aliases are
@@ -317,6 +327,10 @@ impl EngineManager {
 
         let port = free_port()
             .map_err(|e| AppError::other(format!("rsshub engine: no free port: {e}")))?;
+        // Enforce the execve size budget before touching the log files: an
+        // over-budget environment fails the spawn with E2BIG, and the coded
+        // error here is the actionable form of that failure.
+        let child_env = build_child_env(user_env, port)?;
         let log_path = self.root.join("engine.log");
 
         // The log file is opened twice (stdout + stderr share it in append
@@ -337,28 +351,9 @@ impl EngineManager {
             .stdout(std::process::Stdio::from(log_out))
             .stderr(std::process::Stdio::from(log_err))
             .kill_on_drop(true);
-        // Allowlisted host environment…
-        for key in ENV_ALLOWLIST {
-            if let Ok(value) = std::env::var(key) {
-                cmd.env(key, value);
-            }
-        }
-        // …then the user's route variables, which win on collision with the
-        // host environment…
-        for (k, v) in user_env {
+        for (k, v) in &child_env {
             cmd.env(k, v);
         }
-        // …and finally the manager's own variables, which the user's route
-        // variables must NOT override: `PORT` must match the port the health
-        // check probes, and `LISTEN_INADDR_ANY=0` is what keeps RSSHub bound
-        // to 127.0.0.1 — its default (bind any) would expose the engine, user
-        // cookies included, to the whole network. (RSSHub's `toBoolean` reads
-        // "0" as false; `lib/index.ts` then binds `127.0.0.1`.) The header
-        // size matches RSSHub's own production start command.
-        cmd.env("PORT", port.to_string())
-            .env("NODE_ENV", "production")
-            .env("LISTEN_INADDR_ANY", "0")
-            .env("NODE_OPTIONS", "--max-http-header-size=32768");
 
         log::info!(
             "rsshub engine: starting {} on 127.0.0.1:{port}",
@@ -550,6 +545,46 @@ pub fn loopback_client() -> &'static reqwest::Client {
 /// includes the route's own upstream scrape (possibly a slow site), so this
 /// is deliberately wider than the feed client's default.
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Assemble the engine child's environment and enforce the execve size
+/// budget: allowlisted host variables first, then the user's route variables
+/// (winning on collision), then the manager's own fixed variables — which
+/// the user's route variables must NOT override (`PORT` must match the port
+/// the health check probes, and `LISTEN_INADDR_ANY=0` keeps RSSHub bound to
+/// 127.0.0.1 — its default (bind any) would expose the engine, user cookies
+/// included, to the whole network; RSSHub's `toBoolean` reads "0" as false
+/// and `lib/index.ts` then binds 127.0.0.1. The header size matches RSSHub's
+/// own production start command). Returns the coded
+/// [`CODE_ENV_TOO_LARGE`](CODE_ENV_TOO_LARGE) error when the merged size
+/// exceeds [`MAX_TOTAL_ENV_BYTES`].
+fn build_child_env(
+    user_env: &BTreeMap<String, String>,
+    port: u16,
+) -> AppResult<BTreeMap<String, String>> {
+    let mut env: BTreeMap<String, String> = ENV_ALLOWLIST
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect();
+    env.extend(user_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.insert("PORT".into(), port.to_string());
+    env.insert("NODE_ENV".into(), "production".into());
+    env.insert("LISTEN_INADDR_ANY".into(), "0".into());
+    env.insert("NODE_OPTIONS".into(), "--max-http-header-size=32768".into());
+
+    // NAME + '=' + value + NUL per entry — the layout execve charges for.
+    let total: usize = env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+    if total > MAX_TOTAL_ENV_BYTES {
+        log::error!(
+            "rsshub engine: merged environment is {total} bytes, over the {MAX_TOTAL_ENV_BYTES}-byte budget"
+        );
+        return Err(AppError::code(CODE_ENV_TOO_LARGE));
+    }
+    Ok(env)
+}
 
 /// Poll the engine's health endpoint until it answers or the budget runs out.
 ///
@@ -1068,6 +1103,33 @@ mod tests {
         let err = mgr.ensure(&BTreeMap::new()).await.unwrap_err();
         assert_eq!(err.code_str(), CODE_ENGINE_MISSING);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn build_child_env_layers_host_user_and_fixed_vars() {
+        // The manager's own variables survive a colliding user entry: PORT,
+        // NODE_ENV, LISTEN_INADDR_ANY and NODE_OPTIONS are not user-overrideable.
+        let mut user = BTreeMap::new();
+        user.insert("PORT".to_string(), "99999".to_string());
+        user.insert("MY_TOKEN".to_string(), "secret".to_string());
+        let env = build_child_env(&user, 49152).unwrap();
+        assert_eq!(env.get("PORT").map(String::as_str), Some("49152"));
+        assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
+        assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
+        assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
+    }
+
+    #[test]
+    fn build_child_env_refuses_budget_overrun() {
+        // Individually valid entries (each well under the per-value ceiling)
+        // must still trip the *total* budget instead of failing execve with
+        // E2BIG later.
+        let mut user = BTreeMap::new();
+        for i in 0..24 {
+            user.insert(format!("BULK_VAR_{i}"), "v".repeat(60_000));
+        }
+        let err = build_child_env(&user, 49152).unwrap_err();
+        assert_eq!(err.code_str(), CODE_ENV_TOO_LARGE);
     }
 
     #[cfg(unix)]
