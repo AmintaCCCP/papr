@@ -94,7 +94,12 @@ pub async fn run_integration(
     // receives is a real summary instead of the plain-text excerpt fallback.
     // A failure fails the whole send loudly rather than silently saving a
     // non-summary description.
-    if use_ai_summary && article.ai_summary.as_deref().map_or(true, |s| s.trim().is_empty()) {
+    if use_ai_summary
+        && article
+            .ai_summary
+            .as_deref()
+            .map_or(true, |s| s.trim().is_empty())
+    {
         ensure_ai_summary(&state, &mut article).await?;
     }
     let ctx = ArticleContext::build(article, feed_url).await?;
@@ -132,14 +137,7 @@ async fn ensure_ai_summary(
         )
     };
     let http = state.http();
-    let text = crate::ai::complete_chat(
-        &http,
-        &cfg,
-        &system,
-        &user,
-        crate::ai::MAX_TOKENS,
-    )
-    .await?;
+    let text = crate::ai::complete_chat(&http, &cfg, &system, &user, crate::ai::MAX_TOKENS).await?;
     let text = text.trim();
     if text.is_empty() {
         return Err(AppError::code("aiEmptyResponse"));

@@ -10,4 +10,5 @@ pub mod newsletter;
 pub mod parse;
 pub mod parsers;
 pub mod refresh;
+pub mod rsshub;
 pub mod sources;

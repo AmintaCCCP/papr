@@ -72,9 +72,13 @@ fn starts_valid_entity(rest: &str) -> bool {
         };
         if let Some(semi) = body.find(';') {
             return semi > 0
-                && body[..semi]
-                    .chars()
-                    .all(|c| if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() });
+                && body[..semi].chars().all(|c| {
+                    if hex {
+                        c.is_ascii_hexdigit()
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                });
         }
     }
     false
@@ -350,5 +354,4 @@ mod tests {
         assert_eq!(feeds[0].title, "Today");
         assert_eq!(feeds[1].feed_url, "https://y.example/feed");
     }
-
 }

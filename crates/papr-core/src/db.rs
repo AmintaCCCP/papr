@@ -6,6 +6,8 @@ use crate::models::*;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -302,6 +304,23 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         // databases remain readable without resetting or discarding data.
         M::up("ALTER TABLE feeds ADD COLUMN custom_favicon INTEGER NOT NULL DEFAULT 0;"),
         M::up("ALTER TABLE feeds ADD COLUMN position INTEGER NOT NULL DEFAULT 0;"),
+        // v22 — installed RSSHub route registry (the route marketplace). One
+        // row per route the user installed from the bundled catalog, keyed by
+        // the route's template path (`/bilibili/user/video/:id`). `enabled`
+        // gates refresh of its subscriptions; `env_json` is the route's
+        // environment variables (`{"NCM_COOKIES": "..."}`) merged into the
+        // local engine's process environment at spawn. Subscriptions are
+        // ordinary feeds rows with `source_type = 'rsshub'`.
+        M::up(
+            r#"
+            CREATE TABLE rsshub_routes (
+                route_path   TEXT PRIMARY KEY,
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                env_json     TEXT NOT NULL DEFAULT '{}',
+                installed_at TEXT NOT NULL
+            );
+            "#,
+        ),
     ])
 });
 
@@ -561,14 +580,15 @@ pub fn list_feeds(conn: &Connection) -> AppResult<Vec<Feed>> {
 /// the last two are the stored revalidators for a conditional GET.
 pub type FeedToRefresh = (i64, String, Option<String>, Option<String>);
 
-/// All feeds that need an HTTP fetch. Newsletter and parser sources are
-/// excluded — newsletters are polled over IMAP and parser feeds are fetched
-/// by the parser leg (see `refresh::poll_parsers`); neither feed_url is a
-/// plain feed document a conditional GET could parse.
+/// All feeds that need an HTTP fetch. Newsletter, parser and rsshub sources
+/// are excluded — newsletters are polled over IMAP, parser feeds are fetched
+/// by the parser leg (see `refresh::poll_parsers`) and rsshub routes run
+/// through the local engine (see `refresh::poll_rsshub`); none of their
+/// feed_urls is a plain feed document a conditional GET could parse.
 pub fn feeds_to_refresh(conn: &Connection) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x')",
+         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub')",
     )?;
     let rows = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -590,7 +610,7 @@ pub const REFRESH_OFF_MINUTES: i64 = 525_600;
 pub fn feeds_due_for_refresh(conn: &Connection, global_min: i64) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x')
+         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub')
            AND COALESCE(refresh_interval_min, ?1) < ?2
            AND ( last_fetched_at IS NULL
                  OR (julianday('now') - julianday(last_fetched_at)) * 1440.0
@@ -606,11 +626,12 @@ pub fn feeds_due_for_refresh(conn: &Connection, global_min: i64) -> AppResult<Ve
 
 /// Non-parser feeds for a single feed id — the per-feed manual refresh. An
 /// empty result means the id is unknown or names a source polled elsewhere
-/// (a newsletter over IMAP, or an X timeline via the parser leg).
+/// (a newsletter over IMAP, an X timeline via the parser leg, or an rsshub
+/// route via the engine leg).
 pub fn feeds_to_refresh_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x') AND id = ?1",
+         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub') AND id = ?1",
     )?;
     let rows = stmt
         .query_map(params![feed_id], |r| {
@@ -627,7 +648,7 @@ pub fn feeds_to_refresh_in_folder(
 ) -> AppResult<Vec<FeedToRefresh>> {
     let mut stmt = conn.prepare(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x') AND folder_id = ?1",
+         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub') AND folder_id = ?1",
     )?;
     let rows = stmt
         .query_map(params![folder_id], |r| {
@@ -755,18 +776,19 @@ pub fn delete_feed(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// Feeds for OPML export as `(title, feed_url, folder)` tuples. Newsletter
-/// sources are excluded, as are parser feeds: OPML is an RSS-subscription
+/// Feeds for OPML export as `(title, feed_url, folder)` tuples. Newsletter,
+/// parser and rsshub sources are excluded: OPML is an RSS-subscription
 /// interchange format. A newsletter's `feed_url` is a synthetic `imap://…`
-/// string and a parser feed's `x.com/<user>` URL is not a feed document —
-/// exporting either would emit an `<outline>` any reader (Papr's own
-/// `import_opml` included) would treat as an RSS feed and then fail to
+/// string, a parser feed's `x.com/<user>` URL is not a feed document, and an
+/// `rsshub://` short link only resolves inside papr (the local engine) —
+/// exporting any of the three would emit an `<outline>` any reader (Papr's
+/// own `import_opml` included) would treat as an RSS feed and then fail to
 /// HTTP-fetch forever, with the credentials not even carried.
 pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Option<String>)>> {
     let mut stmt = conn.prepare(
         "SELECT f.title, f.feed_url, fo.name
          FROM feeds f LEFT JOIN folders fo ON fo.id = f.folder_id
-         WHERE f.source_type NOT IN ('newsletter', 'x')
+         WHERE f.source_type NOT IN ('newsletter', 'x', 'rsshub')
          ORDER BY fo.name, f.title",
     )?;
     let rows = stmt
@@ -776,11 +798,12 @@ pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Opt
 }
 
 /// Feed URLs the sync layer should mirror onto the server. Excludes
-/// `newsletter` and parser sources (those have no upstream feed URL the
-/// server could subscribe to), matching the OPML-export filter.
+/// `newsletter`, parser and rsshub sources (those have no upstream feed URL
+/// the server could subscribe to), matching the OPML-export filter.
 pub fn feed_urls_for_sync(conn: &Connection) -> AppResult<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT feed_url FROM feeds WHERE source_type NOT IN ('newsletter', 'x') AND feed_url <> ''",
+        "SELECT feed_url FROM feeds
+         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub') AND feed_url <> ''",
     )?;
     let rows = stmt
         .query_map([], |r| r.get(0))?
@@ -1157,6 +1180,194 @@ pub fn parser_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Ve
         conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x' AND folder_id = ?1")?;
     let rows = stmt
         .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+// ─────────────────────────── rsshub routes ───────────────────────────
+
+/// One installed RSSHub route (a row of `rsshub_routes`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RsshubRouteRow {
+    /// The route's *template* path, e.g. `/bilibili/user/video/:id`.
+    pub route_path: String,
+    /// When disabled, its subscriptions are skipped by the engine refresh leg.
+    pub enabled: bool,
+    /// The route's environment variables as a JSON object of strings.
+    pub env_json: String,
+    pub installed_at: String,
+}
+
+/// Install (or re-install) a route template. Enabling state and environment
+/// variables survive a re-install — the marketplace's "install" on an
+/// already-installed route is a no-op for configuration.
+pub fn rsshub_route_upsert(conn: &Connection, route_path: &str) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO rsshub_routes(route_path, enabled, env_json, installed_at)
+         VALUES (?1, 1, '{}', datetime('now'))
+         ON CONFLICT(route_path) DO UPDATE SET installed_at = excluded.installed_at",
+        params![route_path],
+    )?;
+    Ok(())
+}
+
+fn rsshub_route_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RsshubRouteRow> {
+    Ok(RsshubRouteRow {
+        route_path: r.get(0)?,
+        enabled: r.get::<_, i64>(1)? != 0,
+        env_json: r.get(2)?,
+        installed_at: r.get(3)?,
+    })
+}
+
+/// Every installed route, oldest install first (the env-merge order and the
+/// marketplace's "installed" list both want this).
+pub fn rsshub_routes_list(conn: &Connection) -> AppResult<Vec<RsshubRouteRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT route_path, enabled, env_json, installed_at
+         FROM rsshub_routes ORDER BY installed_at, route_path",
+    )?;
+    let rows = stmt
+        .query_map([], rsshub_route_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// One installed route by template path.
+pub fn rsshub_route_get(conn: &Connection, route_path: &str) -> AppResult<Option<RsshubRouteRow>> {
+    Ok(conn
+        .query_row(
+            "SELECT route_path, enabled, env_json, installed_at
+             FROM rsshub_routes WHERE route_path = ?1",
+            params![route_path],
+            rsshub_route_row,
+        )
+        .optional()?)
+}
+
+/// Toggle a route. Disabled routes stop refreshing their subscriptions but
+/// keep their environment variables.
+pub fn rsshub_route_set_enabled(
+    conn: &Connection,
+    route_path: &str,
+    enabled: bool,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE rsshub_routes SET enabled = ?2 WHERE route_path = ?1",
+        params![route_path, enabled as i64],
+    )?;
+    Ok(())
+}
+
+/// Replace a route's environment variables (`env_json` is a JSON object of
+/// strings; the caller validates).
+pub fn rsshub_route_set_env(conn: &Connection, route_path: &str, env_json: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE rsshub_routes SET env_json = ?2 WHERE route_path = ?1",
+        params![route_path, env_json],
+    )?;
+    Ok(())
+}
+
+/// Uninstall a route. Subscribed feeds (their `rsshub://` URLs) are left
+/// alone — the UI warns before calling this.
+pub fn rsshub_route_delete(conn: &Connection, route_path: &str) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM rsshub_routes WHERE route_path = ?1",
+        params![route_path],
+    )?;
+    Ok(())
+}
+
+/// The merged environment variables of every *enabled* route.
+///
+/// Each row's `env_json` is an object of string variables; rows merge in
+/// install order with later installs winning on name collision (deterministic
+/// because `rsshub_routes_list` orders by `installed_at`). Malformed JSON is
+/// skipped defensively — one corrupted row must not break engine start for
+/// every route; the marketplace UI rewrites `env_json` on the next save.
+pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
+    let mut merged = BTreeMap::new();
+    for row in rsshub_routes_list(conn).unwrap_or_default() {
+        if !row.enabled {
+            continue;
+        }
+        let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(&row.env_json)
+        else {
+            continue;
+        };
+        for (k, v) in map {
+            if let Some(s) = v.as_str() {
+                merged.insert(k, s.to_string());
+            }
+        }
+    }
+    merged
+}
+
+/// `(feed_id, feed_url, etag, last_modified)` for every rsshub feed —
+/// the shape the engine leg of `refresh_core` needs. Unlike parser feeds the
+/// engine serves real conditional-GET headers, so the revalidators travel
+/// along ([`FeedToRefresh`]).
+pub fn rsshub_feeds_to_refresh(conn: &Connection) -> AppResult<Vec<FeedToRefresh>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_url, etag, last_modified FROM feeds WHERE source_type = 'rsshub'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// rsshub feeds that are *due*, applying the same per-feed/global interval
+/// logic as [`feeds_due_for_refresh`]. Used by the background scheduler; the
+/// manual refresh polls every rsshub feed via [`rsshub_feeds_to_refresh`].
+pub fn rsshub_feeds_due_for_refresh(
+    conn: &Connection,
+    global_min: i64,
+) -> AppResult<Vec<FeedToRefresh>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_url, etag, last_modified FROM feeds WHERE source_type = 'rsshub'
+         AND COALESCE(refresh_interval_min, ?1) < ?2
+         AND ( last_fetched_at IS NULL
+               OR (julianday('now') - julianday(last_fetched_at)) * 1440.0
+                  >= COALESCE(refresh_interval_min, ?1) )",
+    )?;
+    let rows = stmt
+        .query_map(params![global_min, REFRESH_OFF_MINUTES], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// rsshub feeds for a single feed id — the per-feed manual refresh. Empty
+/// when the id is not an rsshub feed.
+pub fn rsshub_feeds_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<FeedToRefresh>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_url, etag, last_modified FROM feeds
+         WHERE source_type = 'rsshub' AND id = ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![feed_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// rsshub feeds in a folder — the per-folder manual refresh.
+pub fn rsshub_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Vec<FeedToRefresh>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_url, etag, last_modified FROM feeds
+         WHERE source_type = 'rsshub' AND folder_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![folder_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -2730,7 +2941,7 @@ mod tests {
 
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22] {
+        for version in [0, 19, 20, 21, 22, 23] {
             let path = std::env::temp_dir().join(format!(
                 "papr-migrations-{}-{}-{}.db",
                 std::process::id(),
@@ -2741,7 +2952,7 @@ mod tests {
                     .as_nanos()
             ));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(21)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(22)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
@@ -2753,25 +2964,27 @@ mod tests {
             if version >= 21 {
                 conn.execute("UPDATE feeds SET position=42", []).unwrap();
             }
-            if version == 22 {
-                conn.pragma_update(None, "user_version", 22).unwrap();
+            if version == 23 {
+                // A database from a *future* build (higher schema version than
+                // this binary knows) must be refused, not silently migrated.
+                conn.pragma_update(None, "user_version", 23).unwrap();
             }
             drop(conn);
             let result = open(&path);
-            if version == 22 {
+            if version == 23 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    22
+                    23
                 );
             } else {
                 let conn = result.unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    21
+                    22
                 );
                 if version > 0 {
                     let values: (String, i64, i64) = conn
@@ -4846,5 +5059,142 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "Tech");
+    }
+    #[test]
+    fn rsshub_route_registry_round_trips() {
+        let conn = test_conn();
+        assert!(rsshub_routes_list(&conn).unwrap().is_empty());
+
+        rsshub_route_upsert(&conn, "/bilibili/user/video/:id").unwrap();
+        rsshub_route_upsert(&conn, "/github/activity/:user").unwrap();
+        let rows = rsshub_routes_list(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.enabled));
+
+        // Re-installing keeps the configuration (enabled + env).
+        rsshub_route_set_env(
+            &conn,
+            "/bilibili/user/video/:id",
+            r#"{"BILIBILI_COOKIE_1":"x"}"#,
+        )
+        .unwrap();
+        rsshub_route_set_enabled(&conn, "/bilibili/user/video/:id", false).unwrap();
+        rsshub_route_upsert(&conn, "/bilibili/user/video/:id").unwrap();
+        let row = rsshub_route_get(&conn, "/bilibili/user/video/:id")
+            .unwrap()
+            .unwrap();
+        assert!(!row.enabled, "re-install must not re-enable");
+        assert_eq!(row.env_json, r#"{"BILIBILI_COOKIE_1":"x"}"#);
+
+        rsshub_route_delete(&conn, "/github/activity/:user").unwrap();
+        assert!(rsshub_route_get(&conn, "/github/activity/:user")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rsshub_enabled_env_merges_enabled_rows_only() {
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/a/one/:id").unwrap();
+        rsshub_route_upsert(&conn, "/a/two/:id").unwrap();
+        rsshub_route_upsert(&conn, "/a/three/:id").unwrap();
+        rsshub_route_set_env(&conn, "/a/one/:id", r#"{"SHARED":"first","ONLY_A":"1"}"#).unwrap();
+        rsshub_route_set_env(&conn, "/a/two/:id", r#"{"SHARED":"second","ONLY_B":"2"}"#).unwrap();
+        // Disabled routes contribute nothing.
+        rsshub_route_set_env(&conn, "/a/three/:id", r#"{"ONLY_C":"3"}"#).unwrap();
+        rsshub_route_set_enabled(&conn, "/a/three/:id", false).unwrap();
+
+        let env = rsshub_enabled_env(&conn);
+        assert_eq!(env.get("SHARED").map(String::as_str), Some("second"));
+        assert_eq!(env.get("ONLY_A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("ONLY_B").map(String::as_str), Some("2"));
+        assert!(!env.contains_key("ONLY_C"));
+        assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn rsshub_enabled_env_skips_malformed_rows() {
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/a/broken/:id").unwrap();
+        rsshub_route_upsert(&conn, "/a/good/:id").unwrap();
+        rsshub_route_set_env(&conn, "/a/broken/:id", "not json").unwrap();
+        rsshub_route_set_env(&conn, "/a/good/:id", r#"{"OK":"yes"}"#).unwrap();
+        let env = rsshub_enabled_env(&conn);
+        assert_eq!(env.get("OK").map(String::as_str), Some("yes"));
+        assert_eq!(env.len(), 1);
+    }
+
+    #[test]
+    fn rsshub_feed_queries_track_the_dedicated_source_type() {
+        let conn = test_conn();
+        let rss = insert_feed(
+            &conn,
+            "https://example.com/rss",
+            None,
+            "rss",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        let hub = insert_feed(
+            &conn,
+            "rsshub:///github/activity/DIYgod",
+            None,
+            "hub",
+            None,
+            SourceType::Rsshub,
+            None,
+        )
+        .unwrap();
+        let nl = insert_feed(
+            &conn,
+            "imap://box",
+            None,
+            "nl",
+            None,
+            SourceType::Newsletter,
+            None,
+        )
+        .unwrap();
+        let x = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "x",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+
+        // The plain-HTTP set excludes newsletters, parser and rsshub sources.
+        let http: Vec<i64> = feeds_to_refresh(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect();
+        assert_eq!(http, vec![rss]);
+
+        // The engine leg sees exactly the rsshub feeds, with revalidators.
+        let hub_feeds = rsshub_feeds_to_refresh(&conn).unwrap();
+        assert_eq!(hub_feeds.len(), 1);
+        assert_eq!(hub_feeds[0].0, hub);
+        assert_eq!(hub_feeds[0].1, "rsshub:///github/activity/DIYgod");
+        assert!(hub_feeds[0].2.is_none());
+
+        // Per-feed and per-folder scoping.
+        assert_eq!(rsshub_feeds_for_feed(&conn, rss).unwrap().len(), 0);
+        assert_eq!(rsshub_feeds_for_feed(&conn, hub).unwrap().len(), 1);
+        // OPML export and sync never leak rsshub:// URLs.
+        let export = feeds_for_export(&conn).unwrap();
+        assert!(export
+            .iter()
+            .all(|(_, url, _)| !url.starts_with("rsshub://")));
+        assert_eq!(export.len(), 1, "only the plain rss feed exports");
+        let sync = feed_urls_for_sync(&conn).unwrap();
+        assert!(sync.iter().all(|u| !u.starts_with("rsshub://")));
+
+        let _ = (nl, x);
     }
 }

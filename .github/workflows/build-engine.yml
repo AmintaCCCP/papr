@@ -1,0 +1,103 @@
+name: Engine build
+
+# Builds the bundled local RSSHub engine for every supported desktop
+# platform. Runs on demand and weekly (RSSHub moves fast; a stale engine
+# misses route fixes). Artifacts are attached to this run and, best-effort,
+# uploaded to the `engine` prerelease for the settings card's URL installer.
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays 03:40 UTC — off the busy top-of-hour slots.
+    - cron: "40 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-14
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: win-x64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # RSSHub master requires node ^24.15.
+          node-version: 24
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        # The version comes from RSSHub's packageManager field after the
+        # clone; pin a compatible one here so install is deterministic.
+        with:
+          version: 12
+
+      # The build caches (RSSHub clone, pnpm store, Node distribution) live
+      # under target/engine-cache keyed by a rolling ISO week — cheap
+      # rebuilds, no unbounded growth. The exact key only matches within one
+      # week, so the cache is saved once per week per platform instead of on
+      # every run; the restore-keys prefix still picks up the previous week's
+      # cache for a fresh build.
+      - name: Compute cache key (ISO week)
+        shell: bash
+        run: echo "ENGINE_WEEK=$(date +%G-W%V)" >> "$GITHUB_ENV"
+
+      - name: Restore engine build cache
+        uses: actions/cache@v4
+        with:
+          path: target/engine-cache
+          key: engine-cache-${{ matrix.platform }}-${{ env.ENGINE_WEEK }}
+          restore-keys: engine-cache-${{ matrix.platform }}-
+
+      - name: Build engine
+        shell: bash
+        run: scripts/build-engine.sh
+
+      - name: Upload run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsshub-engine-${{ matrix.platform }}
+          path: |
+            target/engine/*.tar.gz
+            target/engine/*.sha256
+          if-no-files-found: error
+
+  release:
+    # Best-effort: attach the archives to the rolling `engine` prerelease so
+    # the settings card's URL installer has stable links. A missing release
+    # or a token without push rights must not fail the build.
+    name: Attach to engine prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to the engine prerelease
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view engine --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create engine --repo "$GITHUB_REPOSITORY" \
+              --title "RSSHub engine builds" \
+              --notes "Rolling prerelease of papr's bundled local RSSHub engine archives. Checksums in the .sha256 files." \
+              --prerelease
+          gh release upload engine dist/*.tar.gz dist/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber

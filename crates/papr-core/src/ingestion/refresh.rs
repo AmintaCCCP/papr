@@ -13,6 +13,7 @@ use crate::db;
 use crate::error::AppResult;
 use crate::ingestion::newsletter;
 use crate::ingestion::parsers::{self, x};
+use crate::ingestion::rsshub::{self, engine::EngineManager};
 use crate::ingestion::{fetch, parse};
 use crate::models::{RefreshProgress, SourceType};
 use rusqlite::Connection;
@@ -130,10 +131,11 @@ async fn fetch_one(
 pub async fn refresh_core(
     db: &Mutex<Connection>,
     client: &reqwest::Client,
+    engine: Option<&EngineManager>,
     scope: RefreshScope,
     mut on_event: impl FnMut(RefreshProgress),
 ) -> AppResult<RefreshSummary> {
-    let (feeds, newsletters, parser_feeds, concurrency, dedup, rules) = {
+    let (feeds, newsletters, parser_feeds, rsshub_feeds, concurrency, dedup, rules) = {
         let conn = db.lock().await;
         // The global default interval for feeds without a per-feed override.
         let global_min = db::get_setting(&conn, "refresh_interval_min")
@@ -143,38 +145,51 @@ pub async fn refresh_core(
             .filter(|m| *m >= 5)
             .map(|m| m.min(db::REFRESH_OFF_MINUTES))
             .unwrap_or(30);
-        let (feeds, newsletters, parser_feeds) = match scope {
+        let (feeds, newsletters, parser_feeds, rsshub_feeds) = match scope {
             RefreshScope::All => (
                 db::feeds_to_refresh(&conn)?,
                 db::newsletter_sources_to_poll(&conn).unwrap_or_default(),
                 db::parser_feeds_to_refresh(&conn).unwrap_or_default(),
+                db::rsshub_feeds_to_refresh(&conn).unwrap_or_default(),
             ),
             RefreshScope::Due => (
                 db::feeds_due_for_refresh(&conn, global_min)?,
                 db::newsletter_sources_due_to_poll(&conn, global_min).unwrap_or_default(),
                 db::parser_feeds_due_for_refresh(&conn, global_min).unwrap_or_default(),
+                db::rsshub_feeds_due_for_refresh(&conn, global_min).unwrap_or_default(),
             ),
-            // The HTTP fetch set excludes newsletter and parser sources
-            // (`NOT IN ('newsletter','x')` in the queries), so a newsletter's
-            // synthetic `newsletter://` URL is never handed to `fetch_one` and
-            // an X feed is never fetched as a feed document; each is polled by
-            // its own leg below instead.
+            // The HTTP fetch set excludes newsletter / parser / rsshub sources
+            // (`NOT IN ('newsletter','x','rsshub')` in the queries), so a newsletter's
+            // synthetic `newsletter://` URL is never handed to `fetch_one`, an X
+            // feed is never fetched as a feed document, and an `rsshub://`
+            // short link never reaches a plain HTTP GET; each is polled by its
+            // own leg below instead.
             RefreshScope::Feed(id) => (
                 db::feeds_to_refresh_for_feed(&conn, id)?,
                 db::newsletter_sources_for_feed(&conn, id).unwrap_or_default(),
                 db::parser_feeds_for_feed(&conn, id).unwrap_or_default(),
+                db::rsshub_feeds_for_feed(&conn, id).unwrap_or_default(),
             ),
             RefreshScope::Folder(id) => (
                 db::feeds_to_refresh_in_folder(&conn, id)?,
                 db::newsletter_sources_in_folder(&conn, id).unwrap_or_default(),
                 db::parser_feeds_in_folder(&conn, id).unwrap_or_default(),
+                db::rsshub_feeds_in_folder(&conn, id).unwrap_or_default(),
             ),
         };
         let concurrency =
             db::setting_parsed::<i64>(&conn, "net_concurrency", 6).clamp(1, 16) as usize;
         let dedup = db::setting_flag(&conn, "dedup_enabled", false);
         let rules = db::active_rules(&conn).unwrap_or_default();
-        (feeds, newsletters, parser_feeds, concurrency, dedup, rules)
+        (
+            feeds,
+            newsletters,
+            parser_feeds,
+            rsshub_feeds,
+            concurrency,
+            dedup,
+            rules,
+        )
     };
 
     // Nothing due this cycle: emit a no-op Started/Finished and bow out before
@@ -183,6 +198,7 @@ pub async fn refresh_core(
         && feeds.is_empty()
         && newsletters.is_empty()
         && parser_feeds.is_empty()
+        && rsshub_feeds.is_empty()
     {
         on_event(RefreshProgress::Started { total: 0 });
         on_event(RefreshProgress::Finished { new_articles: 0 });
@@ -272,6 +288,10 @@ pub async fn refresh_core(
     // Parser feeds: fetch each X timeline through the built-in X parser, same
     // cadence as the RSS refresh above.
     total_new += poll_parsers(db, client, parser_feeds, dedup, &rules).await;
+
+    // rsshub feeds: run each route through the bundled local engine, same
+    // cadence as the RSS refresh above.
+    total_new += poll_rsshub(db, engine, rsshub_feeds, concurrency, dedup, &rules).await;
 
     // Retention: drop old read articles when a finite window is configured. The
     // DELETE scans the whole table, so throttle it to once per day rather than
@@ -489,6 +509,192 @@ async fn poll_parsers(
     {
         let conn = db.lock().await;
         state.save(&conn);
+    }
+    total_new
+}
+
+/// Concurrency cap for engine route fetches. The engine is a local process —
+/// each route scrape is CPU/network bound *on this machine* — so even a high
+/// global `net_concurrency` should not point every feed at it at once.
+const RSSHUB_ENGINE_CONCURRENCY: usize = 4;
+
+/// Run every rsshub feed's route through the bundled local engine and ingest
+/// the feed documents it serves. Runs as part of [`refresh_core`] so rsshub
+/// subscriptions refresh on the same cadence as RSS feeds. Returns the
+/// new-article count.
+///
+/// Gating: a feed refreshes when at least one installed template it
+/// instantiates is enabled in the `rsshub_routes` registry. A feed whose
+/// matching templates are all disabled — or that matches none (uninstalled
+/// route) — is silently skipped: the marketplace UI's toggle and
+/// uninstall-confirmation are the visible controls; the refresh leg just
+/// goes quiet. A feed's failure (engine will not start, route error) is
+/// recorded as that feed's `fetch_error` — with the coded key where one
+/// exists, so the sidebar tooltip localizes — and does not abort the others.
+async fn poll_rsshub(
+    db: &Mutex<Connection>,
+    engine: Option<&EngineManager>,
+    feeds: Vec<db::FeedToRefresh>,
+    concurrency: usize,
+    dedup: bool,
+    rules: &[crate::models::Rule],
+) -> usize {
+    if feeds.is_empty() {
+        return 0;
+    }
+
+    // The engine registry gates the leg: nothing installed (or no engine
+    // handle — the agent CLI) can only error, with the actionable coded key.
+    let Some(engine) = engine else {
+        let conn = db.lock().await;
+        for (feed_id, _, _, _) in &feeds {
+            let _ = db::set_feed_error(&conn, *feed_id, rsshub::engine::CODE_ENGINE_MISSING);
+        }
+        return 0;
+    };
+    if !engine.installed() {
+        let conn = db.lock().await;
+        for (feed_id, _, _, _) in &feeds {
+            let _ = db::set_feed_error(&conn, *feed_id, rsshub::engine::CODE_ENGINE_MISSING);
+        }
+        return 0;
+    }
+
+    // Enabled templates + their merged environment variables, read once.
+    let (templates, env) = {
+        let conn = db.lock().await;
+        (
+            db::rsshub_routes_list(&conn).unwrap_or_default(),
+            db::rsshub_enabled_env(&conn),
+        )
+    };
+    // A feed with a malformed rsshub:// URL (empty route) can never resolve —
+    // mark it once instead of silently skipping.
+    let mut runnable: Vec<db::FeedToRefresh> = Vec::new();
+    {
+        let conn = db.lock().await;
+        for (feed_id, url, etag, last_modified) in feeds {
+            let Some(route) = rsshub::route_from_url(&url) else {
+                let _ = db::set_feed_error(&conn, feed_id, "malformed rsshub:// feed URL");
+                continue;
+            };
+            // Gating: the feed refreshes when *any* installed template it
+            // instantiates is enabled. Overlapping templates exist (a route
+            // and a longer sibling can both match one concrete path), and a
+            // disabled sibling must not silence a feed an enabled template
+            // serves; "no matching template at all" (uninstalled route) is
+            // covered by the same condition — quiet skip either way.
+            let gated_on = templates
+                .iter()
+                .any(|t| rsshub::template_matches(&route, &t.route_path) && t.enabled);
+            if !gated_on {
+                continue;
+            }
+            runnable.push((feed_id, url, etag, last_modified));
+        }
+    }
+    if runnable.is_empty() {
+        return 0;
+    }
+
+    // Ensure the engine once for the whole leg; a start failure errors every
+    // feed with the coded key.
+    let port = match engine.ensure(&env).await {
+        Ok(port) => port,
+        Err(e) => {
+            // Every AppError carries a stable code the sidebar can localize.
+            let message = e.code_str().to_string();
+            let conn = db.lock().await;
+            for (feed_id, _, _, _) in &runnable {
+                let _ = db::set_feed_error(&conn, *feed_id, &message);
+            }
+            return 0;
+        }
+    };
+    let base = format!("http://127.0.0.1:{port}");
+    // The engine is loopback-only; requests to it must never go through a
+    // configured proxy (the shared feed client honours the user's `net_proxy`
+    // setting for every URL, which would send 127.0.0.1 out to the proxy).
+    let client = rsshub::engine::loopback_client().clone();
+
+    let sem = Arc::new(Semaphore::new(concurrency.min(RSSHUB_ENGINE_CONCURRENCY)));
+    let mut set: JoinSet<(i64, String, Outcome)> = JoinSet::new();
+    for (feed_id, url, etag, last_modified) in runnable {
+        let client = client.clone();
+        let base = base.clone();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await;
+            let route = rsshub::route_from_url(&url).unwrap_or_default();
+            let target = format!("{base}/{}", route.trim_start_matches('/'));
+            let outcome = match fetch::conditional_get(
+                &client,
+                &target,
+                etag.as_deref(),
+                last_modified.as_deref(),
+            )
+            .await
+            {
+                Ok(fetch::Fetched::NotModified) => Outcome::NotModified,
+                Ok(fetch::Fetched::Body {
+                    bytes,
+                    etag,
+                    last_modified,
+                }) => match parse::parse_feed(&bytes, &target) {
+                    Ok(parsed) => Outcome::Updated {
+                        parsed,
+                        etag,
+                        last_modified,
+                    },
+                    // The document came back but is not a feed: a login page,
+                    // a rate-limit notice, an HTML error from the route.
+                    Err(_) => Outcome::Failed(rsshub::engine::CODE_ROUTE_FETCH.to_string()),
+                },
+                Err(_) => Outcome::Failed(rsshub::engine::CODE_ROUTE_FETCH.to_string()),
+            };
+            (feed_id, url, outcome)
+        });
+    }
+    let mut total_new = 0usize;
+    while let Some(joined) = set.join_next().await {
+        let Ok((feed_id, _url, outcome)) = joined else {
+            continue;
+        };
+        engine.touch().await;
+        match outcome {
+            Outcome::NotModified => {
+                let conn = db.lock().await;
+                let _ = db::touch_feed(&conn, feed_id);
+            }
+            Outcome::Failed(e) => {
+                let conn = db.lock().await;
+                let _ = db::set_feed_error(&conn, feed_id, &e);
+            }
+            Outcome::Updated {
+                parsed,
+                etag,
+                last_modified,
+            } => {
+                total_new +=
+                    upsert_articles(db, feed_id, &parsed.articles, dedup, rules, "rsshub").await;
+                let conn = db.lock().await;
+                let _ = db::update_feed_meta(
+                    &conn,
+                    feed_id,
+                    parsed.title.as_deref(),
+                    parsed.site_url.as_deref(),
+                    parsed.description.as_deref(),
+                    parsed.icon.as_deref(),
+                );
+                let _ = db::set_feed_fetch_state(
+                    &conn,
+                    feed_id,
+                    etag.as_deref(),
+                    last_modified.as_deref(),
+                    None,
+                );
+            }
+        }
     }
     total_new
 }

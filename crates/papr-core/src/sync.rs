@@ -233,19 +233,25 @@ async fn creds(db: &Db) -> AppResult<Option<Creds>> {
     let nonempty = |k| db::get_setting(&conn, k).map(|v| v.filter(|s| !s.is_empty()));
     let auth = nonempty("freshrss_auth")?;
     let legacy_pass = nonempty("freshrss_pass")?;
-    let provider = Provider::from_setting(
-        db::get_setting(&conn, "freshrss_provider")?.as_deref(),
-    );
+    let provider = Provider::from_setting(db::get_setting(&conn, "freshrss_provider")?.as_deref());
     if url.trim().is_empty() || user.is_empty() || (auth.is_none() && legacy_pass.is_none()) {
         return Ok(None);
     }
-    Ok(Some(Creds { url, user, auth, legacy_pass, provider }))
+    Ok(Some(Creds {
+        url,
+        user,
+        auth,
+        legacy_pass,
+        provider,
+    }))
 }
 
 /// The configured GReader server URL and provider, or `None` when not
 /// connected.
 pub async fn connected_url(db: &Db) -> AppResult<Option<(String, String)>> {
-    Ok(creds(db).await?.map(|c| (c.url, c.provider.as_str().to_string())))
+    Ok(creds(db)
+        .await?
+        .map(|c| (c.url, c.provider.as_str().to_string())))
 }
 
 /// Persist a verified connection, storing the auth token and never the
@@ -560,7 +566,9 @@ mod tests {
     #[test]
     fn folder_name_prefers_label() {
         assert_eq!(
-            cat("user/-/label/Tech", Some("Tech")).folder_name().as_deref(),
+            cat("user/-/label/Tech", Some("Tech"))
+                .folder_name()
+                .as_deref(),
             Some("Tech")
         );
     }
@@ -577,7 +585,10 @@ mod tests {
     #[test]
     fn folder_name_skips_unnamed_categories() {
         // A state tag (not a label) or a blank label is not a folder.
-        assert_eq!(cat("user/-/state/com.google/read", None).folder_name(), None);
+        assert_eq!(
+            cat("user/-/state/com.google/read", None).folder_name(),
+            None
+        );
         assert_eq!(cat("", Some("   ")).folder_name(), None);
     }
 

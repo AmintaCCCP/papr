@@ -633,7 +633,12 @@ export default function ArticleList({ onToast }: Props) {
                     <div className="art-head">
                       {!a.isRead && <span className="art-dot" />}
                       <span className="art-feed">{a.feedTitle}</span>
-                      {feed && feed.sourceType !== "rss" && (
+                      {feed &&
+                        feed.sourceType !== "rss" &&
+                        // An rsshub subscription reads like an ordinary RSS
+                        // feed (it literally is one — served by the local
+                        // engine), so it gets no source badge.
+                        feed.sourceType !== "rsshub" && (
                         <span className="src-badge">{feed.sourceType}</span>
                       )}
                       <span className="art-sep">·</span>

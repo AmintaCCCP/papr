@@ -21,6 +21,7 @@ import CommandPalette, { type CommandAction } from "./components/CommandPalette"
 import SettingsDialog from "./components/SettingsDialog";
 import AddFeedDialog from "./components/AddFeedDialog";
 import ExploreDialog from "./components/ExploreDialog";
+import RsshubMarketplaceDialog from "./components/RsshubMarketplaceDialog";
 import PromptDialog from "./components/PromptDialog";
 import PlayerBar from "./components/PlayerBar";
 import ResizeHandle from "./components/ResizeHandle";
@@ -108,6 +109,7 @@ export default function App() {
   const [addFeedUrl, setAddFeedUrl] = useState<string | undefined>(undefined);
   // The standalone Explore (curated-directory marketplace) dialog.
   const [explore, setExplore] = useState(false);
+  const [rsshubMarket, setRsshubMarket] = useState(false);
   const [newFolder, setNewFolder] = useState(false);
 
   // Mirror "any covering modal is open" into the store. The reader's
@@ -592,6 +594,10 @@ export default function App() {
             setSettings({ open: false });
             setAddFeed(true);
           }}
+          onOpenMarketplace={() => {
+            setSettings({ open: false });
+            setRsshubMarket(true);
+          }}
         />
       )}
 
@@ -609,6 +615,13 @@ export default function App() {
       {explore && (
         <ExploreDialog
           onClose={() => setExplore(false)}
+          onToast={showToast}
+        />
+      )}
+
+      {rsshubMarket && (
+        <RsshubMarketplaceDialog
+          onClose={() => setRsshubMarket(false)}
           onToast={showToast}
         />
       )}

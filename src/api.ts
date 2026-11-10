@@ -20,6 +20,10 @@ import type {
   RuleAction,
   RuleField,
   RulePreview,
+  RsshubCatalog,
+  RsshubEngineInfo,
+  RsshubEngineStatus,
+  RsshubRouteRow,
   SmartCounts,
   Tag,
   TranslateEvent,
@@ -198,6 +202,41 @@ export function aiTranslate(
  *  preview cache. */
 export const translateArticlePreview = (articleId: number, lang: string, engine: string) =>
   invoke<ArticlePreviewTranslation>("translate_article_preview", { articleId, lang, engine });
+
+// ── RSSHub route marketplace ──
+/** The whole bundled route catalog (slim JSON). Cached for the session —
+ *  it is a compile-time snapshot, so it never goes stale. */
+export const rsshubMarketplaceCatalog = () =>
+  invoke<RsshubCatalog>("rsshub_marketplace_catalog");
+export const rsshubRoutesInstalled = () =>
+  invoke<RsshubRouteRow[]>("rsshub_routes_installed");
+/** Install a route template from the catalog (keeps config on re-install). */
+export const rsshubRouteInstall = (path: string) =>
+  invoke<void>("rsshub_route_install", { path });
+/** Uninstall a route template. Subscriptions stay but stop refreshing. */
+export const rsshubRouteUninstall = (path: string) =>
+  invoke<void>("rsshub_route_uninstall", { path });
+export const rsshubRouteSetEnabled = (path: string, enabled: boolean) =>
+  invoke<void>("rsshub_route_set_enabled", { path, enabled });
+/** Replace a route's environment variables. */
+export const rsshubRouteSetEnv = (path: string, env: Record<string, string>) =>
+  invoke<void>("rsshub_route_set_env", { path, env });
+/** Probe one route through the local engine (the marketplace "test" button).
+ *  Throws a coded error the caller localises. */
+export const rsshubTestRoute = (path: string) =>
+  invoke<ParserTestResult>("rsshub_test_route", { path });
+
+export const engineStatus = () =>
+  invoke<RsshubEngineStatus>("engine_status");
+/** Install the engine from a native file dialog. `null` when cancelled. */
+export const engineInstallFromDialog = () =>
+  invoke<RsshubEngineInfo | null>("engine_install_from_dialog");
+export const engineInstallFromUrl = (url: string, sha256?: string) =>
+  invoke<RsshubEngineInfo>("engine_install_from_url", {
+    url,
+    sha256: sha256?.trim() ? sha256.trim() : null,
+  });
+export const engineUninstall = () => invoke<void>("engine_uninstall");
 
 // ── settings ──
 export const getSetting = (key: string) =>

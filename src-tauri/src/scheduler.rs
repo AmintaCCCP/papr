@@ -51,11 +51,17 @@ pub async fn refresh_all(
     };
 
     let client = state.http();
-    let summary = refresh::refresh_core(&state.db, &client, scope, |event| {
-        if let Some(p) = &progress {
-            let _ = p.send(event);
-        }
-    })
+    let summary = refresh::refresh_core(
+        &state.db,
+        &client,
+        Some(state.engine.as_ref()),
+        scope,
+        |event| {
+            if let Some(p) = &progress {
+                let _ = p.send(event);
+            }
+        },
+    )
     .await?;
 
     // Background scheduler with nothing due this cycle: bow out before the
