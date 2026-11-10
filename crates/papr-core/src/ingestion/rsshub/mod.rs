@@ -46,31 +46,61 @@ pub fn route_from_url(input: &str) -> Option<String> {
 /// slash-free segment; every other segment must match exactly. A concrete
 /// path may be shorter than its template only if the trailing template
 /// segments are all optional.
+///
+/// Two shapes need extra care:
+///
+/// * A query string (`rsshub:///bilibili/hot/search?keyword=x`) travels with
+///   the route into the engine URL, but matching is path-shaped — the query
+///   never participates.
+/// * A regex-constrained parameter (`:name{.+}`, hono's syntax — 174 catalog
+///   routes use it, `/rss/:url{.+}` foremost) applies its regex to the *rest
+///   of the path*, so it consumes every remaining segment instead of one.
+///   The `{.+}` shape can never match a single segment, so without this the
+///   affected subscriptions would silently never refresh.
 pub fn template_matches(concrete: &str, template: &str) -> bool {
-    let concrete = concrete.trim_matches('/');
-    let template = template.trim_matches('/');
-    let mut t_segments = template.split('/').peekable();
-    for c in concrete.split('/') {
-        let Some(t) = t_segments.next() else {
-            // The concrete path is deeper than the template — no match.
-            return false;
-        };
+    let path = concrete.split(['?', '#']).next().unwrap_or("");
+    let c_segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let t_segments: Vec<&str> = template.trim_matches('/').split('/').collect();
+    let mut consumed = 0usize;
+    for (index, t) in t_segments.iter().enumerate() {
         let is_param = t.starts_with(':');
         let is_optional = t.ends_with('?');
-        if is_param {
-            // `:seg?` may be absent, which shows up as an empty segment only
-            // when the caller kept the slash. Empty concrete segments match
-            // optional params; a required param must have content.
-            if c.is_empty() && !is_optional {
-                return false;
+        // A regex-constrained param spans slashes (hono applies the regex to
+        // the remaining path), so it eats the rest — template segments after
+        // it could never match anyway. The concrete path must have something
+        // left for it unless it is optional.
+        if is_param && t.contains('{') {
+            return if consumed < c_segments.len() {
+                true
+            } else {
+                is_optional
+            };
+        }
+        match c_segments.get(consumed) {
+            Some(&c) => {
+                if is_param {
+                    // `:seg?` may be absent, which shows up as an empty
+                    // segment only when the caller kept the slash. Empty
+                    // concrete segments match optional params; a required
+                    // param must have content.
+                    if c.is_empty() && !is_optional {
+                        return false;
+                    }
+                } else if c != *t {
+                    return false;
+                }
+                consumed += 1;
             }
-        } else if c != t {
-            return false;
+            None => {
+                // The concrete path ended mid-template: every remaining
+                // template segment must be optional.
+                return t_segments[index..].iter().all(|s| s.ends_with('?'));
+            }
         }
     }
     // Anything the concrete path did not consume must be optional
     // (`:tail?`) — a required segment left unfilled is not a match.
-    t_segments.all(|t| t.ends_with('?'))
+    consumed == c_segments.len()
 }
 
 #[cfg(test)]
@@ -168,5 +198,57 @@ mod tests {
         ));
         assert!(template_matches("/slack/user/:id", "/slack/user/:id"));
         assert!(!template_matches("/slack/user/", "/slack/user/:id"));
+    }
+
+    #[test]
+    fn template_matches_ignores_query_and_fragment() {
+        // A query travels with the route into the engine URL but never
+        // participates in matching.
+        assert!(template_matches(
+            "/bilibili/hot/search?keyword=x",
+            "/bilibili/hot/search"
+        ));
+        assert!(template_matches(
+            "github/activity/DIYgod#top",
+            "/github/activity/:user"
+        ));
+        assert!(!template_matches(
+            "/bilibili/hot/other?keyword=x",
+            "/bilibili/hot/search"
+        ));
+    }
+
+    #[test]
+    fn template_matches_catch_all_regex_params() {
+        // hono's `:name{.+}` applies the regex to the rest of the path —
+        // it must consume every remaining segment.
+        assert!(template_matches(
+            "/81/81rc/sy/gzdt_210283",
+            "/81/81rc/:category{.+}?"
+        ));
+        assert!(template_matches(
+            "/rss/https://example.com/blog/feed.xml",
+            "/rss/:url{.+}"
+        ));
+        // A deep concrete path under a catch-all template still matches.
+        assert!(template_matches(
+            "/1x/category/sub/deep",
+            "/1x/:category{.+}?"
+        ));
+        // An optional catch-all with nothing left matches; a required one
+        // does not.
+        assert!(template_matches("/81/81rc", "/81/81rc/:category{.+}?"));
+        assert!(!template_matches("/rss", "/rss/:url{.+}"));
+        // Literals before the catch-all still must match exactly.
+        assert!(!template_matches(
+            "/81/other/sy/gzdt_210283",
+            "/81/81rc/:category{.+}?"
+        ));
+        // A concrete path ending where the catch-all sits is consumed by it,
+        // not left dangling.
+        assert!(template_matches(
+            "/bangumi.moe/tag1/tag2",
+            "/bangumi.moe/:tags{.+}?"
+        ));
     }
 }

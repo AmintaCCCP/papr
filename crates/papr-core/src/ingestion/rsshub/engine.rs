@@ -397,9 +397,12 @@ impl EngineManager {
         }
 
         // Start failed — reap the child so it cannot outlive the call, and
-        // surface the coded error (the log tail lives in engine.log).
+        // surface the coded error (the log tail lives in engine.log). The
+        // wait mirrors try_running/shutdown: kill alone can leave the
+        // process unreaped until the runtime's orphan sweep gets to it.
         let mut child = child;
         let _ = child.kill().await;
+        let _ = child.wait().await;
         log::error!("rsshub engine: did not become healthy within budget; see engine.log");
         Err(AppError::code(CODE_ENGINE_START))
     }

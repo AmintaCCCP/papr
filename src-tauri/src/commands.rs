@@ -398,7 +398,9 @@ pub async fn rsshub_route_set_enabled(
 /// Replace a route's environment variables. Values must all be strings — the
 /// engine passes them straight into the child process environment. Names are
 /// restricted to what a process environment can carry on every platform
-/// (letters, digits, underscores) so a typo cannot break the engine spawn.
+/// (letters, digits, underscores) and values may not contain NUL or exceed a
+/// sane ceiling, so a stray paste cannot break the engine spawn with a
+/// cryptic OS error.
 #[tauri::command]
 pub async fn rsshub_route_set_env(
     state: State<'_, AppState>,
@@ -406,10 +408,12 @@ pub async fn rsshub_route_set_env(
     env: BTreeMap<String, String>,
 ) -> AppResult<()> {
     const MAX_ENV_KEY_BYTES: usize = 128;
+    const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
     let path = normalize_route_path(&path);
     if env
         .keys()
         .any(|k| k.len() > MAX_ENV_KEY_BYTES || !valid_env_key(k))
+        || env.values().any(|v| v.contains('\0') || v.len() > MAX_ENV_VALUE_BYTES)
     {
         return Err(AppError::code("rsshubEnvInvalid"));
     }
@@ -586,6 +590,23 @@ async fn add_rsshub_feed(
     let route = rsshub::route_from_url(feed_url)
         .filter(|r| !r.is_empty())
         .ok_or_else(|| AppError::code("rsshubRouteInvalid"))?;
+
+    // A subscription only ever refreshes when an installed route template
+    // covers its path — the engine refresh leg gates on the registry and
+    // quietly skips a feed that matches nothing. Refusing here turns that
+    // silent never-refresh trap into an actionable error at add time (the
+    // marketplace installs the template before subscribing, so its flow is
+    // unaffected).
+    {
+        let conn = state.read().await;
+        let covered = db::rsshub_routes_list(&conn)
+            .unwrap_or_default()
+            .iter()
+            .any(|t| rsshub::template_matches(&route, &t.route_path));
+        if !covered {
+            return Err(AppError::code("rsshubRouteNotInstalled"));
+        }
+    }
 
     let env = {
         let conn = state.read().await;
