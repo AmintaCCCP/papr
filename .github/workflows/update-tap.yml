@@ -52,7 +52,7 @@ jobs:
           echo "linux=$(sha256sum cli-linux.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Check out tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: l0ng-ai/homebrew-papr
           ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}

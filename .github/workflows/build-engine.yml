@@ -41,16 +41,16 @@ jobs:
             runner: windows-latest
             flavor: browser
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           # RSSHub master requires node ^24.15.
           node-version: 24
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         # The version comes from RSSHub's packageManager field after the
         # clone; pin a compatible one here so install is deterministic.
         with:
@@ -67,7 +67,7 @@ jobs:
         run: echo "ENGINE_WEEK=$(date +%G-W%V)" >> "$GITHUB_ENV"
 
       - name: Restore engine build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target/engine-cache
           key: engine-cache-${{ matrix.platform }}-${{ env.ENGINE_WEEK }}
@@ -83,7 +83,7 @@ jobs:
           fi
 
       - name: Upload run artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: rsshub-engine-${{ matrix.flavor }}-${{ matrix.platform }}
           path: |
@@ -99,10 +99,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
