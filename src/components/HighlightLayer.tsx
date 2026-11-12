@@ -21,6 +21,7 @@ import {
 } from "../lib/highlightDom";
 import { captureContext } from "../lib/anchor";
 import { HIGHLIGHT_COLORS } from "../lib/highlightColors";
+import { isComposingKey } from "../lib/ime";
 import { clampAxis } from "../lib/viewport";
 import type { Highlight } from "../types";
 import Icon from "./Icon";
@@ -325,7 +326,9 @@ function HighlightPopover({
       if (!ref.current?.contains(e.target as Node)) save();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      // Skip the Escape that only cancels an IME candidate — the popover's
+      // note field is a live CJK input target.
+      if (e.key === "Escape" && !isComposingKey(e)) onClose();
     };
     const tm = window.setTimeout(() => {
       document.addEventListener("mousedown", onDown);

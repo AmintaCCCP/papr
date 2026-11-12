@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { isComposingKey } from "../lib/ime";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 
 interface Props {
@@ -34,13 +35,15 @@ export default function PromptDialog({
   }, [initialValue]);
 
   // Escape must close the dialog regardless of which control has focus —
-  // an input-level handler dies as soon as the user tabs to a button.
+  // an input-level handler dies as soon as the user tabs to a button. The
+  // `isComposingKey` guard skips the Escape that only cancels an IME
+  // candidate window — this dialog exists for typing CJK names, so losing
+  // the typed text to a composition cancel would be destructive.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);

@@ -211,7 +211,9 @@ export default function CommandPalette({
       e.preventDefault();
       const it = items[active];
       if (it) run(it);
-    } else if (e.key === "Escape") {
+    } else if (e.key === "Escape" && !e.nativeEvent.isComposing) {
+      // The same `isComposing` guard skips the Escape that only cancels an
+      // IME candidate — closing the palette would drop the typed query.
       e.preventDefault();
       onClose();
     }

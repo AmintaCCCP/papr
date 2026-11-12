@@ -5,6 +5,7 @@
 // opened the popover does not immediately close it. Centralised here.
 
 import { useEffect, type RefObject } from "react";
+import { isComposingKey } from "../lib/ime";
 
 interface Options {
   /** Also dismiss when focus leaves the popover subtree (Tab past the last
@@ -24,7 +25,11 @@ export function useDismiss(
     const onDown = (e: MouseEvent) => {
       if (!ref.current?.contains(e.target as Node)) onClose();
     };
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) => {
+      // Skip the Escape that only cancels an IME candidate window — a
+      // popover over an input (tag picker, share menu) must survive it.
+      e.key === "Escape" && !isComposingKey(e) && onClose();
+    };
     const onBlur = (e: FocusEvent) => {
       const next = e.relatedTarget as Node | null;
       if (next && !ref.current?.contains(next)) onClose();

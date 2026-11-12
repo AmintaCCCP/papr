@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { isComposingKey } from "../lib/ime";
 
 interface Props {
   title: string;
@@ -32,13 +33,14 @@ export default function ConfirmDialog({
   const dialogRef = useRef<HTMLDivElement>(null);
   useFocusTrap(dialogRef);
 
-  // Escape must close regardless of which control holds focus.
+  // Escape must close regardless of which control holds focus. The
+  // `isComposingKey` guard skips the Escape that only cancels an IME
+  // candidate window — a stray close must not read as confirmation either.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);

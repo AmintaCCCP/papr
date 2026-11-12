@@ -6,6 +6,7 @@ import * as api from "../api";
 import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { errorText } from "../lib/errors";
+import { isComposingKey } from "../lib/ime";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import {
   catalogCategories,
@@ -26,6 +27,10 @@ import Icon from "./Icon";
 interface Props {
   onClose: () => void;
   onToast: (msg: string) => void;
+  /** Jump to the settings page's engine card — the route detail's
+   *  "install the browser engine" action for requirePuppeteer routes when
+   *  the installed engine has no bundled browser. */
+  onOpenEngineSettings: () => void;
 }
 
 /**
@@ -41,20 +46,29 @@ interface Props {
  * Routes run through the bundled local engine; nothing here touches a
  * hosted RSSHub instance.
  */
-export default function RsshubMarketplaceDialog({ onClose, onToast }: Props) {
+export default function RsshubMarketplaceDialog({
+  onClose,
+  onToast,
+  onOpenEngineSettings,
+}: Props) {
   const { t } = useTranslation();
   const dialogRef = useRef<HTMLDivElement>(null);
   useFocusTrap(dialogRef);
 
   const [tab, setTab] = useState<"market" | "installed">("market");
 
-  // Escape closes the dialog from anywhere inside it.
+  // Escape closes the dialog from anywhere inside it. `isComposingKey`
+  // skips the Escape that only cancels an IME candidate window (CJK input
+  // mid-typing would otherwise tear the whole dialog down). An inner modal
+  // (the env editor / the uninstall confirm) renders its own backdrop
+  // inside this dialog — while one is up it owns Escape, so the outer
+  // close stands down rather than tearing down both layers at once.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      if (dialogRef.current?.querySelector(".modal-backdrop")) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
@@ -102,7 +116,7 @@ export default function RsshubMarketplaceDialog({ onClose, onToast }: Props) {
           </button>
         </div>
         {tab === "market" ? (
-          <MarketTab onToast={onToast} />
+          <MarketTab onToast={onToast} onOpenEngineSettings={onOpenEngineSettings} />
         ) : (
           <InstalledTab onToast={onToast} />
         )}
@@ -113,12 +127,32 @@ export default function RsshubMarketplaceDialog({ onClose, onToast }: Props) {
 
 /* ── market tab ─────────────────────────────────────────────── */
 
-function MarketTab({ onToast }: { onToast: (msg: string) => void }) {
+/** The installed engine's flavor decides whether requirePuppeteer routes are
+ *  installable: the browser flavor (`scripts/build-engine.sh --browser`)
+ *  ships a headless Chromium, the standard one gates those routes. Shared by
+ *  the row badges and the route detail; cached under the same key the
+ *  settings dialog uses, so installing an engine in settings updates here. */
+function useEngineFlavor() {
+  const engine = useQuery({
+    queryKey: ["rsshub-engine"],
+    queryFn: api.engineStatus,
+  });
+  return engine.data?.info?.flavor === "browser";
+}
+
+function MarketTab({
+  onToast,
+  onOpenEngineSettings,
+}: {
+  onToast: (msg: string) => void;
+  onOpenEngineSettings: () => void;
+}) {
   const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState<string | null>(null);
   const [hideNsfw, setHideNsfw] = useState(true);
   const [selected, setSelected] = useState<RsshubHit | null>(null);
+  const browserEngine = useEngineFlavor();
 
   const catalog = useQuery({
     queryKey: ["rsshub-catalog"],
@@ -265,7 +299,12 @@ function MarketTab({ onToast }: { onToast: (msg: string) => void }) {
           )}
         </div>
         {selected && (
-          <RouteDetail hit={selected} onToast={onToast} />
+          <RouteDetail
+            hit={selected}
+            onToast={onToast}
+            browserEngine={browserEngine}
+            onOpenEngineSettings={onOpenEngineSettings}
+          />
         )}
       </div>
     </>
@@ -274,7 +313,17 @@ function MarketTab({ onToast }: { onToast: (msg: string) => void }) {
 
 /** The detail pane: description, parameter form, environment form, and the
  *  install / install-and-subscribe / test actions. */
-function RouteDetail({ hit, onToast }: { hit: RsshubHit; onToast: (msg: string) => void }) {
+function RouteDetail({
+  hit,
+  onToast,
+  browserEngine,
+  onOpenEngineSettings,
+}: {
+  hit: RsshubHit;
+  onToast: (msg: string) => void;
+  browserEngine: boolean;
+  onOpenEngineSettings: () => void;
+}) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const actions = useArticleActions();
@@ -304,7 +353,10 @@ function RouteDetail({ hit, onToast }: { hit: RsshubHit; onToast: (msg: string) 
     subscribeUrl != null &&
     (feeds.data ?? []).some((f) => f.feedUrl === subscribeUrl);
   const envItems = requiredEnv(hit.route.features);
-  const unsupported = hit.route.features.requirePuppeteer;
+  // A requirePuppeteer route runs only when the installed engine bundles the
+  // headless Chromium (the browser flavor). With it, the route is an
+  // ordinary route — same install/test/subscribe flow.
+  const unsupported = hit.route.features.requirePuppeteer && !browserEngine;
 
   const install = useMutation({
     mutationFn: async (alsoSubscribe: boolean) => {
@@ -360,6 +412,13 @@ function RouteDetail({ hit, onToast }: { hit: RsshubHit; onToast: (msg: string) 
         <p className="rsshub-detail-warn">
           <Icon name="alert" size={13} />
           {t("settings.rsshub.unsupportedDesc")}
+          <button
+            className="s-btn"
+            style={{ marginLeft: 8, verticalAlign: "middle" }}
+            onClick={onOpenEngineSettings}
+          >
+            {t("settings.rsshub.unsupportedAction")}
+          </button>
         </p>
       )}
       {hit.route.features.antiCrawler && (
@@ -643,10 +702,11 @@ function EnvEditorModal({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      // The inner-most modal: close only itself. The `isComposingKey` guard
+      // skips the Escape that merely cancels an IME candidate window.
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);

@@ -13,6 +13,7 @@ import { useArticleActions } from "./hooks/articleActions";
 import { readCurrentItems } from "./lib/currentList";
 import { checkForUpdates } from "./lib/updater";
 import { useToasts, toast as toastApi, reportError } from "./toast";
+import { isComposingKey } from "./lib/ime";
 import type { ArticleQuery, ArticleSummary, Feed } from "./types";
 import Sidebar from "./components/Sidebar";
 import ArticleList from "./components/ArticleList";
@@ -512,8 +513,12 @@ export default function App() {
           }
           break;
         case "escape":
-          st.setFocusMode(false);
-          st.setAiOpen(false);
+          // Skip the Escape that only cancels an IME candidate window —
+          // it must not collapse focus mode / the AI card either.
+          if (!isComposingKey(e)) {
+            st.setFocusMode(false);
+            st.setAiOpen(false);
+          }
           break;
       }
     };
@@ -623,6 +628,13 @@ export default function App() {
         <RsshubMarketplaceDialog
           onClose={() => setRsshubMarket(false)}
           onToast={showToast}
+          onOpenEngineSettings={() => {
+            // The browser-flavor engine is installed from the settings page's
+            // engine card (subscriptions section) — same place as the
+            // standard engine.
+            setRsshubMarket(false);
+            openSettings("subscriptions");
+          }}
         />
       )}
 
