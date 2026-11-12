@@ -2,13 +2,64 @@
 
 <img src="docs/logo.svg" alt="Papr" width="96" height="96" />
 
-# Papr
+# Papr (Aminta Fork)
 
 **A fast, native RSS reader — and a CLI your AI agent can actually drive.**
+
+> [!NOTE]
+> **Fork Notice & Maintenance Scope**
+> This repository is a personal fork of [Papr](https://github.com/l0ng-ai/papr), created to serve as a self-hosted, independent alternative to proprietary/paid reader features (such as Folo's premium capabilities).
+>
+> You are very welcome to use, fork, or adapt this project for your own workflow. However, please note that **this fork is maintained strictly for personal use: external issues and pull requests will not be accepted**. If you encounter bugs or wish to propose general features or improvements, please submit them directly to the upstream project at [l0ng-ai/papr](https://github.com/l0ng-ai/papr).
 
 <img src="docs/screenshot.webp" alt="Papr" width="820" />
 
 </div>
+
+## Fork Highlights & Enhancements
+
+This fork enhances Papr with richer export workflows, a Folo-style inline AI reading experience, native social media parsers, an embedded local RSSHub engine, and hardened translation reliability:
+
+### 1. Rich Export Integrations & Custom Webhooks ([#1](https://github.com/AmintaCCCP/papr/pull/1))
+- **Built-in Read-Later & Note-Taking Services**: One-click dispatch from the reader toolbar directly into:
+  - **Cubox** (via personal API URL)
+  - **Readwise Reader** (full document and metadata ingestion)
+  - **Instapaper** (HTTP credential bookmarking)
+  - **Outline** (document creation within chosen collections)
+  - **Readeck** (bookmark and link ingestion)
+  - **Zotero** (creates webpage items in user libraries)
+  - **Obsidian** (writes Markdown notes with structured YAML frontmatter directly into a local vault)
+- **Custom Webhooks & URL Schemes**:
+  - Full HTTP method support (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`) with configurable headers and payload templates.
+  - Native URI scheme triggering (e.g. `obsidian://new?vault=...`).
+  - 8 dynamic template variables: `[title]`, `[url]`, `[content_html]`, `[content_markdown]`, `[summary]`, `[description]`, `[author]`, and `[published_at]`, with automatic URL percent-encoding and JSON-safe string escaping.
+- **On-Demand AI Summary Handoff**: Optionally forward the AI summary as the item's summary/description, generating and persisting it on the fly if not yet present.
+- **Native Rust Dispatch**: All requests execute in backend Rust, bypassing webview CORS restrictions, honoring system proxies and timeouts, and guarded by protocol blocklists.
+
+### 2. Inline AI Summary Card & Custom Prompt Editor ([#3](https://github.com/AmintaCCCP/papr/pull/3))
+- **Folo-Style Inline Card**: Replaced the sliding drawer with an inline summary card positioned naturally between the article header and content, scrolling with the document. Includes one-click Markdown copy, regeneration, and dismissal.
+- **Auto-Summarize on Open**: Added an optional setting (`autoSummarize`) to instantly display cached summaries or generate them in the background upon opening an article.
+- **Configurable Prompt Editor**: In-app prompt customization with one-click restoration to default, uniformly applied across reader summaries and integration exports.
+
+### 3. Native First-Class X (Twitter) Parser ([#5](https://github.com/AmintaCCCP/papr/pull/5))
+- **Zero Third-Party Middlemen**: Subscribes directly to X via official GraphQL endpoints—no external RSSHub instances or intermediate proxies required.
+- **Rich Media & Post Fidelity**: Preserves full entity styling (links, @mentions, hashtags), embeds highest-bitrate MP4 videos and images, formats retweets and quote tweets, and derives exact timestamps via Snowflake IDs.
+- **Resilient Query ID Rotation**: Automatically extracts and caches GraphQL query IDs from client bundles, with automatic invalidation and retries on 404s.
+- **Dedicated Parser Settings**: Manage credentials (`auth_token` and `ct0`) with built-in connection probe diagnostics, plus background rate-limiting (500ms) and per-feed error isolation.
+
+### 4. Embedded Local RSSHub Engine & Route Marketplace ([#6](https://github.com/AmintaCCCP/papr/pull/6), [#7](https://github.com/AmintaCCCP/papr/pull/7))
+- **Self-Contained Local Runtime**: Bundles a slim Node 24 + RSSHub engine running locally on `127.0.0.1`. Spawns on-demand and idles out after 10 minutes of inactivity, completely bypassing blocked or rate-limited public instances.
+- **In-App Route Marketplace**: Browse an offline catalog of 4,000+ routes across 2,000+ namespaces with search, category filtering, and popularity sorting. Features automated parameter forms with pre-filled examples and environment variable configuration.
+- **Catch-All & Query Handling**: Fully supports greedy/wildcard path parameters (`{:path*}`) and strips query strings/fragments during route matching. Cleans up orphan engine processes on exit and provides clear feedback for uninstalled routes.
+
+### 5. Hardened Keyless Translation Engines & UI Concurrency Fixes ([#2](https://github.com/AmintaCCCP/papr/pull/2), [#4](https://github.com/AmintaCCCP/papr/pull/4))
+- **Repaired Free Translation Endpoints**:
+  - Bing: Migrated to Edge's keyless `translatetext` API, resolving broken token endpoint 404 failures.
+  - Google: Switched to Chromium's batch form endpoint (`clients5.google.com`), supporting aligned multi-segment payloads without awkward newline splits.
+- **Scoped Viewport Translation**: Scoped list-view auto-translation strictly to the currently opened article instead of queuing all visible list rows, eliminating severe Google 429 rate-limiting.
+- **Race Condition Fix**: Eliminated the React Query refetch race condition when switching translation engines in Settings, and added descriptive error messaging per engine.
+
+---
 
 Papr is two front-ends over **one local database**:
 
