@@ -184,7 +184,7 @@ jobs:
       # them under the root target dir on every platform, with cross-target
       # mac builds adding the triple as an extra path segment.
       - name: Upload bundles
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: papr-desktop-${{ matrix.target }}
           path: |
