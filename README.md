@@ -50,14 +50,18 @@ This fork enhances Papr with richer export workflows, a Folo-style inline AI rea
 ### 4. Embedded Local RSSHub Engine & Route Marketplace ([#6](https://github.com/AmintaCCCP/papr/pull/6), [#7](https://github.com/AmintaCCCP/papr/pull/7))
 - **Self-Contained Local Runtime**: Bundles a slim Node 24 + RSSHub engine running locally on `127.0.0.1`. Spawns on-demand and idles out after 10 minutes of inactivity, completely bypassing blocked or rate-limited public instances.
 - **In-App Route Marketplace**: Browse an offline catalog of 4,000+ routes across 2,000+ namespaces with search, category filtering, and popularity sorting. Features automated parameter forms with pre-filled examples and environment variable configuration.
+- **Browser Engine Flavor**: Two engine builds ship from CI — `standard` (Node + RSSHub) and `browser` (`scripts/build-engine.sh --browser`), which additionally bundles RSSHub's own `patchright` runtime plus a headless Chromium. Installing the browser flavor (Settings → Subscriptions → RSSHub local engine, from file or URL) unlocks the marketplace's `Needs browser` routes: the engine pins `PLAYWRIGHT_BROWSERS_PATH` at its bundled Chromium, so anti-bot routes run headlessly on-device with no system Chrome required.
 - **Catch-All & Query Handling**: Fully supports greedy/wildcard path parameters (`{:path*}`) and strips query strings/fragments during route matching. Cleans up orphan engine processes on exit and provides clear feedback for uninstalled routes.
 
-### 5. Hardened Keyless Translation Engines & UI Concurrency Fixes ([#2](https://github.com/AmintaCCCP/papr/pull/2), [#4](https://github.com/AmintaCCCP/papr/pull/4))
-- **Repaired Free Translation Endpoints**:
+### 5. Hardened Keyless Translation Engines & UI Concurrency Fixes ([#2](https://github.com/AmintaCCCP/papr/pull/2), [#4](https://github.com/AmintaCCCP/papr/pull/4))- **Repaired Free Translation Endpoints**:
   - Bing: Migrated to Edge's keyless `translatetext` API, resolving broken token endpoint 404 failures.
   - Google: Switched to Chromium's batch form endpoint (`clients5.google.com`), supporting aligned multi-segment payloads without awkward newline splits.
 - **Scoped Viewport Translation**: Scoped list-view auto-translation strictly to the currently opened article instead of queuing all visible list rows, eliminating severe Google 429 rate-limiting.
 - **Race Condition Fix**: Eliminated the React Query refetch race condition when switching translation engines in Settings, and added descriptive error messaging per engine.
+
+### 6. Dialog Robustness: IME-Safe Escape & Nested Modals
+- **IME Candidate Escape No Longer Closes Dialogs**: Every dialog, popover and the command palette guards Escape with `isComposing` — cancelling a CJK/IME candidate window no longer tears down the dialog the user is typing in (the same guard `Enter` submits already had).
+- **Nested-Modal Escape Scoping**: Inner modals (RSSHub env editor, uninstall confirms, parser credential dialogs) own Escape while open; the outer dialog no longer closes both layers at once.
 
 ---
 

@@ -40,11 +40,20 @@ done
 PORT="$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")"
 
 echo "==> starting engine on 127.0.0.1:$PORT (log: $WORK/engine.log)"
+# The browser flavor's bundled Chromium registry: the app's EngineManager
+# pins PLAYWRIGHT_BROWSERS_PATH at <version dir>/browser when present (see
+# engine.rs build_child_env) — the smoke run must mirror that contract so a
+# requirePuppeteer route resolves the bundled browser, not the host's.
+BROWSER_ENV=()
+if [ -d "$ENGINE_DIR/browser" ]; then
+  BROWSER_ENV=(PLAYWRIGHT_BROWSERS_PATH="$ENGINE_DIR/browser" PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1)
+fi
 (
   cd "$ENGINE_DIR"
   exec env -i \
     PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
     PORT="$PORT" NODE_ENV=production NODE_OPTIONS="--max-http-header-size=32768" \
+    ${BROWSER_ENV[@]+"${BROWSER_ENV[@]}"} \
     "$NODE_BIN" "$ENTRY"
 ) > "$WORK/engine.log" 2>&1 &
 SERVER_PID=$!

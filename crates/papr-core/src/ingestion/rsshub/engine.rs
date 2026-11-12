@@ -180,6 +180,13 @@ fn platform_arg_max() -> Option<usize> {
 pub struct EngineInfo {
     /// Engine format version — bumped when the layout changes.
     pub version: String,
+    /// `standard` (Node + RSSHub only; browser routes are gated in the
+    /// marketplace) or `browser` (also ships a headless Chromium under
+    /// `<version dir>/browser` for `requirePuppeteer` routes). Older
+    /// manifests predate the field and read as the empty string, which
+    /// behaves exactly like `standard`.
+    #[serde(default)]
+    pub flavor: String,
     /// The RSSHub git revision the build was made from.
     #[serde(alias = "rsshub_revision")]
     pub rsshub_revision: String,
@@ -191,6 +198,14 @@ pub struct EngineInfo {
     /// archive manifest must tolerate its absence.
     #[serde(default, alias = "installed_at")]
     pub installed_at: String,
+}
+
+impl EngineInfo {
+    /// True when the installed engine bundles the headless Chromium the
+    /// `requirePuppeteer` routes need (`scripts/build-engine.sh --browser`).
+    pub fn is_browser_flavor(&self) -> bool {
+        self.flavor == "browser"
+    }
 }
 
 /// What `engine_status` reports to the settings UI.
@@ -379,7 +394,7 @@ impl EngineManager {
         // Enforce the execve size budget before touching the log files: an
         // over-budget environment fails the spawn with E2BIG, and the coded
         // error here is the actionable form of that failure.
-        let child_env = build_child_env(user_env, port)?;
+        let child_env = build_child_env(user_env, port, &dir)?;
         let log_path = self.root.join("engine.log");
 
         // The log file is opened twice (stdout + stderr share it in append
@@ -601,12 +616,19 @@ const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// 127.0.0.1 — its default (bind any) would expose the engine, user cookies
 /// included, to the whole network; RSSHub's `toBoolean` reads "0" as false
 /// and `lib/index.ts` then binds 127.0.0.1. The header size matches RSSHub's
-/// own production start command). Returns the coded
+/// own production start command). When the installed engine is the browser
+/// flavor (`<version dir>/browser` exists — see `scripts/build-engine.sh
+/// --browser`), `PLAYWRIGHT_BROWSERS_PATH` is pinned to that directory so
+/// RSSHub's patchright launch resolves the *bundled* Chromium instead of
+/// hunting the host's (or trying to download one — `install` was already
+/// run at build time, and a runtime download inside the stripped child
+/// environment would be a surprise network fetch). Returns the coded
 /// [`CODE_ENV_TOO_LARGE`](CODE_ENV_TOO_LARGE) error when the merged size
 /// exceeds what this platform's `execve` accepts ([`execve_budget`]).
 fn build_child_env(
     user_env: &BTreeMap<String, String>,
     port: u16,
+    version_dir: &Path,
 ) -> AppResult<BTreeMap<String, String>> {
     let mut env: BTreeMap<String, String> = ENV_ALLOWLIST
         .iter()
@@ -621,6 +643,18 @@ fn build_child_env(
     env.insert("NODE_ENV".into(), "production".into());
     env.insert("LISTEN_INADDR_ANY".into(), "0".into());
     env.insert("NODE_OPTIONS".into(), "--max-http-header-size=32768".into());
+    let bundled_browser = version_dir.join("browser");
+    if bundled_browser.is_dir() {
+        // `to_string_lossy`: an engine root with non-UTF8 bytes is not a
+        // thing this code creates, and patchright's env parsing wants a
+        // String anyway — the lossy form keeps a pathological root from
+        // failing the whole spawn.
+        env.insert(
+            "PLAYWRIGHT_BROWSERS_PATH".into(),
+            bundled_browser.to_string_lossy().into_owned(),
+        );
+        env.insert("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD".into(), "1".into());
+    }
 
     // NAME + '=' + value + NUL per entry — the layout execve charges for.
     let budget = execve_budget();
@@ -726,6 +760,19 @@ fn validate_staging(staging: &Path) -> AppResult<EngineInfo> {
     let entry = EngineManager::entry_script(staging);
     if !is_regular(&node) || !entry.as_ref().is_some_and(|p| is_regular(p)) {
         return Err(AppError::code(CODE_ARCHIVE_INVALID));
+    }
+    // A browser-flavor archive ships its headless Chromium under `browser/`
+    // (the directory `build_child_env` pins `PLAYWRIGHT_BROWSERS_PATH` at).
+    // Installing one without it would boot fine and then 500 on every
+    // `requirePuppeteer` route, so refuse the install instead.
+    if info.is_browser_flavor() {
+        let browser = staging.join("browser");
+        let populated = std::fs::read_dir(&browser)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if !populated {
+            return Err(AppError::code(CODE_ARCHIVE_INVALID));
+        }
     }
     Ok(info)
 }
@@ -984,6 +1031,7 @@ mod tests {
         std::fs::write(app.join("index.js"), "// entry\n").unwrap();
         let info = EngineInfo {
             version: "1".into(),
+            flavor: "standard".into(),
             rsshub_revision: "abcdef123456".into(),
             node_version: "v22.0.0".into(),
             installed_at: "2026-01-01T00:00:00Z".into(),
@@ -1013,6 +1061,7 @@ mod tests {
         std::fs::write(app.join("index.js"), "// entry\n").unwrap();
         let info = EngineInfo {
             version: "2".into(),
+            flavor: "standard".into(),
             rsshub_revision: "rev".into(),
             node_version: "v22".into(),
             installed_at: "x".into(),
@@ -1098,6 +1147,56 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A staging tree for `validate_staging`: manifest + node + entry, with
+    /// the manifest's flavor and an optional populated `browser/` dir.
+    fn make_staging(root: &Path, tag: &str, flavor: &str, with_browser: bool) -> PathBuf {
+        let staging = root.join(format!("staging-{tag}"));
+        let app = staging.join("app").join("dist");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(staging.join("bin")).unwrap();
+        std::fs::write(staging.join("bin").join("node"), "binary").unwrap();
+        std::fs::write(app.join("index.js"), "// entry\n").unwrap();
+        let info = EngineInfo {
+            version: "1".into(),
+            flavor: flavor.into(),
+            rsshub_revision: "rev".into(),
+            node_version: "v24".into(),
+            installed_at: "x".into(),
+        };
+        std::fs::write(
+            staging.join("engine.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        if with_browser {
+            // One registry entry — validate_staging only asks that the
+            // directory exists and is populated, matching what the
+            // `patchright install` step produces.
+            std::fs::create_dir_all(staging.join("browser").join("chromium-1")).unwrap();
+        }
+        staging
+    }
+
+    #[test]
+    fn validate_staging_requires_browser_dir_for_browser_flavor() {
+        let root = temp_root("validate-browser");
+        // flavor=browser without a populated browser/ dir: would boot fine
+        // and then 500 on every requirePuppeteer route — refuse the install.
+        let missing = make_staging(&root, "missing", "browser", false);
+        assert_eq!(
+            validate_staging(&missing).unwrap_err().code_str(),
+            CODE_ARCHIVE_INVALID
+        );
+        // Populated: accepted.
+        let ok = make_staging(&root, "ok", "browser", true);
+        assert!(validate_staging(&ok).is_ok());
+        // The standard flavor never needs a browser dir (and must not gain
+        // the requirement).
+        let standard = make_staging(&root, "standard", "standard", false);
+        assert!(validate_staging(&standard).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[tokio::test]
     async fn install_replaces_same_version() {
         let root = temp_root("replace");
@@ -1173,11 +1272,42 @@ mod tests {
         let mut user = BTreeMap::new();
         user.insert("PORT".to_string(), "99999".to_string());
         user.insert("MY_TOKEN".to_string(), "secret".to_string());
-        let env = build_child_env(&user, 49152).unwrap();
+        let dir = temp_root("env-nodir");
+        let env = build_child_env(&user, 49152, &dir).unwrap();
         assert_eq!(env.get("PORT").map(String::as_str), Some("49152"));
         assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
         assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
         assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
+        // A standard engine (no `browser/` dir) must not advertise a browser
+        // registry — patchright would then look for a browser that is not
+        // there instead of failing the route cleanly.
+        assert!(!env.contains_key("PLAYWRIGHT_BROWSERS_PATH"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn build_child_env_pins_the_bundled_browser_registry() {
+        // The browser flavor's `<version dir>/browser` pins
+        // PLAYWRIGHT_BROWSERS_PATH on the fixed layer — a user route variable
+        // of the same name must not redirect patchright away from the
+        // bundled Chromium.
+        let dir = temp_root("env-browser");
+        std::fs::create_dir_all(dir.join("browser").join("chromium-1")).unwrap();
+        let mut user = BTreeMap::new();
+        user.insert(
+            "PLAYWRIGHT_BROWSERS_PATH".to_string(),
+            "/elsewhere".to_string(),
+        );
+        let env = build_child_env(&user, 49152, &dir).unwrap();
+        assert_eq!(
+            env.get("PLAYWRIGHT_BROWSERS_PATH").map(String::as_str),
+            Some(dir.join("browser").to_str().unwrap())
+        );
+        assert_eq!(
+            env.get("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD").map(String::as_str),
+            Some("1")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1189,8 +1319,10 @@ mod tests {
         for i in 0..24 {
             user.insert(format!("BULK_VAR_{i}"), "v".repeat(60_000));
         }
-        let err = build_child_env(&user, 49152).unwrap_err();
+        let dir = temp_root("env-budget");
+        let err = build_child_env(&user, 49152, &dir).unwrap_err();
         assert_eq!(err.code_str(), CODE_ENV_TOO_LARGE);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1292,6 +1424,7 @@ mod tests {
         let root = Path::new("/tmp/eng");
         let evil = EngineInfo {
             version: "sub/../../../etc".into(),
+            flavor: "standard".into(),
             rsshub_revision: "r".into(),
             node_version: "n".into(),
             installed_at: "i".into(),
@@ -1323,6 +1456,7 @@ mod tests {
         std::fs::write(app.join("index.js"), "// entry\n").unwrap();
         let info = EngineInfo {
             version: "1".into(),
+            flavor: "standard".into(),
             rsshub_revision: "rev".into(),
             node_version: "v22".into(),
             installed_at: "x".into(),

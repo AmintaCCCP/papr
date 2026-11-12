@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    name: ${{ matrix.platform }}
+    name: ${{ matrix.platform }}-${{ matrix.flavor }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -24,10 +24,22 @@ jobs:
           - platform: darwin-arm64
             # macos-14 was retired on 2026-11-02; the macos-15 image is arm64.
             runner: macos-15
+            flavor: standard
+          - platform: darwin-arm64
+            runner: macos-15
+            flavor: browser
           - platform: linux-x64
             runner: ubuntu-latest
+            flavor: standard
+          - platform: linux-x64
+            runner: ubuntu-latest
+            flavor: browser
           - platform: win-x64
             runner: windows-latest
+            flavor: standard
+          - platform: win-x64
+            runner: windows-latest
+            flavor: browser
     steps:
       - uses: actions/checkout@v4
 
@@ -63,12 +75,17 @@ jobs:
 
       - name: Build engine
         shell: bash
-        run: scripts/build-engine.sh
+        run: |
+          if [ "${{ matrix.flavor }}" = "browser" ]; then
+            scripts/build-engine.sh --browser
+          else
+            scripts/build-engine.sh
+          fi
 
       - name: Upload run artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rsshub-engine-${{ matrix.platform }}
+          name: rsshub-engine-${{ matrix.flavor }}-${{ matrix.platform }}
           path: |
             target/engine/*.tar.gz
             target/engine/*.sha256
