@@ -221,16 +221,24 @@ describe("catalogCategories", () => {
 describe("extractParams / concretePath", () => {
   it("extracts :params in order, marking optionals", () => {
     expect(extractParams("/bilibili/user/video/:id")).toEqual([
-      { name: "id", optional: false },
+      { name: "id", optional: false, catchAll: false },
     ]);
     expect(extractParams("/bilibili/platform/:area?/:type?")).toEqual([
-      { name: "area", optional: true },
-      { name: "type", optional: true },
+      { name: "area", optional: true, catchAll: false },
+      { name: "type", optional: true, catchAll: false },
     ]);
     expect(extractParams("/github/activity/:user")).toEqual([
-      { name: "user", optional: false },
+      { name: "user", optional: false, catchAll: false },
     ]);
     expect(extractParams("/no/params")).toEqual([]);
+  });
+
+  it("parses hono regex params as catch-alls with clean names", () => {
+    expect(extractParams("/81/81rc/:category{.+}?")).toEqual([
+      { name: "category", optional: true, catchAll: true },
+    ]);
+    expect(extractParams("/npm/package/:name{(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*}"))
+      .toEqual([{ name: "name", optional: false, catchAll: true }]);
   });
 
   it("substitutes values into the template", () => {
@@ -257,6 +265,33 @@ describe("extractParams / concretePath", () => {
       "/x/keyword/a%20b%2Fc",
     );
   });
+
+  it("handles a regex constraint containing a slash (npm scoped packages)", () => {
+    // The npm template's regex carries a literal `/` inside the braces —
+    // splitting there produced garbage literal fragments in the path.
+    const npm = "/npm/package/:name{(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*}";
+    expect(concretePath(npm, { name: "react" })).toBe("/npm/package/react");
+    expect(concretePath(npm, { name: "@rsshub/app" })).toBe("/npm/package/%40rsshub/app");
+    expect(paramsFromExample(npm, "/npm/package/react")).toEqual({ name: "react" });
+    expect(templateMatches("/npm/package/react", npm)).toBe(true);
+    expect(templateMatches("/npm/package/@rsshub/app", npm)).toBe(true);
+    expect(templateMatches("/npm/package", npm)).toBe(false);
+    expect(templateMatches("/npm/other/react", npm)).toBe(false);
+  });
+
+  it("keeps slashes in catch-all values, encoding each segment", () => {
+    // The catalog's catch-all routes take a multi-segment value — the
+    // separators must survive (encoded slashes made these routes unusable).
+    expect(
+      concretePath("/81/81rc/:category{.+}?", { category: "sy/gzdt_210283" }),
+    ).toBe("/81/81rc/sy/gzdt_210283");
+    expect(
+      concretePath("/rss/:url{.+}", { url: "https://example.com/blog" }),
+    ).toBe("/rss/https%3A//example.com/blog");
+    // A required catch-all is still required; an optional one drops out.
+    expect(concretePath("/rss/:url{.+}", {})).toBeNull();
+    expect(concretePath("/1x/:category{.+}?", {})).toBe("/1x");
+  });
 });
 
 describe("paramsFromExample", () => {
@@ -282,6 +317,17 @@ describe("paramsFromExample", () => {
     expect(paramsFromExample("/a/:x", "/b/c/d")).toEqual({});
     expect(paramsFromExample("/a/:x", null)).toEqual({});
   });
+
+  it("absorbs the example's tail into a catch-all parameter", () => {
+    // The example is deeper than the template — the catch-all takes it all.
+    expect(
+      paramsFromExample("/81/81rc/:category{.+}?", "/81/81rc/sy/gzdt_210283"),
+    ).toEqual({ category: "sy/gzdt_210283" });
+    // Literals before the catch-all must still line up.
+    expect(paramsFromExample("/81/other/:category{.+}?", "/81/81rc/sy/x")).toEqual({});
+    // An optional catch-all with nothing left simply stays empty.
+    expect(paramsFromExample("/1x/:category{.+}?", "/1x")).toEqual({});
+  });
 });
 
 describe("templateMatches", () => {
@@ -292,6 +338,20 @@ describe("templateMatches", () => {
     expect(templateMatches("/bilibili/user/video/1/extra", "/bilibili/user/video/:id")).toBe(false);
     expect(templateMatches("/bilibili/user/video", "/bilibili/user/video/:id")).toBe(false);
     expect(templateMatches("/bilibili/platform/-1", "/bilibili/platform/:area?")).toBe(true);
+  });
+
+  it("ignores query strings and fragments", () => {
+    expect(templateMatches("/bilibili/hot/search?keyword=x", "/bilibili/hot/search")).toBe(true);
+    expect(templateMatches("github/activity/DIYgod#top", "/github/activity/:user")).toBe(true);
+    expect(templateMatches("/bilibili/hot/other?keyword=x", "/bilibili/hot/search")).toBe(false);
+  });
+
+  it("lets catch-all params consume the rest of the path", () => {
+    expect(templateMatches("/81/81rc/sy/gzdt_210283", "/81/81rc/:category{.+}?")).toBe(true);
+    expect(templateMatches("/rss/https://example.com/feed.xml", "/rss/:url{.+}")).toBe(true);
+    expect(templateMatches("/81/81rc", "/81/81rc/:category{.+}?")).toBe(true);
+    expect(templateMatches("/rss", "/rss/:url{.+}")).toBe(false);
+    expect(templateMatches("/81/other/sy", "/81/81rc/:category{.+}?")).toBe(false);
   });
 });
 

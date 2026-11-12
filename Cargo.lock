@@ -3556,6 +3556,7 @@ dependencies = [
  "feed-rs",
  "flate2",
  "imap",
+ "libc",
  "log",
  "lol_html",
  "mail-parser",

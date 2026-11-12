@@ -803,9 +803,11 @@
     "rsshubRouteFetch": "无法从本地引擎获取该路由——路由可能暂时不可用、被限流，或目标站点拒绝了请求。",
     "rsshubRouteInvalid": "该 rsshub:// 链接缺少路由路径。",
     "rsshubRouteUnknown": "该路由不在内置目录中。",
+    "rsshubRouteNotInstalled": "请先在 RSSHub 市场安装这个路由 —— 只有已安装的路由才会刷新订阅。",
     "rsshubEnvInvalid": "环境变量名只能包含字母、数字和下划线，且以字母或下划线开头。",
     "rsshubEngineArchiveInvalid": "该文件不是有效的引擎包（.tar.gz / .zip）。",
-    "rsshubEngineChecksum": "下载的引擎包未通过 sha256 校验。"
+    "rsshubEngineChecksum": "下载的引擎包未通过 sha256 校验。",
+    "rsshubEngineEnvTooLarge": "合并后的路由环境变量超出进程环境大小上限 —— 请在市场里移除或缩短部分路由变量。"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

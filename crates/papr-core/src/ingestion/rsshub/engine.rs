@@ -44,6 +44,7 @@ pub const CODE_ENGINE_START: &str = "rsshubEngineStart";
 pub const CODE_ROUTE_FETCH: &str = "rsshubRouteFetch";
 pub const CODE_ARCHIVE_INVALID: &str = "rsshubEngineArchiveInvalid";
 pub const CODE_ARCHIVE_CHECKSUM: &str = "rsshubEngineChecksum";
+pub const CODE_ENV_TOO_LARGE: &str = "rsshubEngineEnvTooLarge";
 
 /// Health-check budget when *starting* the engine. First launch loads
 /// thousands of route modules; a cold start can take tens of seconds.
@@ -112,6 +113,64 @@ const ENV_ALLOWLIST: &[&str] = &[
     "no_proxy",
     "PROXY_URI",
 ];
+
+/// Sanity ceiling on the engine child's *total* environment size (names +
+/// values, bytes, including the C-string separators). `execve` caps argv +
+/// env together (`E2BIG` past the platform limit), so individually valid
+/// values (`rsshub::MAX_ENV_VALUE_BYTES` each) can still accumulate past it
+/// once merged across routes. The *effective* budget adapts to what this
+/// kernel actually accepts ([`execve_budget`]); this fixed ceiling only
+/// keeps a host with a huge `ARG_MAX` from accepting environments that are
+/// almost certainly a mistake.
+const MAX_TOTAL_ENV_BYTES: usize = 1024 * 1024;
+/// Headroom subtracted from the platform's `ARG_MAX` for argv (the node
+/// binary + entry path) and the kernel's per-string accounting slop.
+const ARGV_HEADROOM_BYTES: usize = 64 * 1024;
+/// Floor for the effective budget: even a tiny `RLIMIT_STACK`-derived
+/// `ARG_MAX` (Linux: soft stack / 4, floored at 32 pages ≈ 128 KiB) leaves
+/// this much room for a real environment, and a budget of zero would error
+/// every start regardless of configuration.
+const MIN_ENV_BUDGET_BYTES: usize = 96 * 1024;
+/// `E2BIG` — the errno `execve` returns when argv+env exceed the platform
+/// limit. The number is the same across the Unix targets we ship (Linux,
+/// macOS).
+#[cfg(unix)]
+const E2BIG: i32 = libc::E2BIG;
+
+/// The environment size this process's `execve` actually accepts, as a
+/// budget: `ARG_MAX − argv headroom`, clamped to the sanity ceiling. On
+/// Linux `_SC_ARG_MAX` already reflects the current `RLIMIT_STACK` (soft
+/// stack / 4, floored at 32 pages), so a low stack limit shrinks the budget
+/// instead of failing the spawn with `E2BIG`. Non-Unix platforms have no
+/// portable `ARG_MAX`; they get the fixed ceiling.
+fn execve_budget() -> usize {
+    budget_for(platform_arg_max())
+}
+
+/// The budget arithmetic, parameterized over the platform's `ARG_MAX` so the
+/// low-stack shape is testable without mutating this process's rlimits.
+fn budget_for(arg_max: Option<usize>) -> usize {
+    let budget = match arg_max {
+        Some(arg_max) => arg_max.saturating_sub(ARGV_HEADROOM_BYTES),
+        None => MAX_TOTAL_ENV_BYTES,
+    };
+    budget.clamp(MIN_ENV_BUDGET_BYTES, MAX_TOTAL_ENV_BYTES)
+}
+
+#[cfg(unix)]
+fn platform_arg_max() -> Option<usize> {
+    // `sysconf(_SC_ARG_MAX)` ≥ 1 MiB on macOS; on Linux it tracks
+    // `RLIMIT_STACK`. A negative or failed query falls back to the ceiling.
+    match unsafe { libc::sysconf(libc::_SC_ARG_MAX) } {
+        n if n > 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn platform_arg_max() -> Option<usize> {
+    None
+}
 
 /// The `engine.json` manifest. Written by `scripts/build-engine.sh` (camelCase)
 /// and by the installer after a successful install; snake_case aliases are
@@ -317,6 +376,10 @@ impl EngineManager {
 
         let port = free_port()
             .map_err(|e| AppError::other(format!("rsshub engine: no free port: {e}")))?;
+        // Enforce the execve size budget before touching the log files: an
+        // over-budget environment fails the spawn with E2BIG, and the coded
+        // error here is the actionable form of that failure.
+        let child_env = build_child_env(user_env, port)?;
         let log_path = self.root.join("engine.log");
 
         // The log file is opened twice (stdout + stderr share it in append
@@ -337,36 +400,15 @@ impl EngineManager {
             .stdout(std::process::Stdio::from(log_out))
             .stderr(std::process::Stdio::from(log_err))
             .kill_on_drop(true);
-        // Allowlisted host environment…
-        for key in ENV_ALLOWLIST {
-            if let Ok(value) = std::env::var(key) {
-                cmd.env(key, value);
-            }
-        }
-        // …then the user's route variables, which win on collision with the
-        // host environment…
-        for (k, v) in user_env {
+        for (k, v) in &child_env {
             cmd.env(k, v);
         }
-        // …and finally the manager's own variables, which the user's route
-        // variables must NOT override: `PORT` must match the port the health
-        // check probes, and `LISTEN_INADDR_ANY=0` is what keeps RSSHub bound
-        // to 127.0.0.1 — its default (bind any) would expose the engine, user
-        // cookies included, to the whole network. (RSSHub's `toBoolean` reads
-        // "0" as false; `lib/index.ts` then binds `127.0.0.1`.) The header
-        // size matches RSSHub's own production start command.
-        cmd.env("PORT", port.to_string())
-            .env("NODE_ENV", "production")
-            .env("LISTEN_INADDR_ANY", "0")
-            .env("NODE_OPTIONS", "--max-http-header-size=32768");
 
         log::info!(
             "rsshub engine: starting {} on 127.0.0.1:{port}",
             node_bin.display()
         );
-        let child = cmd
-            .spawn()
-            .map_err(|e| AppError::other(format!("rsshub engine: spawn: {e}")))?;
+        let child = cmd.spawn().map_err(|e| map_spawn_error(&e))?;
 
         if wait_healthy(port, budget).await {
             let mut guard = self.running.lock().await;
@@ -397,9 +439,12 @@ impl EngineManager {
         }
 
         // Start failed — reap the child so it cannot outlive the call, and
-        // surface the coded error (the log tail lives in engine.log).
+        // surface the coded error (the log tail lives in engine.log). The
+        // wait mirrors try_running/shutdown: kill alone can leave the
+        // process unreaped until the runtime's orphan sweep gets to it.
         let mut child = child;
         let _ = child.kill().await;
+        let _ = child.wait().await;
         log::error!("rsshub engine: did not become healthy within budget; see engine.log");
         Err(AppError::code(CODE_ENGINE_START))
     }
@@ -547,6 +592,60 @@ pub fn loopback_client() -> &'static reqwest::Client {
 /// includes the route's own upstream scrape (possibly a slow site), so this
 /// is deliberately wider than the feed client's default.
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Assemble the engine child's environment and enforce the execve size
+/// budget: allowlisted host variables first, then the user's route variables
+/// (winning on collision), then the manager's own fixed variables — which
+/// the user's route variables must NOT override (`PORT` must match the port
+/// the health check probes, and `LISTEN_INADDR_ANY=0` keeps RSSHub bound to
+/// 127.0.0.1 — its default (bind any) would expose the engine, user cookies
+/// included, to the whole network; RSSHub's `toBoolean` reads "0" as false
+/// and `lib/index.ts` then binds 127.0.0.1. The header size matches RSSHub's
+/// own production start command). Returns the coded
+/// [`CODE_ENV_TOO_LARGE`](CODE_ENV_TOO_LARGE) error when the merged size
+/// exceeds what this platform's `execve` accepts ([`execve_budget`]).
+fn build_child_env(
+    user_env: &BTreeMap<String, String>,
+    port: u16,
+) -> AppResult<BTreeMap<String, String>> {
+    let mut env: BTreeMap<String, String> = ENV_ALLOWLIST
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect();
+    env.extend(user_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.insert("PORT".into(), port.to_string());
+    env.insert("NODE_ENV".into(), "production".into());
+    env.insert("LISTEN_INADDR_ANY".into(), "0".into());
+    env.insert("NODE_OPTIONS".into(), "--max-http-header-size=32768".into());
+
+    // NAME + '=' + value + NUL per entry — the layout execve charges for.
+    let budget = execve_budget();
+    let total: usize = env.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+    if total > budget {
+        log::error!(
+            "rsshub engine: merged environment is {total} bytes, over the {budget}-byte budget"
+        );
+        return Err(AppError::code(CODE_ENV_TOO_LARGE));
+    }
+    Ok(env)
+}
+
+/// Map a spawn failure onto the coded error space: `E2BIG` means the
+/// environment/argv budget check above was still too permissive for what
+/// this kernel accepts right now (budgets are advisory limits, errno is the
+/// truth) — surface the same actionable code instead of a cryptic OS error.
+fn map_spawn_error(err: &std::io::Error) -> AppError {
+    #[cfg(unix)]
+    if err.raw_os_error().is_some_and(|code| code == E2BIG) {
+        log::error!("rsshub engine: spawn failed with E2BIG — environment over the kernel's limit");
+        return AppError::code(CODE_ENV_TOO_LARGE);
+    }
+    AppError::other(format!("rsshub engine: spawn: {err}"))
+}
 
 /// Poll the engine's health endpoint until it answers or the budget runs out.
 ///
@@ -1065,6 +1164,66 @@ mod tests {
         let err = mgr.ensure(&BTreeMap::new()).await.unwrap_err();
         assert_eq!(err.code_str(), CODE_ENGINE_MISSING);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn build_child_env_layers_host_user_and_fixed_vars() {
+        // The manager's own variables survive a colliding user entry: PORT,
+        // NODE_ENV, LISTEN_INADDR_ANY and NODE_OPTIONS are not user-overrideable.
+        let mut user = BTreeMap::new();
+        user.insert("PORT".to_string(), "99999".to_string());
+        user.insert("MY_TOKEN".to_string(), "secret".to_string());
+        let env = build_child_env(&user, 49152).unwrap();
+        assert_eq!(env.get("PORT").map(String::as_str), Some("49152"));
+        assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
+        assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
+        assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
+    }
+
+    #[test]
+    fn build_child_env_refuses_budget_overrun() {
+        // Individually valid entries (each well under the per-value ceiling)
+        // must still trip the *total* budget instead of failing execve with
+        // E2BIG later.
+        let mut user = BTreeMap::new();
+        for i in 0..24 {
+            user.insert(format!("BULK_VAR_{i}"), "v".repeat(60_000));
+        }
+        let err = build_child_env(&user, 49152).unwrap_err();
+        assert_eq!(err.code_str(), CODE_ENV_TOO_LARGE);
+    }
+
+    #[test]
+    fn budget_tracks_the_platform_arg_max() {
+        // A generous ARG_MAX (macOS: 1 MiB) is capped by the sanity ceiling;
+        // Linux's big-stack 2 MiB case likewise.
+        assert_eq!(
+            budget_for(Some(1024 * 1024)),
+            MAX_TOTAL_ENV_BYTES - ARGV_HEADROOM_BYTES
+        );
+        assert_eq!(budget_for(Some(4 * 1024 * 1024)), MAX_TOTAL_ENV_BYTES);
+        // A small RLIMIT_STACK (512 KiB → ARG_MAX 128 KiB on Linux) shrinks
+        // the budget instead of letting the spawn fail with E2BIG; the floor
+        // keeps it above zero. The Linux kernel floors ARG_MAX at 32 pages
+        // (128 KiB), which stays above the floor budget.
+        assert_eq!(budget_for(Some(32 * 4096)), MIN_ENV_BUDGET_BYTES);
+        // No portable ARG_MAX (non-Unix, or a failed sysconf): the ceiling.
+        assert_eq!(budget_for(None), MAX_TOTAL_ENV_BYTES);
+        // The live budget never exceeds what this process's execve accepts.
+        if let Some(arg_max) = platform_arg_max() {
+            assert!(execve_budget() <= arg_max);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_error_maps_e2big_to_the_coded_key() {
+        let e2big = std::io::Error::from_raw_os_error(libc::E2BIG);
+        assert_eq!(map_spawn_error(&e2big).code_str(), CODE_ENV_TOO_LARGE);
+        let other = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_ne!(map_spawn_error(&other).code_str(), CODE_ENV_TOO_LARGE);
+        let plain = std::io::Error::other("pathological");
+        assert_ne!(map_spawn_error(&plain).code_str(), CODE_ENV_TOO_LARGE);
     }
 
     #[cfg(unix)]

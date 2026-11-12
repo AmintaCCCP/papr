@@ -230,15 +230,66 @@ export function catalogCategories(
     .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
 }
 
-/** Extract the `:param` / `:param?` placeholders of a route template, in
- *  order of appearance. */
-export function extractParams(template: string): { name: string; optional: boolean }[] {
-  const out: { name: string; optional: boolean }[] = [];
-  for (const seg of template.split("/")) {
-    if (!seg.startsWith(":")) continue;
-    const optional = seg.endsWith("?");
-    const name = optional ? seg.slice(1, -1) : seg.slice(1);
-    if (name) out.push({ name, optional });
+/** One template parameter, parsed out of its path segment. */
+export interface RouteParam {
+  name: string;
+  optional: boolean;
+  /** A hono regex-constrained param (`:name{.+}`) — its value spans
+   *  slashes, so the concrete path may carry several segments. */
+  catchAll: boolean;
+}
+
+/** Split a route template into segments, treating a slash inside a `{…}`
+ *  regex constraint as part of the segment rather than a separator: hono
+ *  applies the brace regex to the remaining path, and the npm scoped-package
+ *  template carries a literal slash inside the braces that must not split it
+ *  into a param fragment plus a garbage literal. */
+function splitTemplateSegments(template: string): string[] {
+  const segments: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of template) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth = Math.max(0, depth - 1);
+    if (ch === "/" && depth === 0) {
+      segments.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  segments.push(current);
+  return segments;
+}
+
+/** Parse one template segment into its parameter shape, or `null` when the
+ *  segment is a literal. Handles hono's suffixes: the optional `?` trails
+ *  everything (`:name?`, `:name{.+}?`) and the regex constraint sits in
+ *  braces (as in the npm route's scoped-package pattern). */
+function parseParamSegment(seg: string): RouteParam | null {
+  if (!seg.startsWith(":")) return null;
+  let body = seg.slice(1);
+  let optional = false;
+  if (body.endsWith("?")) {
+    optional = true;
+    body = body.slice(0, -1);
+  }
+  let catchAll = false;
+  const brace = body.indexOf("{");
+  if (brace >= 0) {
+    catchAll = true;
+    body = body.slice(0, brace);
+  }
+  return { name: body, optional, catchAll };
+}
+
+/** Extract the `:param` / `:param?` / `:param{.+}` placeholders of a route
+ *  template, in order of appearance. */
+export function extractParams(template: string): RouteParam[] {
+  const out: RouteParam[] = [];
+  for (const seg of splitTemplateSegments(template)) {
+    const p = parseParamSegment(seg);
+    if (p && p.name) out.push(p);
   }
   return out;
 }
@@ -246,23 +297,37 @@ export function extractParams(template: string): { name: string; optional: boole
 /** Substitute the user's parameter values into a route template, producing
  *  the concrete path to subscribe with. Returns `null` while any required
  *  parameter is still empty — the "install" buttons stay disabled then.
- *  Optional parameters left empty simply drop out of the path. */
+ *  Optional parameters left empty simply drop out of the path. A catch-all
+ *  parameter's value may span segments: each slash-separated part is
+ *  encoded, the separators themselves are kept. */
 export function concretePath(
   template: string,
   values: Record<string, string>,
 ): string | null {
   const segments: string[] = [];
-  for (const seg of template.split("/")) {
-    if (!seg.startsWith(":")) {
+  for (const seg of splitTemplateSegments(template)) {
+    const p = parseParamSegment(seg);
+    if (!p) {
       segments.push(seg);
       continue;
     }
-    const optional = seg.endsWith("?");
-    const name = optional ? seg.slice(1, -1) : seg.slice(1);
-    const value = (values[name] ?? "").trim();
+    const value = (values[p.name] ?? "").trim();
+    if (p.catchAll) {
+      // Split and rejoin with the separators intact — `encodeURIComponent`
+      // leaves `/` alone, so each part round-trips and a `//` in the value
+      // (e.g. the scheme of a URL for `/rss/:url{.+}`) survives.
+      const parts = value.split("/");
+      if (parts.some((s) => s !== "")) {
+        segments.push(parts.map(encodeURIComponent).join("/"));
+      } else if (!p.optional) {
+        return null; // a required catch-all is missing
+      }
+      // An empty optional catch-all drops out of the path.
+      continue;
+    }
     if (value) {
       segments.push(encodeURIComponent(value));
-    } else if (optional) {
+    } else if (p.optional) {
       continue; // drop the empty optional segment
     } else {
       return null; // a required parameter is missing
@@ -276,7 +341,8 @@ export function concretePath(
  *  placeholder segments are matched positionally against the example's
  *  segments. The example may omit trailing optional parameters, but any
  *  bigger shape mismatch (different fixed segments) disables the prefill
- *  rather than filling wrong values. */
+ *  rather than filling wrong values — except around a catch-all parameter,
+ *  which absorbs every example segment from its position on. */
 export function paramsFromExample(
   template: string,
   example: string | null | undefined,
@@ -295,7 +361,31 @@ export function paramsFromExample(
     }
   }
   const exampleSegments = path.split("/").filter((s) => s !== "");
-  const templateSegments = template.split("/").filter((s) => s !== "");
+  const templateSegments = splitTemplateSegments(template).filter(
+    (s) => s !== "",
+  );
+  const parsed = templateSegments.map(parseParamSegment);
+  // A catch-all parameter eats the rest of the example: everything from its
+  // position on (joined back with slashes, the shape concretePath keeps).
+  const catchIdx = parsed.findIndex((p) => p?.catchAll);
+  if (catchIdx >= 0) {
+    // The literal segments before the catch-all must match the example
+    // exactly — a shape mismatch disables the prefill (parameters before it
+    // match positionally like everywhere else).
+    const literalsMatch =
+      exampleSegments.length >= catchIdx &&
+      parsed
+        .slice(0, catchIdx)
+        .every((p, i) => p !== null || exampleSegments[i] === templateSegments[i]);
+    if (!literalsMatch) return values;
+    parsed.forEach((p, i) => {
+      if (!p || i > catchIdx) return;
+      const value =
+        i === catchIdx ? exampleSegments.slice(i).join("/") : exampleSegments[i];
+      if (p.name && value) values[p.name] = value;
+    });
+    return values;
+  }
   // How many trailing optional parameters the example is allowed to skip.
   let trailingOptional = 0;
   for (let i = templateSegments.length - 1; i >= 0; i--) {
@@ -309,33 +399,50 @@ export function paramsFromExample(
   ) {
     return values;
   }
-  templateSegments.forEach((seg, i) => {
-    if (!seg.startsWith(":")) return;
-    const optional = seg.endsWith("?");
-    const name = optional ? seg.slice(1, -1) : seg.slice(1);
+  templateSegments.forEach((_seg, i) => {
+    const p = parsed[i];
+    if (!p) return;
     const value = exampleSegments[i];
-    if (name && value) values[name] = value;
+    if (p.name && value) values[p.name] = value;
   });
   return values;
 }
 
 /** Mirror of the Rust `template_matches`: true when a concrete route path
- *  instantiates the template (`:seg` matches any non-empty segment). */
+ *  instantiates the template (`:seg` matches any non-empty segment; a
+ *  `:seg{regex}` catch-all consumes the rest). A `?query` / `#fragment` on
+ *  the concrete link travels to the engine but never participates in
+ *  matching. Inner empty segments are preserved — an empty concrete segment
+ *  matches an optional parameter, mirroring the Rust implementation. */
 export function templateMatches(concrete: string, template: string): boolean {
-  const c = concrete.split("/").filter((s) => s !== "");
-  const t = template.split("/").filter((s) => s !== "");
+  const path = (concrete.split(/[?#]/)[0] ?? "").replace(/^\/+|\/+$/g, "");
+  const c = path === "" ? [""] : path.split("/");
+  const t = splitTemplateSegments(template.replace(/^\/+|\/+$/g, ""));
   let i = 0;
-  for (; i < c.length; i++) {
+  for (; i < t.length; i++) {
     const seg = t[i];
-    if (seg === undefined) return false; // concrete is deeper than the template
     if (!seg.startsWith(":")) {
       if (c[i] !== seg) return false;
-    } else if (c[i] === "") {
+      continue;
+    }
+    // A regex-constrained param spans slashes — it eats the rest of the
+    // concrete path (at least one segment unless optional).
+    if (seg.includes("{")) {
+      if (i < c.length) return true;
+      return seg.endsWith("?");
+    }
+    if (c[i] === undefined) {
+      // The concrete path ended mid-template: only optional segments may
+      // remain unmatched.
+      return t.slice(i).every((s) => s.endsWith("?"));
+    }
+    if (c[i] === "" && !seg.endsWith("?")) {
       return false; // a required param segment must have content
     }
   }
-  // Every remaining template segment must be optional (`:tail?`).
-  return t.slice(i).every((seg) => seg.endsWith("?"));
+  // Every remaining concrete segment must have been consumed — a concrete
+  // path deeper than the template does not match.
+  return i === c.length;
 }
 
 /** The env variables a route requires — an empty array when `requireConfig`
