@@ -1154,7 +1154,9 @@ mod tests {
         let app = staging.join("app").join("dist");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::create_dir_all(staging.join("bin")).unwrap();
-        std::fs::write(staging.join("bin").join("node"), "binary").unwrap();
+        // `node_bin` picks the platform-correct name (node.exe on Windows),
+        // matching what `validate_staging` looks for.
+        std::fs::write(EngineManager::node_bin(&staging), "binary").unwrap();
         std::fs::write(app.join("index.js"), "// entry\n").unwrap();
         let info = EngineInfo {
             version: "1".into(),

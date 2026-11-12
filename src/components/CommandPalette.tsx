@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import * as api from "../api";
 import { useUi } from "../store";
 import { feedHost, relTime } from "../lib/feedMeta";
+import { isComposingKey } from "../lib/ime";
 import { modCombo } from "../lib/platform";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import type { ArticleSummary, Feed } from "../types";
@@ -211,9 +212,9 @@ export default function CommandPalette({
       e.preventDefault();
       const it = items[active];
       if (it) run(it);
-    } else if (e.key === "Escape" && !e.nativeEvent.isComposing) {
-      // The same `isComposing` guard skips the Escape that only cancels an
-      // IME candidate — closing the palette would drop the typed query.
+    } else if (e.key === "Escape" && !isComposingKey(e.nativeEvent)) {
+      // The same guard skips the Escape that only cancels an IME candidate
+      // — closing the palette would drop the typed query.
       e.preventDefault();
       onClose();
     }

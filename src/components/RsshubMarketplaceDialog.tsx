@@ -286,7 +286,10 @@ function MarketTab({
                       {hit.route.features.antiCrawler && (
                         <Icon name="info" size={12} color="var(--muted)" />
                       )}
-                      {hit.route.features.requirePuppeteer && (
+                      {/* Same condition the detail pane gates install on —
+                          with the browser engine these routes are ordinary
+                          routes, so no badge. */}
+                      {hit.route.features.requirePuppeteer && !browserEngine && (
                         <span className="rsshub-unsupported">
                           {t("settings.rsshub.unsupported")}
                         </span>
