@@ -5,6 +5,7 @@ import * as api from "../api";
 import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { reportError } from "../toast";
+import { isComposingKey } from "../lib/ime";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import FeedAvatar from "./FeedAvatar";
 import Icon from "./Icon";
@@ -102,13 +103,13 @@ export default function ExploreDialog({ onClose, onToast }: Props) {
     });
   }, [entries, category, search]);
 
-  // Escape closes the dialog from anywhere inside it.
+  // Escape closes the dialog from anywhere inside it. The `isComposingKey`
+  // guard skips the Escape that only cancels an IME candidate window.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);

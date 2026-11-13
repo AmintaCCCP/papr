@@ -63,6 +63,9 @@ export interface RsshubRouteRow {
 /** What engine_status reports (mirrors rsshub::engine::EngineStatus). */
 export interface RsshubEngineInfo {
   version: string;
+  /** "standard" (Node + RSSHub only) or "browser" (also ships a headless
+   *  Chromium for requirePuppeteer routes). Empty on pre-flavor engines. */
+  flavor: string;
   rsshubRevision: string;
   nodeVersion: string;
   installedAt: string;

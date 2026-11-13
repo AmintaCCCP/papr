@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { isComposingKey } from "../lib/ime";
 import Icon from "./Icon";
 
 interface Props {
@@ -69,9 +70,10 @@ export default function Lightbox({ srcs, index, onClose }: Props) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-      else if (e.key === "ArrowLeft") prev();
-      else if (e.key === "ArrowRight") next();
+      // Skip the Escape that only cancels an IME candidate window.
+      if (e.key === "Escape" && !isComposingKey(e)) onClose();
+      else if (e.key === "ArrowLeft" && !isComposingKey(e)) prev();
+      else if (e.key === "ArrowRight" && !isComposingKey(e)) next();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

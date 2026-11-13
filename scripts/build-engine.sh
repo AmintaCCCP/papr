@@ -3,21 +3,33 @@
 #
 # The engine is a directory layout the app's EngineManager understands:
 #
-#   engine.json                    { version, rsshubRevision, nodeVersion }
+#   engine.json                    { version, flavor, rsshubRevision, nodeVersion }
 #   bin/node                       the bundled Node runtime (node.exe on Windows)
 #   app/                           the RSSHub build product
 #     package.json  dist/  node_modules/   (production deps only)
+#   browser/                       browser-flavor only: the bundled headless
+#                                  Chromium the patchright registry resolves
 #
-# Browser-automation packages (patchright / playwright / puppeteer) are never
-# installed into the product: routes that need them are marked unsupported in
-# the marketplace. sharp keeps its prebuilt platform binaries via a plain
-# production install on the build platform.
+# Two flavors:
 #
-# Usage: scripts/build-engine.sh [--fresh]
-#   --fresh   wipe the RSSHub clone / node_modules cache and rebuild from master
+#   standard (default)  Browser-automation packages (patchright / playwright /
+#                       puppeteer) are never installed into the product; routes
+#                       that need them are gated in the marketplace.
+#   browser (--browser) Keeps patchright (RSSHub's own production dependency)
+#                       and ships a headless Chromium under browser/, so
+#                       `features.requirePuppeteer` routes run locally too.
+#                       The archive is ~200 MB heavier; the engine child gets
+#                       PLAYWRIGHT_BROWSERS_PATH pointing at it.
+#
+# sharp keeps its prebuilt platform binaries via a plain production install on
+# the build platform.
+#
+# Usage: scripts/build-engine.sh [--fresh] [--browser]
+#   --fresh    wipe the RSSHub clone / node_modules cache and rebuild from master
+#   --browser  build the browser flavor (headless Chromium bundled)
 #
 # Outputs into target/engine/ (gitignored):
-#   rsshub-engine-<platform>-<node>-<rev>.tar.gz + .sha256
+#   rsshub-engine[-browser]-<platform>-<node>-<rev>.tar.gz + .sha256
 #
 # Heavy artifacts (the RSSHub clone, pnpm store, Node distribution) are cached
 # under target/engine-cache/ so repeated runs are cheap.
@@ -35,7 +47,15 @@ else
 fi
 CACHE="$REPO_ROOT/target/engine-cache"
 OUT="$REPO_ROOT/target/engine"
-FRESH="${1:-}"
+FRESH=""
+FLAVOR="standard"
+for arg in "$@"; do
+  case "$arg" in
+    --fresh) FRESH="--fresh" ;;
+    --browser) FLAVOR="browser" ;;
+    *) echo "unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
 
 mkdir -p "$CACHE" "$OUT"
 
@@ -167,8 +187,7 @@ cp -R "$RSSHUB/$(dirname "$ENTRY")" "$STAGING/app/"
 (
   cd "$STAGING/app"
   # Production install into the staging copy: pulls only runtime deps with
-  # the right prebuilt binaries for this platform (sharp included) and no
-  # browser-automation packages, which are dev dependencies of RSSHub.
+  # the right prebuilt binaries for this platform (sharp included).
   # --no-frozen-lockfile: with --prod, pnpm refilters the lockfile and trips
   # over RSSHub's `overrides` when it is frozen; the staging copy is
   # disposable, so unfrozen resolution (still lockfile-seeded) is fine here.
@@ -176,11 +195,34 @@ cp -R "$RSSHUB/$(dirname "$ENTRY")" "$STAGING/app/"
   export PUPPETEER_SKIP_DOWNLOAD=true
   export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
   ${PNPM[@]} install --prod --no-frozen-lockfile
-  # Belt and braces: no browser automation may ship, even if the lockfile
-  # ever reclassifies it.
-  rm -rf node_modules/patchright node_modules/playwright node_modules/playwright-core \
-        node_modules/puppeteer node_modules/puppeteer-core node_modules/@puppeteer 2>/dev/null || true
+  if [ "$FLAVOR" = "standard" ]; then
+    # Belt and braces: no browser automation may ship in the standard flavor,
+    # even if the lockfile ever reclassifies it. The browser flavor keeps
+    # patchright (RSSHub's own production dependency) — the bundled Chromium
+    # below is what makes requirePuppeteer routes work.
+    rm -rf node_modules/patchright node_modules/playwright node_modules/playwright-core \
+          node_modules/puppeteer node_modules/puppeteer-core node_modules/@puppeteer 2>/dev/null || true
+  fi
 )
+
+if [ "$FLAVOR" = "browser" ]; then
+  echo "==> downloading headless Chromium into staging/browser"
+  # The patchright CLI resolves its registry layout (chromium-<rev>/…) under
+  # PLAYWRIGHT_BROWSERS_PATH, which is exactly what the engine child points
+  # back at runtime (see engine.rs build_child_env). No --no-shell: this
+  # mirrors RSSHub's own Dockerfile (`patchright install chromium`), so
+  # headless launches resolve the same binaries the upstream image ships.
+  (
+    cd "$STAGING/app"
+    PLAYWRIGHT_BROWSERS_PATH="$STAGING/browser" ${PNPM[@]} exec patchright install chromium
+  )
+  # The registry dir must actually be there — a silent skip would ship an
+  # engine that 500s on every browser route.
+  if [ -z "$(ls -A "$STAGING/browser" 2>/dev/null)" ]; then
+    echo "patchright did not populate $STAGING/browser" >&2
+    exit 1
+  fi
+fi
 
 echo "==> bundling node"
 cp "$NODE_BIN" "$STAGING/bin/node"
@@ -189,6 +231,7 @@ cp "$NODE_BIN" "$STAGING/bin/node"
 cat > "$STAGING/engine.json" <<JSON
 {
   "version": "1",
+  "flavor": "$FLAVOR",
   "rsshubRevision": "$RSSHUB_REV",
   "nodeVersion": "$NODE_VERSION"
 }
@@ -205,7 +248,12 @@ sha256_of() {
   fi
 }
 
-ARCHIVE="$OUT/rsshub-engine-$PLATFORM-$NODE_VERSION-${RSSHUB_REV:0:12}.tar.gz"
+# The archive name carries the flavor so both builds can sit side by side in
+# target/engine/ (and on the engine prerelease).
+FLAVOR_SUFFIX=""
+[ "$FLAVOR" = "browser" ] && FLAVOR_SUFFIX="-browser"
+
+ARCHIVE="$OUT/rsshub-engine${FLAVOR_SUFFIX}-$PLATFORM-$NODE_VERSION-${RSSHUB_REV:0:12}.tar.gz"
 echo "==> packing $ARCHIVE"
 # COPYFILE_DISABLE keeps macOS BSD tar from packing AppleDouble `._` files
 # for every extended-attribute entry (pure junk in the distributed archive).

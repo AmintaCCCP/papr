@@ -41,6 +41,7 @@ import {
   type ParsersSettings,
 } from "../lib/parsers";
 import { modKey, modCombo } from "../lib/platform";
+import { isComposingKey } from "../lib/ime";
 import { reportError } from "../toast";
 import { checkForUpdates } from "../lib/updater";
 import { saveTextFile } from "../lib/save";
@@ -113,12 +114,17 @@ export default function SettingsDialog({
   const version = useAppVersion();
   useFocusTrap(windowRef);
 
+  // Escape closes the dialog from anywhere inside it. `isComposingKey`
+  // skips the Escape that only cancels an IME candidate window; a nested
+  // modal (parser credentials / a confirm) renders its own backdrop inside
+  // this window — while one is up it owns Escape, so the outer close
+  // stands down rather than tearing down both layers at once.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      if (windowRef.current?.querySelector(".modal-backdrop")) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
@@ -1103,7 +1109,12 @@ function RsshubEngineGroup() {
                 status.data?.running
                   ? "settings.rsshub.engineRunning"
                   : "settings.rsshub.engineIdle",
-              )
+              ) +
+              // The flavor decides whether requirePuppeteer routes run, so
+              // surface it right where the engine's state is read.
+              (info?.flavor === "browser"
+                ? ` · ${t("settings.rsshub.engineFlavorBrowser")}`
+                : "")
             : t("settings.rsshub.engineNotInstalledDesc")
         }
       >
@@ -1880,13 +1891,14 @@ function ParserSettingsModal({
   const [testResult, setTestResult] = useState<string | null>(null);
 
   // Escape must close the dialog regardless of which control has focus —
-  // an input-level handler dies as soon as the user tabs to a button.
+  // an input-level handler dies as soon as the user tabs to a button. The
+  // `isComposingKey` guard skips the Escape that only cancels an IME
+  // candidate window (cookie fields are the place users type CJK notes).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-      }
+      if (e.key !== "Escape" || isComposingKey(e) || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
