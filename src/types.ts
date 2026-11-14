@@ -10,6 +10,11 @@ export type SourceType =
   | "newsletter"
   /** An X (Twitter) user timeline served by the built-in X parser. */
   | "x"
+  /** A Xiaohongshu (RED) blogger profile served by the built-in
+   *  Xiaohongshu parser. */
+  | "xiaohongshu"
+  /** A Kuaishou creator profile served by the built-in Kuaishou parser. */
+  | "kuaishou"
   /** An RSSHub route executed by the bundled local engine. */
   | "rsshub";
 
