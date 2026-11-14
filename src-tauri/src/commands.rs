@@ -13,6 +13,7 @@ use crate::ingestion::sources::{self, Normalized};
 use crate::ingestion::{fetch, parse};
 
 use crate::models::*;
+use crate::folo;
 use crate::opml;
 use crate::sanitize;
 use crate::scheduler;
@@ -1609,6 +1610,172 @@ pub async fn export_opml(state: State<'_, AppState>) -> AppResult<String> {
     let conn = state.read().await;
     let feeds = db::feeds_for_export(&conn)?;
     opml::build(&feeds)
+}
+
+// ─────────────────────────── Folo lists ───────────────────────────
+
+/// One feed of a Folo list, as the import tab's preview renders it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoloPreviewFeed {
+    /// The URL an import would store — possibly rewritten by the Twitter
+    /// mapping, else Folo's original.
+    pub url: String,
+    pub title: String,
+    /// `true` when the URL was rewritten to the native X parser's form.
+    pub mapped: bool,
+    /// `true` when the URL has no papr equivalent and an import skips it.
+    pub unsupported: bool,
+}
+
+/// The preview card the Folo import tab renders before importing.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoloListPreview {
+    pub list_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub image: Option<String>,
+    pub owner_name: Option<String>,
+    pub subscription_count: u64,
+    /// Total feeds in the list per Folo's own counter.
+    pub feed_count: usize,
+    /// How many of the embedded feeds an import would take.
+    pub importable: usize,
+    /// How many embedded feeds have no papr equivalent.
+    pub unsupported: usize,
+    /// `true` when Folo's anonymous cap hid part of the list — an import
+    /// covers only the embedded feeds unless a Folo token lifts the cap.
+    pub truncated: bool,
+    pub feeds: Vec<FoloPreviewFeed>,
+}
+
+/// Result of a Folo list import, shown as a toast after the fact.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoloImportReport {
+    pub list_title: String,
+    pub imported: usize,
+    pub skipped: usize,
+    pub unsupported: usize,
+    /// The list's total size when Folo only embedded part of it (the
+    /// anonymous cap), `None` when everything arrived.
+    pub truncated_total: Option<usize>,
+}
+
+/// Resolve the effective Folo API token: the caller's explicit token wins,
+/// otherwise the stored `folo_token` setting applies. Also clones the shared
+/// HTTP client out of the state in the same short lock.
+async fn folo_request_context(
+    state: &AppState,
+    token: Option<String>,
+) -> (reqwest::Client, Option<String>) {
+    let client = state.http.read().unwrap().clone();
+    let stored = {
+        let conn = state.db.lock().await;
+        db::get_setting(&conn, "folo_token").ok().flatten()
+    };
+    let token = token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .or(stored);
+    (client, token)
+}
+
+/// Fetch and shape a Folo shared list for the import tab's preview card.
+/// Anonymous requests embed only the first few feeds (Folo's backend cap);
+/// a Folo token — passed or stored — lifts it.
+#[tauri::command]
+pub async fn preview_folo_list(
+    state: State<'_, AppState>,
+    url: String,
+    token: Option<String>,
+    map_twitter: bool,
+) -> AppResult<FoloListPreview> {
+    let (client, token) = folo_request_context(&state, token).await;
+    let list = folo::fetch_list(&client, &url, token.as_deref()).await?;
+    let mut preview_feeds = Vec::with_capacity(list.feeds.len());
+    let mut importable = 0;
+    let mut unsupported = 0;
+    for feed in &list.feeds {
+        let converted = folo::convert_feed_url(&feed.url, map_twitter);
+        let (url, mapped) = match converted {
+            folo::FeedConversion::Mapped(url) => (url, true),
+            folo::FeedConversion::Keep(url) => (url, false),
+            folo::FeedConversion::Unsupported => {
+                unsupported += 1;
+                preview_feeds.push(FoloPreviewFeed {
+                    url: feed.url.clone(),
+                    title: folo::display_title(feed).to_string(),
+                    mapped: false,
+                    unsupported: true,
+                });
+                continue;
+            }
+        };
+        importable += 1;
+        preview_feeds.push(FoloPreviewFeed {
+            url,
+            title: folo::display_title(feed).to_string(),
+            mapped,
+            unsupported: false,
+        });
+    }
+    let truncated = list.truncated();
+    Ok(FoloListPreview {
+        list_id: list.id,
+        title: list.title,
+        description: list.description,
+        image: list.image,
+        owner_name: list.owner_name,
+        subscription_count: list.subscription_count,
+        feed_count: list.feed_count,
+        importable,
+        unsupported,
+        truncated,
+        feeds: preview_feeds,
+    })
+}
+
+/// Import the feeds of a Folo shared list — the desktop twin of
+/// `papr folo import`. Feeds whose URL has no papr equivalent are skipped;
+/// already-subscribed URLs are counted, not re-inserted. Kicks off a refresh
+/// afterwards, exactly like the OPML import.
+#[tauri::command]
+pub async fn import_folo_list(
+    app: AppHandle,
+    url: String,
+    token: Option<String>,
+    folder_id: Option<i64>,
+    map_twitter: bool,
+) -> AppResult<FoloImportReport> {
+    let list = {
+        let state = app.state::<AppState>();
+        let (client, token) = folo_request_context(&state, token).await;
+        let list = folo::fetch_list(&client, &url, token.as_deref()).await?;
+        let (rows, unsupported) = folo::to_imported(&list, map_twitter, None);
+        // The whole import runs in one transaction inside papr-core; the
+        // writer lock is held only for its duration, never across the fetch.
+        let (imported, skipped) = {
+            let conn = state.db.lock().await;
+            folo::import_feeds(&conn, &rows, folder_id)?
+        };
+        let truncated_total = list.truncated().then_some(list.feed_count);
+        FoloImportReport {
+            list_title: list.title,
+            imported,
+            skipped,
+            unsupported,
+            truncated_total,
+        }
+    };
+    // Newly imported feeds have no articles yet — refresh like the OPML
+    // import does, queueing behind any in-flight run.
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = scheduler::refresh_all(&app2, None, true, scheduler::RefreshScope::All).await;
+    });
+    Ok(list)
 }
 
 // ─────────────────────────── file read / write ───────────────────────────

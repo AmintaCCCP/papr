@@ -13,6 +13,7 @@ pub mod ai;
 pub mod db;
 pub mod error;
 pub mod extraction;
+pub mod folo;
 pub mod ingestion;
 pub mod models;
 pub mod opml;

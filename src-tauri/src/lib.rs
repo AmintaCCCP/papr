@@ -6,7 +6,7 @@
 // `papr-core` (shared with the agent CLI). Re-export them under their original
 // crate paths so the rest of the app keeps referring to `crate::db`,
 // `crate::ingestion`, etc. unchanged.
-pub use papr_core::{ai, db, error, extraction, ingestion, models, opml, sanitize, sync};
+pub use papr_core::{ai, db, error, extraction, folo, ingestion, models, opml, sanitize, sync};
 
 mod backing;
 mod commands;
@@ -283,6 +283,8 @@ pub fn run() {
             commands::save_image,
             commands::import_opml,
             commands::export_opml,
+            commands::preview_folo_list,
+            commands::import_folo_list,
             commands::save_text_file,
             commands::get_setting,
             commands::set_setting,

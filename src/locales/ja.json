@@ -75,7 +75,25 @@
     "discoverNoResults": "フィードが見つかりません — 別のキーワードを試すか、URL を貼り付けてください。",
     "discoverError": "検索に失敗しました — 接続を確認して再試行してください。",
     "discoverFromPage": "このページで見つかったフィード",
-    "discoverAdd": "追加"
+    "discoverAdd": "追加",
+    "tabFolo": "Folo リスト",
+    "foloHint": "Folo リストの共有リンクを貼り付けて、プレビューしてから一括インポートできます。",
+    "foloUrlPlaceholder": "https://app.folo.is/share/lists/…",
+    "foloUrlLabel": "Folo リストのリンクまたは ID",
+    "foloFetch": "プレビューを取得",
+    "foloFetching": "取得中…",
+    "foloImport": "{{count}} 件のフィードをインポート",
+    "foloImporting": "インポート中…",
+    "foloBy": "{{owner}} 作成",
+    "foloStats": "フィード {{feeds}} 件 · 購読者 {{subscribers}} 人",
+    "foloTruncated": "匿名アクセスでは {{total}} 件中の最初の {{visible}} 件のみ取得できます。設定 → 購読 で Folo トークンを設定するとすべてインポートできます。",
+    "foloUnsupported": "{{count}} 件のフィードは未対応のためスキップされます。",
+    "foloMappedBadge": "X",
+    "foloUnsupportedBadge": "未対応",
+    "foloMapTwitter": "Twitter ルートをネイティブ X パーサーに書き換える",
+    "foloImported": "{{imported}} 件をインポートし、既購読 {{skipped}} 件をスキップしました",
+    "foloUnsupportedNote": "未対応 {{count}} 件",
+    "foloTruncatedNote": "リストには合計 {{total}} 件あります（匿名アクセスでは一部のみ）"
   },
   "editFeed": {
     "title": "フィードを編集",
@@ -364,7 +382,13 @@
       "noMatch": "一致するフィードがありません。",
       "opmlExported": "OPML をエクスポートしました",
       "opmlImported": "OPML から {{count}} 件のフィードをインポートしました",
-      "unsubscribed": "{{title}} の購読を解除しました"
+      "unsubscribed": "{{title}} の購読を解除しました",
+      "foloTokenTitle": "Folo",
+      "foloTokenLabel": "Folo API トークン（任意）",
+      "foloTokenDesc": "ログイン済み Folo セッションのアクセストークンを貼り付けると、リストのインポート時にすべてのフィードを取得できます（匿名では最初の数件のみ）。トークンはパーサー資格情報と同様、ローカルデータベースに平文で保存されます。",
+      "foloTokenPlaceholder": "トークンを貼り付け（空欄 = 匿名アクセス）",
+      "foloTokenSaved": "Folo トークンを保存しました",
+      "foloTokenCleared": "Folo トークンを消去しました"
     },
     "filters": {
       "title": "フィルタールール",
@@ -849,7 +873,10 @@
     "rsshubEngineChecksum": "ダウンロードしたエンジンアーカイブが sha256 チェックに失敗しました。",
     "rsshubEngineEnvTooLarge": "マージされたルート環境変数がプロセス環境の上限を超えています —— マーケットプレイスで一部のルート変数を削除または短くしてください。",
     "editUrlUnsupported": "この購読のアドレスは編集できません — 購読解除して新しいソースで再追加してください",
-    "feedUrlChanged": "このフィードは別のウィンドウで編集されました — ダイアログを開き直してから変更してください"
+    "feedUrlChanged": "このフィードは別のウィンドウで編集されました — ダイアログを開き直してから変更してください",
+    "foloInvalidRef": "Folo リストの参照ではありません — app.folo.is/share/lists/… 形式の共有リンクか、数字のみの ID を貼り付けてください",
+    "foloListNotFound": "Folo にそのリストは存在しません — リンクが間違っているか、リストが削除された可能性があります",
+    "foloTokenRejected": "Folo がトークンを拒否しました — 設定 → 購読 で確認して再試行してください"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

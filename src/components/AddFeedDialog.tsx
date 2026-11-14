@@ -7,7 +7,7 @@ import { useFocusTrap } from "../hooks/useFocusTrap";
 import { errorText } from "../lib/errors";
 import { isComposingKey } from "../lib/ime";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
-import type { DiscoveryResult } from "../types";
+import type { DiscoveryResult, FoloListPreview } from "../types";
 import Icon from "./Icon";
 
 interface Props {
@@ -18,7 +18,7 @@ interface Props {
 }
 
 /** Which kind of source the dialog is currently configuring. */
-type Tab = "feed" | "newsletter";
+type Tab = "feed" | "newsletter" | "folo";
 
 /** The IMAP port `add_newsletter_source` falls back to (implicit-TLS IMAP). */
 const DEFAULT_IMAP_PORT = 993;
@@ -131,9 +131,104 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
     },
   });
 
+  // ── folo tab state ──
+  const [foloUrl, setFoloUrl] = useState("");
+  // Rewrite `rsshub://twitter/user/*` to the native X parser — on by
+  // default, since this fork's X parser only needs its own credentials while
+  // RSSHub's Twitter routes need extra environment variables.
+  const [foloMapTwitter, setFoloMapTwitter] = useState(true);
+  const [foloPreview, setFoloPreview] = useState<FoloListPreview | null>(null);
+  // Identity of the request currently allowed to land. TanStack mutations
+  // settle whenever the response arrives — if the user retyped the URL or
+  // flipped the mapping while a fetch was in flight, that response describes
+  // inputs the form no longer holds, so it must be dropped, not rendered
+  // (otherwise the card would show list A under input B, and a non-empty
+  // preview would block ever fetching B).
+  const foloReqRef = useRef<{ url: string; mapTwitter: boolean } | null>(null);
+
+  // The preview is fetched on demand (button / Enter), not while typing —
+  // each call hits Folo's API, and the import only ever runs against a
+  // preview the user has actually seen.
+  const fetchPreview = useMutation({
+    mutationFn: (req: { url: string; mapTwitter: boolean }) => {
+      foloReqRef.current = req;
+      return api
+        .fetchFoloList(req.url, req.mapTwitter)
+        .then((p) => ({ p, req }));
+    },
+    onSuccess: ({ p, req }) => {
+      // Land only when this exact request is still the one the form wants —
+      // a newer fetch (or an edit / toggle) has meanwhile taken over.
+      if (foloReqRef.current === req) {
+        foloReqRef.current = null;
+        setFoloPreview(p);
+      }
+    },
+    onError: (_e, req) => {
+      if (foloReqRef.current === req) {
+        foloReqRef.current = null;
+        setFoloPreview(null);
+      }
+    },
+  });
+
+  const importFolo = useMutation({
+    mutationFn: () =>
+      api.importFoloList(foloUrl.trim(), folderId, foloMapTwitter),
+    onSuccess: (r) => {
+      actions.refreshAfterBulk();
+      // Compose the toast from the report — the truncation and unsupported
+      // segments only apply when non-zero, and plain concatenation of
+      // locale fragments reads badly, so each is its own full sentence.
+      const parts = [
+        t("addFeed.foloImported", { imported: r.imported, skipped: r.skipped }),
+      ];
+      if (r.unsupported > 0)
+        parts.push(t("addFeed.foloUnsupportedNote", { count: r.unsupported }));
+      if (r.truncatedTotal != null)
+        parts.push(
+          t("addFeed.foloTruncatedNote", { total: r.truncatedTotal }),
+        );
+      onToast(parts.join(" "));
+      onClose();
+    },
+  });
+
+  /** Editing the reference invalidates the shown preview — and drops any
+   *  in-flight fetch for the previous input, so its late response can't
+   *  masquerade as this one's. */
+  const editFoloUrl = (v: string) => {
+    setFoloUrl(v);
+    setFoloPreview(null);
+    foloReqRef.current = null;
+  };
+
+  /** Re-fetch the preview when the mapping toggle changes, so the card never
+   *  shows a rewrite the import won't do. An in-flight fetch for the old
+   *  option is dropped (its result would be accepted against inputs it
+   *  wasn't asked for); a preview shown or a fetch running gets redone. */
+  useEffect(() => {
+    foloReqRef.current = null;
+    if (foloUrl.trim() && (foloPreview || fetchPreview.isPending)) {
+      fetchPreview.mutate({ url: foloUrl.trim(), mapTwitter: foloMapTwitter });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberate:
+    // only the toggle re-triggers this, not the preview it re-reads
+  }, [foloMapTwitter]);
+
   const submit = () => {
     if (tab === "feed") {
       if (url.trim() && !add.isPending) add.mutate(url.trim());
+    } else if (tab === "folo") {
+      // Before a preview exists, Enter / the primary button fetches it; once
+      // shown, they run the import itself (the folo tab therefore never
+      // submits a blind import).
+      if (foloPreview) {
+        if (foloPreview.importable > 0 && !importFolo.isPending)
+          importFolo.mutate();
+      } else if (foloUrl.trim() && !fetchPreview.isPending) {
+        fetchPreview.mutate({ url: foloUrl.trim(), mapTwitter: foloMapTwitter });
+      }
     } else {
       if (nlHost.trim() && nlUser.trim() && nlPass && !addNewsletter.isPending)
         addNewsletter.mutate();
@@ -206,6 +301,14 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
             onClick={() => setTab("newsletter")}
           >
             {t("addFeed.tabNewsletter")}
+          </button>
+          <button
+            role="tab"
+            aria-selected={tab === "folo"}
+            className={`seg-btn${tab === "folo" ? " active" : ""}`}
+            onClick={() => setTab("folo")}
+          >
+            {t("addFeed.tabFolo")}
           </button>
         </div>
 
@@ -301,6 +404,117 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
               <div className="modal-error">{errorText(add.error)}</div>
             )}
           </>
+        ) : tab === "folo" ? (
+          <>
+            <p className="modal-hint">{t("addFeed.foloHint")}</p>
+            <input
+              className="modal-input"
+              type="text"
+              autoFocus
+              placeholder={t("addFeed.foloUrlPlaceholder")}
+              aria-label={t("addFeed.foloUrlLabel")}
+              {...NO_AUTOCORRECT}
+              value={foloUrl}
+              onChange={(e) => editFoloUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) submit();
+              }}
+            />
+            {fetchPreview.isError && (
+              <div className="modal-error">
+                {errorText(fetchPreview.error)}
+              </div>
+            )}
+            {foloPreview && (
+              <div className="folo-preview">
+                <div className="folo-head">
+                  <span className="folo-title">{foloPreview.title}</span>
+                  {foloPreview.ownerName && (
+                    <span className="folo-sub">
+                      {t("addFeed.foloBy", {
+                        owner: foloPreview.ownerName,
+                      })}
+                    </span>
+                  )}
+                  <span className="folo-sub">
+                    {t("addFeed.foloStats", {
+                      feeds: foloPreview.feedCount,
+                      subscribers: foloPreview.subscriptionCount,
+                    })}
+                  </span>
+                </div>
+                {foloPreview.truncated && (
+                  <div className="folo-warning">
+                    {t("addFeed.foloTruncated", {
+                      visible: foloPreview.feeds.length,
+                      total: foloPreview.feedCount,
+                    })}
+                  </div>
+                )}
+                <div className="folo-feed-list">
+                  {foloPreview.feeds.map((f, i) => (
+                    <div
+                      key={`${i}-${f.url}`}
+                      className={`discover-row${f.unsupported ? " folo-unsupported" : ""}`}
+                    >
+                      <div className="discover-text">
+                        <span className="discover-title">{f.title}</span>
+                        <span className="discover-desc discover-url">
+                          {f.url}
+                        </span>
+                      </div>
+                      {f.mapped && (
+                        <span className="folo-badge">
+                          {t("addFeed.foloMappedBadge")}
+                        </span>
+                      )}
+                      {f.unsupported && (
+                        <span className="folo-badge">
+                          {t("addFeed.foloUnsupportedBadge")}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {foloPreview.unsupported > 0 && (
+                  <div className="folo-warning">
+                    {t("addFeed.foloUnsupported", {
+                      count: foloPreview.unsupported,
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+            {(folders.data?.length ?? 0) > 0 && (
+              <select
+                className="s-select"
+                style={{ width: "100%" }}
+                aria-label={t("addFeed.folderLabel")}
+                value={folderId ?? ""}
+                onChange={(e) =>
+                  setFolderId(e.target.value ? Number(e.target.value) : null)
+                }
+              >
+                <option value="">{t("addFeed.noFolder")}</option>
+                {folders.data!.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <label className="folo-map-row">
+              <input
+                type="checkbox"
+                checked={foloMapTwitter}
+                onChange={(e) => setFoloMapTwitter(e.target.checked)}
+              />
+              {t("addFeed.foloMapTwitter")}
+            </label>
+            {importFolo.isError && (
+              <div className="modal-error">{errorText(importFolo.error)}</div>
+            )}
+          </>
         ) : (
           <>
             <p className="modal-hint">{t("addFeed.newsletterHint")}</p>
@@ -389,6 +603,27 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
             >
               <Icon name="plus" size={12} />
               {add.isPending ? t("addFeed.adding") : t("addFeed.subscribe")}
+            </button>
+          ) : tab === "folo" ? (
+            <button
+              className="s-btn primary"
+              onClick={submit}
+              disabled={
+                foloPreview
+                  ? foloPreview.importable === 0 ||
+                    importFolo.isPending ||
+                    fetchPreview.isPending
+                  : !foloUrl.trim() || fetchPreview.isPending
+              }
+            >
+              <Icon name="plus" size={12} />
+              {foloPreview
+                ? importFolo.isPending
+                  ? t("addFeed.foloImporting")
+                  : t("addFeed.foloImport", { count: foloPreview.importable })
+                : fetchPreview.isPending
+                  ? t("addFeed.foloFetching")
+                  : t("addFeed.foloFetch")}
             </button>
           ) : (
             <button

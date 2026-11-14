@@ -10,6 +10,8 @@ import type {
   ArticleSummary,
   DiscoveryResult,
   Feed,
+  FoloImportReport,
+  FoloListPreview,
   Folder,
   Highlight,
   NewsletterInput,
@@ -162,6 +164,30 @@ export const extractFulltext = (articleId: number) =>
 export const importOpml = (content: string) =>
   invoke<number>("import_opml", { content });
 export const exportOpml = () => invoke<string>("export_opml");
+
+// ── Folo lists ──
+/** Fetch a Folo shared list for the import tab's preview. `mapTwitter`
+ *  mirrors the import checkbox so the preview shows the same rewrite the
+ *  import would apply. The stored `folo_token` setting (if any) is applied
+ *  backend-side. */
+export const fetchFoloList = (url: string, mapTwitter: boolean) =>
+  invoke<FoloListPreview>("preview_folo_list", {
+    url,
+    mapTwitter,
+    token: null,
+  });
+/** Import a Folo shared list's feeds into the chosen folder. */
+export const importFoloList = (
+  url: string,
+  folderId: number | null,
+  mapTwitter: boolean,
+) =>
+  invoke<FoloImportReport>("import_folo_list", {
+    url,
+    folderId,
+    mapTwitter,
+    token: null,
+  });
 
 // ── AI (streaming over a Channel) ──
 export function aiSummarize(
