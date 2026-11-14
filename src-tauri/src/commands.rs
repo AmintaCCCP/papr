@@ -874,6 +874,17 @@ pub async fn edit_feed_url(state: State<'_, AppState>, id: i64, url: String) -> 
         if db::find_feed_by_url(&conn, &feed_url)?.is_some_and(|other| other != id) {
             return Err(AppError::code("alreadySubscribed"));
         }
+        // Two edits can race through the network validation above (edit to A,
+        // save, edit to B, save — A's slow fetch lands after B's commit). The
+        // duplicate check can't catch that, so compare the address under the
+        // write lock against the one this command saw when it started, and
+        // refuse to let a stale edit overwrite a newer one. Same lock held
+        // through the transaction below, so nothing can slip in between.
+        let now_url = db::feed_url_by_id(&conn, id)?
+            .ok_or_else(|| AppError::code("noFeedFound"))?;
+        if now_url != current.feed_url {
+            return Err(AppError::code("feedUrlChanged"));
+        }
         // One transaction: the URL swap, metadata adoption and article import
         // land together or not at all — a mid-import failure must not leave
         // the feed pointing at the new document with only some of its

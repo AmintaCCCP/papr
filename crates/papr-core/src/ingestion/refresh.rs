@@ -90,6 +90,11 @@ enum Outcome {
     NotModified,
     Updated {
         parsed: parse::ParsedFeed,
+        /// Where the document actually came from — the challenge/redirect
+        /// chain's final URL, which is the base its relative links resolve
+        /// against (not necessarily the `feeds.feed_url` it was requested
+        /// with).
+        doc_url: String,
         etag: Option<String>,
         last_modified: Option<String>,
     },
@@ -106,11 +111,13 @@ async fn fetch_one(
         Ok(fetch::Fetched::NotModified) => Outcome::NotModified,
         Ok(fetch::Fetched::Body {
             bytes,
+            doc_url,
             etag,
             last_modified,
-        }) => match parse::parse_feed(&bytes, url) {
+        }) => match parse::parse_feed(&bytes, &doc_url) {
             Ok(parsed) => Outcome::Updated {
                 parsed,
+                doc_url,
                 etag,
                 last_modified,
             },
@@ -266,6 +273,7 @@ pub async fn refresh_core(
             }
             Outcome::Updated {
                 parsed,
+                doc_url,
                 etag,
                 last_modified,
             } => {
@@ -289,8 +297,11 @@ pub async fn refresh_core(
                 );
                 // Promote a still-generic `'rss'` feed to its real kind now that
                 // the parsed document reveals it (audio enclosures → podcast,
-                // `/@user.rss` → mastodon). A no-op for an already classified feed.
-                let refined = parse::refine_source_type(SourceType::Rss, &parsed, &feed_url);
+                // `/@user.rss` → mastodon). Classified against the document's
+                // final address — the URL redirects and challenge hops landed
+                // at — not the address the fetch was launched from. A no-op for
+                // an already classified feed.
+                let refined = parse::refine_source_type(SourceType::Rss, &parsed, &doc_url);
                 let _ = db::refine_feed_source_type(&conn, feed_id, refined);
             }
         }
@@ -660,11 +671,13 @@ async fn poll_rsshub(
                 Ok(fetch::Fetched::NotModified) => Outcome::NotModified,
                 Ok(fetch::Fetched::Body {
                     bytes,
+                    doc_url,
                     etag,
                     last_modified,
-                }) => match parse::parse_feed(&bytes, &target) {
+                }) => match parse::parse_feed(&bytes, &doc_url) {
                     Ok(parsed) => Outcome::Updated {
                         parsed,
+                        doc_url,
                         etag,
                         last_modified,
                     },
@@ -694,6 +707,7 @@ async fn poll_rsshub(
             }
             Outcome::Updated {
                 parsed,
+                doc_url: _,
                 etag,
                 last_modified,
             } => {

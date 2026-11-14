@@ -59,6 +59,24 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
     };
   }, []);
 
+  // Move focus into the dialog on open and hand it back to the opener on
+  // close. `autoFocus` only covers the editable-URL case — for locked feeds
+  // the input renders read-only but still takes focus (so the URL can be
+  // read/selected) — and nothing restores the opener's focus. The first
+  // control is the URL input in both cases.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const first = dialogRef.current?.querySelector<HTMLElement>(
+      "input, select, button",
+    );
+    (first ?? dialogRef.current)?.focus();
+    return () => {
+      // The opener (context-menu row) is often already gone by close time;
+      // focusing a detached node is a no-op, which is fine.
+      opener?.focus();
+    };
+  }, []);
+
   // Escape closes the dialog regardless of focused control, with the IME
   // guard the other dialogs use (the URL field is a live CJK input target).
   useEffect(() => {
@@ -84,24 +102,39 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
     if (saving || !canSave) return;
     setSaving(true);
     setError(null);
+    // Track which writes landed: if a later one fails, the earlier writes are
+    // already committed — the caches must be refreshed even on the failure
+    // path, or the UI keeps showing pre-save state for saved changes.
+    let applied: "none" | "some" = "none";
+    const refreshCaches = () => {
+      // A URL edit brings new articles; a settings change only touches the
+      // feed row. refreshAfterBulk covers both without over-invalidating.
+      actions.refreshAfterBulk();
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+    };
     try {
-      if (urlChanged) await api.editFeedUrl(feed.id, url.trim());
-      if (autoTranslateChanged)
+      if (urlChanged) {
+        await api.editFeedUrl(feed.id, url.trim());
+        applied = "some";
+      }
+      if (autoTranslateChanged) {
         await api.setFeedAutoTranslate(feed.id, autoTranslate);
-      if (openModeChanged)
+        applied = "some";
+      }
+      if (openModeChanged) {
         await api.setFeedOpenMode(
           feed.id,
           openMode === "default" ? null : openMode,
         );
-      if (urlChanged || autoTranslateChanged || openModeChanged) {
-        // A URL edit brings new articles; a settings change only touches the
-        // feed row. refreshAfterBulk covers both without over-invalidating.
-        actions.refreshAfterBulk();
-        qc.invalidateQueries({ queryKey: ["feeds"] });
+        applied = "some";
+      }
+      if (applied === "some") {
+        refreshCaches();
         if (aliveRef.current) onToast(t("editFeed.toastSaved"));
       }
       if (aliveRef.current) onClose();
     } catch (e) {
+      if (applied === "some") refreshCaches();
       setError(e);
       setSaving(false);
     }
@@ -125,8 +158,10 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
         <input
           className="modal-input"
           type="text"
-          autoFocus={urlEditable}
-          readOnly={!urlEditable}
+          // Read-only (not disabled) so the address stays readable while the
+          // save is in flight or the source type locks it — but never
+          // editable then. Focus is set by the mount effect above.
+          readOnly={saving || !urlEditable}
           value={url}
           placeholder={t("editFeed.urlLabel")}
           aria-label={t("editFeed.urlLabel")}
@@ -157,6 +192,7 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
             type="checkbox"
             className="s-toggle"
             checked={autoTranslate}
+            disabled={saving}
             onChange={(e) => setAutoTranslate(e.target.checked)}
           />
         </div>
@@ -179,6 +215,7 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
             id="editfeed-openmode"
             className="s-select"
             value={openMode}
+            disabled={saving}
             onChange={(e) => setOpenMode(e.target.value as OpenModeChoice)}
           >
             {OPEN_MODE_OPTIONS.map((o) => (

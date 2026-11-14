@@ -94,6 +94,11 @@ pub enum Fetched {
     /// Fresh content, along with revalidation headers to store.
     Body {
         bytes: Vec<u8>,
+        /// The URL the document actually came from — after HTTP redirects and
+        /// an anti-bot challenge hop this can differ from the request URL,
+        /// and it (not the request URL) is the base relative links inside the
+        /// document resolve against.
+        doc_url: String,
         etag: Option<String>,
         last_modified: Option<String>,
     },
@@ -147,8 +152,19 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
             .any(|a| a.value().as_element().is_some_and(|e| e.name() == "script"));
         if in_script {
             if script_call.is_none() {
-                if let Some(idx) = t.find("location.replace(") {
-                    script_call = Some(t[idx..].to_string());
+                // Only a call the browser would actually run counts: a
+                // `location.replace` mentioned inside a JS string literal or
+                // comment is sample content, not a redirect. Scan forward
+                // through the candidates, skipping the ones the tiny lexer
+                // below puts inside a string or comment.
+                let mut from = 0;
+                while let Some(rel) = t[from..].find("location.replace(") {
+                    let idx = from + rel;
+                    if !inside_js_string_or_comment(t, idx) {
+                        script_call = Some(t[idx..].to_string());
+                        break;
+                    }
+                    from = idx + "location.replace(".len();
                 }
             }
         } else {
@@ -178,6 +194,74 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
     let path = raw.replace("\\/", "/");
     let base = reqwest::Url::parse(base_url).ok()?;
     base.join(&path).ok().map(|u| u.into())
+}
+
+/// Is `idx` — the byte offset of a `location.replace(` candidate inside the
+/// script source `script` — inside a JS string literal or comment? A tiny
+/// lexer tracks line/block comments and the three quote styles (with `\`
+/// escapes, backticks included) from the start of the script: a call
+/// mentioned inside `"…"` or `// …` is sample content, not a redirect the
+/// browser would run. JS regex literals are not modelled — at worst a regex
+/// containing `//` hides a real call, which fails safe (the parse errors as
+/// it did before the challenge handling existed). An unterminated string or
+/// comment also fails safe the same way.
+fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
+    #[derive(PartialEq)]
+    enum Js {
+        Code,
+        LineComment,
+        BlockComment,
+        Str(u8),
+    }
+    let bytes = script.as_bytes();
+    let mut state = Js::Code;
+    let mut i = 0;
+    while i < idx && i < bytes.len() {
+        let c = bytes[i];
+        match state {
+            Js::Code => {
+                if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    state = Js::LineComment;
+                    i += 2;
+                    continue;
+                }
+                if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    state = Js::BlockComment;
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' || c == b'\'' || c == b'`' {
+                    state = Js::Str(c);
+                }
+                i += 1;
+            }
+            Js::LineComment => {
+                if c == b'\n' {
+                    state = Js::Code;
+                }
+                i += 1;
+            }
+            Js::BlockComment => {
+                if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    state = Js::Code;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            Js::Str(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    state = Js::Code;
+                }
+                i += 1;
+            }
+        }
+    }
+    state != Js::Code
 }
 
 /// Follow one anti-bot challenge redirect: re-GET the target URL with the
@@ -231,6 +315,7 @@ pub async fn conditional_get(
     // revalidation headers).
     if let Some(target) = js_redirect_target(&bytes, &final_url) {
         let resp = follow_challenge(client, &target).await?;
+        let doc_url = resp.url().to_string();
         let read_header = |name: reqwest::header::HeaderName| {
             resp.headers()
                 .get(&name)
@@ -241,12 +326,14 @@ pub async fn conditional_get(
         let last_modified = read_header(LAST_MODIFIED);
         return Ok(Fetched::Body {
             bytes: read_capped(resp).await?,
+            doc_url,
             etag,
             last_modified,
         });
     }
     Ok(Fetched::Body {
         bytes,
+        doc_url: final_url,
         etag,
         last_modified,
     })
@@ -421,6 +508,29 @@ mod tests {
         // A commented-out call is content too.
         let commented = b"<html><body><!-- location.replace('/nope') --></body></html>";
         assert_eq!(js_redirect_target(commented, "https://example.com/"), None);
+    }
+
+    #[test]
+    fn quoted_call_in_script_string_or_comment_is_not_a_challenge() {
+        // The call assigned to a variable inside a script never runs — it is
+        // a string literal, and must not redirect the fetch.
+        let in_string = b"<html><script>const example = \"location.replace('/missing')\";\
+</script></html>";
+        assert_eq!(js_redirect_target(in_string, "https://example.com/"), None);
+        // Same for a commented-out call (line and block forms).
+        let line_comment =
+            b"<html><script>// location.replace('/missing')\n</script></html>";
+        assert_eq!(js_redirect_target(line_comment, "https://example.com/"), None);
+        let block_comment =
+            b"<html><script>/* location.replace('/missing') */</script></html>";
+        assert_eq!(js_redirect_target(block_comment, "https://example.com/"), None);
+        // A real call after a quoted sample in the same script still wins.
+        let mixed = b"<html><script>const s = \"location.replace('/sample')\";\
+location.replace('/real?a=1')</script></html>";
+        assert_eq!(
+            js_redirect_target(mixed, "https://example.com/x").as_deref(),
+            Some("https://example.com/real?a=1")
+        );
     }
 
     #[test]

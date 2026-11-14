@@ -819,7 +819,8 @@
     "rsshubEngineArchiveInvalid": "そのファイルは有効なエンジンアーカイブ（.tar.gz / .zip）ではありません。",
     "rsshubEngineChecksum": "ダウンロードしたエンジンアーカイブが sha256 チェックに失敗しました。",
     "rsshubEngineEnvTooLarge": "マージされたルート環境変数がプロセス環境の上限を超えています —— マーケットプレイスで一部のルート変数を削除または短くしてください。",
-    "editUrlUnsupported": "この購読のアドレスは編集できません — 購読解除して新しいソースで再追加してください"
+    "editUrlUnsupported": "この購読のアドレスは編集できません — 購読解除して新しいソースで再追加してください",
+    "feedUrlChanged": "このフィードは別のウィンドウで編集されました — ダイアログを開き直してから変更してください"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

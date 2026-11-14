@@ -821,7 +821,8 @@
     "rsshubEngineArchiveInvalid": "That file is not a valid engine archive (.tar.gz / .zip).",
     "rsshubEngineChecksum": "The downloaded engine archive failed the sha256 check.",
     "rsshubEngineEnvTooLarge": "The merged route environment variables are too large for a process environment — remove or shorten some route variables in the marketplace.",
-    "editUrlUnsupported": "This subscription's address can't be edited — unsubscribe and re-add it with the new source"
+    "editUrlUnsupported": "This subscription's address can't be edited — unsubscribe and re-add it with the new source",
+    "feedUrlChanged": "The feed was edited in another window — reopen the dialog to make your change"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

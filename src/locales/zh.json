@@ -821,7 +821,8 @@
     "rsshubEngineArchiveInvalid": "该文件不是有效的引擎包（.tar.gz / .zip）。",
     "rsshubEngineChecksum": "下载的引擎包未通过 sha256 校验。",
     "rsshubEngineEnvTooLarge": "合并后的路由环境变量超出进程环境大小上限 —— 请在市场里移除或缩短部分路由变量。",
-    "editUrlUnsupported": "该订阅源的地址不支持编辑 — 请退订后按新来源重新添加"
+    "editUrlUnsupported": "该订阅源的地址不支持编辑 — 请退订后按新来源重新添加",
+    "feedUrlChanged": "该订阅源已在其他窗口被编辑 — 请重新打开对话框后再修改"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",
