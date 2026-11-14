@@ -823,34 +823,48 @@ function FoloTokenGroup({ onToast }: { onToast: (m: string) => void }) {
   // stored value lands, so a save can't race the initial read.
   const [stored, setStored] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  // The settled value, mirrored in a ref so a save queued behind another one
+  // compares against the truth that previous save is about to produce, not
+  // the value captured at its own blur time. Without the chain, blur → save
+  // → clear input → blur again would skip the clear ("" == the stale stored
+  // value) and leave the token in the DB while the input shows empty.
+  const storedRef = useRef("");
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     api
       .getSetting("folo_token")
       .then((v) => {
-        setStored(v ?? "");
-        setDraft(v ?? "");
+        const value = v ?? "";
+        storedRef.current = value;
+        setStored(value);
+        setDraft(value);
       })
       .catch(() => setStored(""));
   }, []);
 
-  const save = async () => {
+  const save = () => {
     if (stored === null) return;
     const next = draft.trim();
-    if (next === stored.trim()) return;
-    try {
-      await api.setSetting("folo_token", next);
-      setStored(next);
-      onToast(
-        t(
-          next
-            ? "settings.subscriptions.foloTokenSaved"
-            : "settings.subscriptions.foloTokenCleared",
-        ),
-      );
-    } catch (e) {
-      reportError(e);
-    }
+    saveChain.current = saveChain.current.then(async () => {
+      // Re-checked inside the chain: an earlier save in flight may have
+      // already written exactly this draft.
+      if (next === storedRef.current.trim()) return;
+      try {
+        await api.setSetting("folo_token", next);
+        storedRef.current = next;
+        setStored(next);
+        onToast(
+          t(
+            next
+              ? "settings.subscriptions.foloTokenSaved"
+              : "settings.subscriptions.foloTokenCleared",
+          ),
+        );
+      } catch (e) {
+        reportError(e);
+      }
+    });
   };
 
   return (

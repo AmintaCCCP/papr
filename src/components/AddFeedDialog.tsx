@@ -138,14 +138,38 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
   // RSSHub's Twitter routes need extra environment variables.
   const [foloMapTwitter, setFoloMapTwitter] = useState(true);
   const [foloPreview, setFoloPreview] = useState<FoloListPreview | null>(null);
+  // Identity of the request currently allowed to land. TanStack mutations
+  // settle whenever the response arrives — if the user retyped the URL or
+  // flipped the mapping while a fetch was in flight, that response describes
+  // inputs the form no longer holds, so it must be dropped, not rendered
+  // (otherwise the card would show list A under input B, and a non-empty
+  // preview would block ever fetching B).
+  const foloReqRef = useRef<{ url: string; mapTwitter: boolean } | null>(null);
 
   // The preview is fetched on demand (button / Enter), not while typing —
   // each call hits Folo's API, and the import only ever runs against a
   // preview the user has actually seen.
   const fetchPreview = useMutation({
-    mutationFn: () => api.fetchFoloList(foloUrl.trim(), foloMapTwitter),
-    onSuccess: (p) => setFoloPreview(p),
-    onError: () => setFoloPreview(null),
+    mutationFn: (req: { url: string; mapTwitter: boolean }) => {
+      foloReqRef.current = req;
+      return api
+        .fetchFoloList(req.url, req.mapTwitter)
+        .then((p) => ({ p, req }));
+    },
+    onSuccess: ({ p, req }) => {
+      // Land only when this exact request is still the one the form wants —
+      // a newer fetch (or an edit / toggle) has meanwhile taken over.
+      if (foloReqRef.current === req) {
+        foloReqRef.current = null;
+        setFoloPreview(p);
+      }
+    },
+    onError: (_e, req) => {
+      if (foloReqRef.current === req) {
+        foloReqRef.current = null;
+        setFoloPreview(null);
+      }
+    },
   });
 
   const importFolo = useMutation({
@@ -170,10 +194,24 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
     },
   });
 
-  /** Re-fetch the preview when the mapping toggle changes under an open
-   *  preview, so the card never shows a rewrite the import won't do. */
+  /** Editing the reference invalidates the shown preview — and drops any
+   *  in-flight fetch for the previous input, so its late response can't
+   *  masquerade as this one's. */
+  const editFoloUrl = (v: string) => {
+    setFoloUrl(v);
+    setFoloPreview(null);
+    foloReqRef.current = null;
+  };
+
+  /** Re-fetch the preview when the mapping toggle changes, so the card never
+   *  shows a rewrite the import won't do. An in-flight fetch for the old
+   *  option is dropped (its result would be accepted against inputs it
+   *  wasn't asked for); a preview shown or a fetch running gets redone. */
   useEffect(() => {
-    if (foloPreview && foloUrl.trim()) fetchPreview.mutate();
+    foloReqRef.current = null;
+    if (foloUrl.trim() && (foloPreview || fetchPreview.isPending)) {
+      fetchPreview.mutate({ url: foloUrl.trim(), mapTwitter: foloMapTwitter });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberate:
     // only the toggle re-triggers this, not the preview it re-reads
   }, [foloMapTwitter]);
@@ -189,7 +227,7 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
         if (foloPreview.importable > 0 && !importFolo.isPending)
           importFolo.mutate();
       } else if (foloUrl.trim() && !fetchPreview.isPending) {
-        fetchPreview.mutate();
+        fetchPreview.mutate({ url: foloUrl.trim(), mapTwitter: foloMapTwitter });
       }
     } else {
       if (nlHost.trim() && nlUser.trim() && nlPass && !addNewsletter.isPending)
@@ -377,11 +415,7 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
               aria-label={t("addFeed.foloUrlLabel")}
               {...NO_AUTOCORRECT}
               value={foloUrl}
-              onChange={(e) => {
-                setFoloUrl(e.target.value);
-                // Editing the reference invalidates the shown preview.
-                setFoloPreview(null);
-              }}
+              onChange={(e) => editFoloUrl(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.nativeEvent.isComposing) submit();
               }}
@@ -576,7 +610,9 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
               onClick={submit}
               disabled={
                 foloPreview
-                  ? foloPreview.importable === 0 || importFolo.isPending
+                  ? foloPreview.importable === 0 ||
+                    importFolo.isPending ||
+                    fetchPreview.isPending
                   : !foloUrl.trim() || fetchPreview.isPending
               }
             >

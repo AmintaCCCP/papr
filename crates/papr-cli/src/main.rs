@@ -1619,7 +1619,11 @@ async fn cmd_folo_import(path: &Path, cmd: FoloCmd) -> Result<String, AxiError> 
     } = cmd;
     let conn = open_rw(path)?;
     // Token precedence: --token wins, then the stored folo_token setting,
-    // then anonymous.
+    // then anonymous. `token_from_arg` feeds the rejection help — an invalid
+    // stored token needs "clear the setting" as the next step, an invalid
+    // --token needs "fix or drop the flag", and dropping --token alone would
+    // just re-read the same broken stored value.
+    let token_from_arg = token.as_ref().is_some_and(|t| !t.trim().is_empty());
     let token = match token {
         Some(t) if !t.trim().is_empty() => Some(t),
         _ => db::get_setting(&conn, "folo_token")
@@ -1629,7 +1633,7 @@ async fn cmd_folo_import(path: &Path, cmd: FoloCmd) -> Result<String, AxiError> 
     let client = http_client()?;
     let list = papr_core::folo::fetch_list(&client, &url, token.as_deref())
         .await
-        .map_err(folo_err)?;
+        .map_err(|e| folo_err(e, token_from_arg))?;
     let (rows, unsupported) = papr_core::folo::to_imported(&list, !no_map_twitter, None);
     let (added, skipped) =
         papr_core::folo::import_feeds(&conn, &rows, folder).map_err(db_err)?;
@@ -1676,8 +1680,10 @@ async fn cmd_folo_import(path: &Path, cmd: FoloCmd) -> Result<String, AxiError> 
 }
 
 /// Translate Folo-fetch failures into actionable CLI messages — coded core
-/// errors render as bare codes otherwise.
-fn folo_err(e: papr_core::error::AppError) -> AxiError {
+/// errors render as bare codes otherwise. `from_arg` says whether the
+/// rejected token came from `--token` (vs the stored `folo_token` setting),
+/// so the help names the source the user actually has to fix.
+fn folo_err(e: papr_core::error::AppError, from_arg: bool) -> AxiError {
     use papr_core::error::AppError;
     match &e {
         AppError::Coded("foloInvalidRef") => AxiError::runtime_help(
@@ -1692,10 +1698,19 @@ fn folo_err(e: papr_core::error::AppError) -> AxiError {
         ),
         AppError::Coded("foloTokenRejected") => AxiError::runtime_help(
             "Folo rejected the access token",
-            vec![
-                "Check the token (`papr settings get folo_token` shows the stored one)".into(),
-                "Drop --token to import anonymously (the list's first few feeds only)".into(),
-            ],
+            if from_arg {
+                vec![
+                    "Check the --token value".into(),
+                    "Drop --token to fall back to the stored folo_token setting \
+(or anonymous access when none is stored)".into(),
+                ]
+            } else {
+                vec![
+                    "The stored folo_token setting was rejected — clear it with \
+`papr settings set folo_token \"\"` and retry without --token".into(),
+                    "Or set a fresh token with `papr settings set folo_token <token>`".into(),
+                ]
+            },
         ),
         _ => clean_err("could not fetch the Folo list", e),
     }
