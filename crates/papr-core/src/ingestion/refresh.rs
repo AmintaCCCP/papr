@@ -12,7 +12,8 @@
 use crate::db;
 use crate::error::AppResult;
 use crate::ingestion::newsletter;
-use crate::ingestion::parsers::{self, x};
+use crate::ingestion::parsers::transport::jittered_delay_ms;
+use crate::ingestion::parsers::{self, kuaishou, x, xiaohongshu};
 use crate::ingestion::rsshub::{self, engine::EngineManager};
 use crate::ingestion::{fetch, parse};
 use crate::models::{RefreshProgress, SourceType};
@@ -443,18 +444,21 @@ async fn poll_newsletters(
     total_new
 }
 
-/// Fetch every parser feed's timeline through the built-in X parser and ingest
-/// the tweets as articles. Runs as part of [`refresh_core`] so X timelines
+/// Fetch every parser feed through its built-in parser and ingest the
+/// results as articles. Runs as part of [`refresh_core`] so parser timelines
 /// refresh on the same cadence as RSS feeds. Returns the new-article count.
 ///
-/// Sequential with a throttle between handles — the GraphQL API is
-/// rate-limited per login session, so concurrency would trade a little speed
-/// for 429s. One feed's failure (bad cookies for everyone, one account gone)
-/// is recorded as that feed's `fetch_error` and does not abort the others.
+/// Feeds are grouped by `source_type` and handed to their parser's poll
+/// function, each gated by its own enabled toggle and credential model. All
+/// parsers poll strictly serially with a jittered pace between feeds — the
+/// upstream sites rate-limit and fingerprint traffic, so concurrency would
+/// trade a little speed for captchas and bans. One feed's failure (expired
+/// cookie, one account gone) is recorded as that feed's `fetch_error` and
+/// does not abort the others.
 async fn poll_parsers(
     db: &Mutex<Connection>,
     client: &reqwest::Client,
-    feeds: Vec<(i64, String)>,
+    feeds: Vec<db::ParserFeed>,
     dedup: bool,
     rules: &[crate::models::Rule],
 ) -> usize {
@@ -462,6 +466,57 @@ async fn poll_parsers(
         return 0;
     }
 
+    // Group by owning parser. The feeds table is the single source of truth:
+    // whatever `source_type` says decides the parser, so a parser can be
+    // disabled while other parsers keep refreshing.
+    let mut by_x: Vec<db::ParserFeed> = Vec::new();
+    let mut by_xiaohongshu: Vec<db::ParserFeed> = Vec::new();
+    let mut by_kuaishou: Vec<db::ParserFeed> = Vec::new();
+    for feed in feeds {
+        match feed.1.as_str() {
+            parsers::X => by_x.push(feed),
+            parsers::XIAOHONGSHU => by_xiaohongshu.push(feed),
+            parsers::KUAISHOU => by_kuaishou.push(feed),
+            other => {
+                log::warn!("poll_parsers: unknown parser source_type '{other}'");
+            }
+        }
+    }
+
+    let mut total_new = 0usize;
+    if !by_x.is_empty() {
+        total_new += poll_x_feeds(db, client, by_x, dedup, rules).await;
+    }
+    // The xiaohongshu / kuaishou legs need the dedicated parser client: the
+    // shared feed client runs a cookie jar that would overwrite their
+    // explicitly-built Cookie headers, and follows redirects their flows must
+    // inspect instead.
+    if !by_xiaohongshu.is_empty() || !by_kuaishou.is_empty() {
+        let parser_client = {
+            let conn = db.lock().await;
+            fetch::build_parser_client(&conn)
+        };
+        if !by_xiaohongshu.is_empty() {
+            total_new +=
+                poll_xiaohongshu_feeds(db, &parser_client, by_xiaohongshu, dedup, rules).await;
+        }
+        if !by_kuaishou.is_empty() {
+            total_new += poll_kuaishou_feeds(db, &parser_client, by_kuaishou, dedup, rules).await;
+        }
+    }
+    total_new
+}
+
+/// The X (Twitter) leg: fetch each feed's timeline page through the X parser
+/// and ingest the tweets. Credentials are per-login-session and shared
+/// across feeds; the enabled toggle gates the whole leg.
+async fn poll_x_feeds(
+    db: &Mutex<Connection>,
+    client: &reqwest::Client,
+    feeds: Vec<db::ParserFeed>,
+    dedup: bool,
+    rules: &[crate::models::Rule],
+) -> usize {
     // The enabled toggle gates the whole leg: disabling the parser stops new
     // subscriptions AND puts existing feeds to sleep (no more x.com traffic)
     // until it is re-enabled. Checked here rather than filtered in the query
@@ -484,7 +539,7 @@ async fn poll_parsers(
         // Enabled parser feeds without cookies can only error — say so per
         // feed so the sidebar tooltip shows the actionable reason.
         let conn = db.lock().await;
-        for (feed_id, _) in &feeds {
+        for (feed_id, _, _) in &feeds {
             let _ = db::set_feed_error(&conn, *feed_id, parsers::x::CODE_AUTH_REQUIRED);
         }
         return 0;
@@ -495,7 +550,7 @@ async fn poll_parsers(
     };
 
     let mut total_new = 0usize;
-    for (index, (feed_id, feed_url)) in feeds.iter().enumerate() {
+    for (index, (feed_id, _, feed_url)) in feeds.iter().enumerate() {
         if index > 0 {
             tokio::time::sleep(Duration::from_millis(x::HANDLE_THROTTLE_MS)).await;
         }
@@ -544,6 +599,290 @@ async fn poll_parsers(
         state.save(&conn);
     }
     total_new
+}
+
+/// The Xiaohongshu leg: fetch each feed's SSR profile page and ingest the
+/// note cards. Works anonymously; a configured cookie additionally unlocks
+/// note-detail fetches for new notes (full text, media), throttled and
+/// capped per cycle with a pending queue carrying the rest to the next run.
+///
+/// Per feed, the pending backlog from earlier cycles is retried *before* the
+/// fresh profile page is processed, and both phases share one budget — a
+/// detail failed this cycle must not be re-attempted seconds later by the
+/// retry phase of the same cycle.
+async fn poll_xiaohongshu_feeds(
+    db: &Mutex<Connection>,
+    client: &reqwest::Client,
+    feeds: Vec<db::ParserFeed>,
+    dedup: bool,
+    rules: &[crate::models::Rule],
+) -> usize {
+    let enabled = {
+        let conn = db.lock().await;
+        parsers::parser_enabled(&conn, parsers::XIAOHONGSHU)
+    };
+    if !enabled {
+        return 0;
+    }
+    let cookie = {
+        let conn = db.lock().await;
+        parsers::cookie_credentials(&conn, parsers::XIAOHONGSHU)
+    };
+    let mut state = {
+        let conn = db.lock().await;
+        xiaohongshu::XhsState::load(&conn)
+    };
+
+    let mut total_new = 0usize;
+    for (index, (feed_id, _, feed_url)) in feeds.iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(jittered_delay_ms(
+                xiaohongshu::FEED_THROTTLE_MS,
+            )))
+            .await;
+        }
+        let Some(profile_id) = xiaohongshu::profile_id_from_feed_url(feed_url) else {
+            log::warn!("xiaohongshu parser: feed {feed_id} has a malformed URL: {feed_url}");
+            let conn = db.lock().await;
+            let _ = db::set_feed_error(&conn, *feed_id, "malformed xiaohongshu feed URL");
+            continue;
+        };
+
+        // ── pending retry phase (earlier cycles' backlog, cookie mode) ──
+        // The guid is the one the original card row stored: the detail page's
+        // title/time may differ from the card's, so the retry article pins it
+        // instead of recomputing.
+        let mut retried: Vec<db::NewArticle> = Vec::new();
+        for pending in state.take(*feed_id, xiaohongshu::MAX_DETAILS_PER_REFRESH) {
+            let Some(token) = pending.xsec_token.as_deref() else {
+                continue;
+            };
+            xiaohongshu::pace_details().await;
+            match xiaohongshu::fetch_note_detail(
+                client,
+                &pending.note_id,
+                token,
+                cookie.as_deref().unwrap_or_default(),
+            )
+            .await
+            {
+                Ok(parsed) => {
+                    let note = xiaohongshu::XhsNote {
+                        note_id: Some(pending.note_id.clone()),
+                        xsec_token: pending.xsec_token.clone(),
+                        title: parsed.title.clone().unwrap_or_default(),
+                        kind: parsed.kind.clone(),
+                        time_ms: parsed.time_ms,
+                        cover: parsed.images.first().cloned(),
+                        author: None,
+                        liked_count: None,
+                    };
+                    retried.push(xiaohongshu::note_to_article(
+                        &profile_id,
+                        feed_url,
+                        &note,
+                        Some(&parsed),
+                        Some(&pending.guid),
+                    ));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "xiaohongshu parser: pending detail retry failed ({}): {e}",
+                        pending.note_id
+                    );
+                    // Re-queue for the next cycle.
+                    state.enqueue(
+                        *feed_id,
+                        xiaohongshu::XhsPendingNote {
+                            note_id: pending.note_id.clone(),
+                            xsec_token: pending.xsec_token.clone(),
+                            guid: pending.guid.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        if !retried.is_empty() {
+            upsert_articles(db, *feed_id, &retried, dedup, rules, "xiaohongshu").await;
+            let conn = db.lock().await;
+            for article in &retried {
+                let _ = db::refresh_parser_article(&conn, *feed_id, article);
+            }
+        }
+
+        // ── fresh profile page phase ─────────────────────────────────────
+        match xiaohongshu::fetch_user_notes(client, &profile_id, cookie.as_deref()).await {
+            Ok(page) => {
+                let profile_url = feed_url.clone();
+                let known = existing_guids(db, *feed_id, &profile_id, &page.notes).await;
+                let mut articles: Vec<db::NewArticle> = Vec::with_capacity(page.notes.len());
+                // The per-cycle budget counts *detail fetches*, not cards, and
+                // is shared with the retry phase above: a page of existing
+                // cards must not eat it before the first genuinely new note
+                // gets its full text.
+                let mut details_used = retried.len();
+                for note in &page.notes {
+                    let guid = xiaohongshu::note_guid(&profile_id, note);
+                    let is_new = !known.contains(&guid);
+                    let detail = if xiaohongshu::detail_fetchable(note, cookie.as_deref())
+                        && is_new
+                        && details_used < xiaohongshu::MAX_DETAILS_PER_REFRESH
+                    {
+                        details_used += 1;
+                        xiaohongshu::pace_details().await;
+                        match xiaohongshu::fetch_note_detail(
+                            client,
+                            note.note_id.as_deref().unwrap_or_default(),
+                            note.xsec_token.as_deref().unwrap_or_default(),
+                            cookie.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                        {
+                            Ok(parsed) => Some(parsed),
+                            Err(e) => {
+                                log::warn!(
+                                    "xiaohongshu parser: note detail failed ({}): {e}",
+                                    note.note_id.as_deref().unwrap_or("?")
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // A new note whose detail was capped or failed joins the
+                    // pending queue so a later refresh retries the full text.
+                    // Re-enqueues are deduped by note id in `enqueue`.
+                    if detail.is_none()
+                        && xiaohongshu::detail_fetchable(note, cookie.as_deref())
+                        && is_new
+                    {
+                        state.enqueue(
+                            *feed_id,
+                            xiaohongshu::XhsPendingNote {
+                                note_id: note.note_id.clone().unwrap_or_default(),
+                                xsec_token: note.xsec_token.clone(),
+                                guid: guid.clone(),
+                            },
+                        );
+                    }
+                    articles.push(xiaohongshu::note_to_article(
+                        &profile_id,
+                        &profile_url,
+                        note,
+                        detail.as_ref(),
+                        None,
+                    ));
+                }
+                let inserted =
+                    upsert_articles(db, *feed_id, &articles, dedup, rules, "xiaohongshu").await;
+                total_new += inserted;
+                let conn = db.lock().await;
+                for article in &articles {
+                    let _ = db::refresh_parser_article(&conn, *feed_id, article);
+                }
+                let _ = db::touch_feed(&conn, *feed_id);
+            }
+            Err(e) => {
+                log::warn!("xiaohongshu parser: profile fetch failed for {profile_id}: {e}");
+                let message = e.code().map(String::from).unwrap_or_else(|| e.to_string());
+                let conn = db.lock().await;
+                let _ = db::set_feed_error(&conn, *feed_id, &message);
+            }
+        }
+    }
+    {
+        let conn = db.lock().await;
+        state.save(&conn);
+    }
+    total_new
+}
+
+/// The Kuaishou leg: run each feed's GraphQL operations through the parser
+/// and ingest the works. Anonymous traffic is captcha-gated upstream, so a
+/// configured cookie is the supported path; the captcha surfaces as a coded,
+/// localisable per-feed error.
+async fn poll_kuaishou_feeds(
+    db: &Mutex<Connection>,
+    client: &reqwest::Client,
+    feeds: Vec<db::ParserFeed>,
+    dedup: bool,
+    rules: &[crate::models::Rule],
+) -> usize {
+    let enabled = {
+        let conn = db.lock().await;
+        parsers::parser_enabled(&conn, parsers::KUAISHOU)
+    };
+    if !enabled {
+        return 0;
+    }
+    let cookie = {
+        let conn = db.lock().await;
+        parsers::cookie_credentials(&conn, parsers::KUAISHOU)
+    };
+
+    let mut total_new = 0usize;
+    for (index, (feed_id, _, feed_url)) in feeds.iter().enumerate() {
+        if index > 0 {
+            tokio::time::sleep(Duration::from_millis(jittered_delay_ms(
+                kuaishou::FEED_THROTTLE_MS,
+            )))
+            .await;
+        }
+        let user_id = match kuaishou::profile_id_from_feed_url(feed_url) {
+            Some(id) => id,
+            None => {
+                log::warn!("kuaishou parser: feed {feed_id} has a malformed URL: {feed_url}");
+                let conn = db.lock().await;
+                let _ = db::set_feed_error(&conn, *feed_id, "malformed kuaishou feed URL");
+                continue;
+            }
+        };
+        match kuaishou::fetch_creator_page(client, &user_id, cookie.as_deref()).await {
+            Ok(page) => {
+                let articles: Vec<db::NewArticle> = page
+                    .photos
+                    .iter()
+                    .map(|photo| kuaishou::photo_to_article(photo, feed_url))
+                    .collect();
+                let inserted = upsert_articles(db, *feed_id, &articles, dedup, rules, "kuaishou")
+                    .await;
+                total_new += inserted;
+                let conn = db.lock().await;
+                for article in &articles {
+                    let _ = db::refresh_parser_article(&conn, *feed_id, article);
+                }
+                let _ = db::touch_feed(&conn, *feed_id);
+            }
+            Err(e) => {
+                log::warn!("kuaishou parser: fetch failed for {user_id}: {e}");
+                let message = e.code().map(String::from).unwrap_or_else(|| e.to_string());
+                let conn = db.lock().await;
+                let _ = db::set_feed_error(&conn, *feed_id, &message);
+            }
+        }
+    }
+    total_new
+}
+
+/// The guid set already stored for `feed_id`, restricted to the candidates
+/// the incoming page carries — the "is this note new" check that decides
+/// whether a note detail fetch (cookie mode) is worth a request.
+async fn existing_guids(
+    db: &Mutex<Connection>,
+    feed_id: i64,
+    profile_id: &str,
+    notes: &[xiaohongshu::XhsNote],
+) -> std::collections::HashSet<String> {
+    let guids: Vec<String> = notes
+        .iter()
+        .map(|n| xiaohongshu::note_guid(profile_id, n))
+        .collect();
+    let conn = db.lock().await;
+    db::filter_existing_guids(&conn, feed_id, &guids)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
 }
 
 /// Concurrency cap for engine route fetches. The engine is a local process —

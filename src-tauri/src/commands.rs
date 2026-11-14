@@ -104,6 +104,12 @@ pub async fn add_feed(
                     Some(SourceType::Youtube),
                 )
             }
+            Normalized::NeedsKuaishouResolution { short_url } => {
+                // An app share short link: follow the redirect (host-checked)
+                // to learn the canonical profile URL, then run the parser flow.
+                let profile_url = resolve_kuaishou_short_url(&client, &short_url).await?;
+                (profile_url, Some(SourceType::Kuaishou))
+            }
             Normalized::Untouched => (url.clone(), None),
         };
 
@@ -111,6 +117,14 @@ pub async fn add_feed(
     // built-in X parser produces the feed data instead (see `add_x_feed`).
     if forced_type == Some(SourceType::X) {
         return add_x_feed(state, &effective_url, folder_id).await;
+    }
+    // Xiaohongshu profile URLs run through their parser the same way.
+    if forced_type == Some(SourceType::Xiaohongshu) {
+        return add_xiaohongshu_feed(state, &effective_url, folder_id).await;
+    }
+    // Kuaishou profile URLs run through their parser.
+    if forced_type == Some(SourceType::Kuaishou) {
+        return add_kuaishou_feed(state, &effective_url, folder_id).await;
     }
     // An `rsshub://` short link runs through the local engine (the route
     // marketplace), never through a hosted RSSHub instance.
@@ -314,8 +328,251 @@ async fn add_x_feed(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParserTestResult {
-    /// Tweets fetched from the probe handle's timeline.
+    /// Entries fetched from the probe target's timeline/profile.
     pub article_count: usize,
+}
+
+/// Follow a Kuaishou app share short link (`v.kuaishou.com/<token>`) to its
+/// canonical profile URL. The parser client does not follow redirects, so
+/// each hop is read from the `Location` header and host-checked before
+/// continuing — at most 3 hops, and a landing host outside kuaishou.com
+/// fails outright, so the share token can never bounce the app off-site.
+async fn resolve_kuaishou_short_url(
+    client: &reqwest::Client,
+    short_url: &str,
+) -> AppResult<String> {
+    let mut url = short_url.to_string();
+    for _ in 0..3 {
+        let resp = client.get(&url).send().await?;
+        let final_url = resp.url().clone();
+        let status = resp.status();
+        if !crate::ingestion::parsers::transport::is_host_or_subdomain(
+            &final_url,
+            "kuaishou.com",
+        ) {
+            return Err(AppError::code("kuaishouHandleInvalid"));
+        }
+        if !status.is_redirection() {
+            return crate::ingestion::parsers::kuaishou::normalize_kuaishou_url(&final_url)
+                .or_else(|| {
+                    crate::ingestion::parsers::kuaishou::profile_id_from_feed_url(
+                        final_url.as_ref(),
+                    )
+                    .map(|id| format!("https://www.kuaishou.com/profile/{id}"))
+                })
+                .ok_or_else(|| AppError::code("kuaishouHandleInvalid"));
+        }
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .ok_or_else(|| AppError::code("kuaishouHandleInvalid"))?;
+        url = Url::parse(final_url.as_str())?.join(&location)?.to_string();
+    }
+    Err(AppError::code("kuaishouHandleInvalid"))
+}
+
+/// The Xiaohongshu-parser add flow: the canonical profile URL → the SSR page
+/// → a feed row (`source_type = 'xiaohongshu'`) plus the newest note cards as
+/// articles. Works anonymously; a configured cookie upgrades the same page to
+/// include note ids, and the newest notes' detail pages are fetched for the
+/// full body. The gate order mirrors `add_x_feed`: enabled → duplicate.
+async fn add_xiaohongshu_feed(
+    state: State<'_, AppState>,
+    feed_url: &str,
+    folder_id: Option<i64>,
+) -> AppResult<Feed> {
+    {
+        let conn = state.read().await;
+        if !parsers::parser_enabled(&conn, parsers::XIAOHONGSHU) {
+            return Err(AppError::code("parserDisabled"));
+        }
+        if db::find_feed_by_url(&conn, feed_url)?.is_some() {
+            return Err(AppError::code("alreadySubscribed"));
+        }
+    }
+    let cookie = {
+        let conn = state.read().await;
+        parsers::cookie_credentials(&conn, parsers::XIAOHONGSHU)
+    };
+    let profile_id = parsers::xiaohongshu::profile_id_from_feed_url(feed_url)
+        .ok_or_else(|| AppError::code(parsers::xiaohongshu::CODE_HANDLE_INVALID))?;
+
+    let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+    let page = parsers::xiaohongshu::fetch_user_notes(&client, &profile_id, cookie.as_deref())
+        .await
+        .map_err(parsers::xiaohongshu::XhsError::into_app_error)?;
+
+    // Cookie mode: fetch details for the newest notes so the first sync
+    // already carries full text. Capped and paced exactly like the refresh
+    // leg; a failed detail still yields a complete card article, and notes
+    // beyond the cap join the pending queue (keyed after the feed insert).
+    let mut articles: Vec<db::NewArticle> = Vec::with_capacity(page.notes.len());
+    let mut deferred: Vec<parsers::xiaohongshu::XhsPendingNote> = Vec::new();
+    let mut details_used = 0usize;
+    for note in &page.notes {
+        let mut detail = None;
+        if parsers::xiaohongshu::detail_fetchable(note, cookie.as_deref())
+            && details_used < parsers::xiaohongshu::MAX_DETAILS_PER_REFRESH
+        {
+            details_used += 1;
+            parsers::xiaohongshu::pace_details().await;
+            detail = match parsers::xiaohongshu::fetch_note_detail(
+                &client,
+                note.note_id.as_deref().unwrap_or_default(),
+                note.xsec_token.as_deref().unwrap_or_default(),
+                cookie.as_deref().unwrap_or_default(),
+            )
+            .await
+            {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    log::warn!("xiaohongshu parser: add-time detail failed: {e}");
+                    None
+                }
+            };
+        }
+        if detail.is_none() && parsers::xiaohongshu::detail_fetchable(note, cookie.as_deref()) {
+            deferred.push(parsers::xiaohongshu::XhsPendingNote {
+                note_id: note.note_id.clone().unwrap_or_default(),
+                xsec_token: note.xsec_token.clone(),
+                guid: parsers::xiaohongshu::note_guid(&profile_id, note),
+            });
+        }
+        articles.push(parsers::xiaohongshu::note_to_article(
+            &profile_id,
+            feed_url,
+            note,
+            detail.as_ref(),
+            None,
+        ));
+    }
+
+    let conn = state.db.lock().await;
+    // 昵称 as feed title, bio as description, avatar as favicon — the same
+    // contract the X parser uses.
+    let feed_id = db::insert_feed(
+        &conn,
+        feed_url,
+        Some(feed_url),
+        &page.profile.nickname,
+        page.profile.desc.as_deref(),
+        SourceType::Xiaohongshu,
+        folder_id,
+    )?;
+    if let Some(avatar) = &page.profile.avatar {
+        db::update_feed_meta(&conn, feed_id, None, None, None, Some(avatar))?;
+    }
+    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let rules = db::active_rules(&conn).unwrap_or_default();
+    for article in &articles {
+        db::upsert_article(&conn, feed_id, article, dedup, &rules)?;
+    }
+    // Notes beyond the add-time detail cap wait in the parser state's pending
+    // queue under their real feed id; the refresh leg retries them (also
+    // covering any detail fetch that failed above).
+    if !deferred.is_empty() {
+        let mut st = parsers::xiaohongshu::XhsState::load(&conn);
+        for note in deferred {
+            st.enqueue(feed_id, note);
+        }
+        st.save(&conn);
+    }
+    let unread = db::count_feed_unread(&conn, feed_id)?;
+    let _ = db::touch_feed(&conn, feed_id);
+    let last_fetched_at = db::feed_last_fetched(&conn, feed_id).ok().flatten();
+    drop(conn);
+
+    Ok(Feed {
+        id: feed_id,
+        feed_url: feed_url.to_string(),
+        site_url: Some(feed_url.to_string()),
+        title: page.profile.nickname.clone(),
+        description: page.profile.desc.clone(),
+        favicon_url: page.profile.avatar,
+        folder_id,
+        source_type: SourceType::Xiaohongshu.as_str().to_string(),
+        last_fetched_at,
+        fetch_error: None,
+        unread_count: unread,
+        refresh_interval_min: None,
+        auto_translate: false,
+        open_mode: None,
+    })
+}
+
+/// The Kuaishou-parser add flow: the canonical profile URL → the GraphQL web
+/// API → a feed row (`source_type = 'kuaishou'`) plus the newest works as
+/// articles. A pasted login cookie is the supported credential; anonymous
+/// traffic is captcha-gated upstream and surfaces as a coded error.
+async fn add_kuaishou_feed(
+    state: State<'_, AppState>,
+    feed_url: &str,
+    folder_id: Option<i64>,
+) -> AppResult<Feed> {
+    {
+        let conn = state.read().await;
+        if !parsers::parser_enabled(&conn, parsers::KUAISHOU) {
+            return Err(AppError::code("parserDisabled"));
+        }
+        if db::find_feed_by_url(&conn, feed_url)?.is_some() {
+            return Err(AppError::code("alreadySubscribed"));
+        }
+    }
+    let cookie = {
+        let conn = state.read().await;
+        parsers::cookie_credentials(&conn, parsers::KUAISHOU)
+    };
+    let user_id = parsers::kuaishou::profile_id_from_feed_url(feed_url)
+        .ok_or_else(|| AppError::code(parsers::kuaishou::CODE_HANDLE_INVALID))?;
+
+    let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+    let page = parsers::kuaishou::fetch_creator_page(&client, &user_id, cookie.as_deref())
+        .await
+        .map_err(parsers::kuaishou::KsError::into_app_error)?;
+
+    let conn = state.db.lock().await;
+    // 昵称 as feed title, bio as description, avatar as favicon.
+    let feed_id = db::insert_feed(
+        &conn,
+        feed_url,
+        Some(feed_url),
+        &page.profile.name,
+        page.profile.bio.as_deref(),
+        SourceType::Kuaishou,
+        folder_id,
+    )?;
+    if let Some(avatar) = &page.profile.avatar {
+        db::update_feed_meta(&conn, feed_id, None, None, None, Some(avatar))?;
+    }
+    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
+    let rules = db::active_rules(&conn).unwrap_or_default();
+    for photo in &page.photos {
+        let article = parsers::kuaishou::photo_to_article(photo, feed_url);
+        db::upsert_article(&conn, feed_id, &article, dedup, &rules)?;
+    }
+    let unread = db::count_feed_unread(&conn, feed_id)?;
+    let _ = db::touch_feed(&conn, feed_id);
+    let last_fetched_at = db::feed_last_fetched(&conn, feed_id).ok().flatten();
+    drop(conn);
+
+    Ok(Feed {
+        id: feed_id,
+        feed_url: feed_url.to_string(),
+        site_url: Some(feed_url.to_string()),
+        title: page.profile.name.clone(),
+        description: page.profile.bio.clone(),
+        favicon_url: page.profile.avatar,
+        folder_id,
+        source_type: SourceType::Kuaishou.as_str().to_string(),
+        last_fetched_at,
+        fetch_error: None,
+        unread_count: unread,
+        refresh_interval_min: None,
+        auto_translate: false,
+        open_mode: None,
+    })
 }
 
 // ─────────────────────────── RSSHub route marketplace ───────────────────────────
@@ -655,41 +912,77 @@ async fn add_rsshub_feed(
 }
 /// Validate a parser's configuration with a real upstream round-trip. For the
 /// X parser this fetches `handle`'s latest timeline page; success means the
-/// cookies work and the queryId chain resolved. Errors surface as coded
-/// errors the frontend localises (`xAuthInvalid`, `xBlocked`, …).
+/// cookies work and the queryId chain resolved. For the xiaohongshu parser it
+/// fetches the profile SSR page (anonymous works; the configured cookie is
+/// used when present), and for kuaishou it runs the GraphQL photo list (the
+/// pasted cookie is the supported credential). Errors surface as coded
+/// errors the frontend localises (`xAuthInvalid`, `xiaohongshuBlocked`,
+/// `kuaishouCaptcha`, …).
 #[tauri::command]
 pub async fn test_parser(
     state: State<'_, AppState>,
     id: String,
     handle: String,
 ) -> AppResult<ParserTestResult> {
-    if id != parsers::X {
-        return Err(AppError::code("parserUnknown"));
-    }
-    let handle = parsers::x::sanitize_handle_input(&handle)
-        .ok_or_else(|| AppError::code(parsers::x::CODE_HANDLE_INVALID))?;
-    let (auth_token, ct0) = {
-        let conn = state.read().await;
-        parsers::x_credentials(&conn)
-    }
-    .ok_or_else(|| AppError::code(parsers::x::CODE_AUTH_REQUIRED))?;
+    match id.as_str() {
+        parsers::X => {
+            let handle = parsers::x::sanitize_handle_input(&handle)
+                .ok_or_else(|| AppError::code(parsers::x::CODE_HANDLE_INVALID))?;
+            let (auth_token, ct0) = {
+                let conn = state.read().await;
+                parsers::x_credentials(&conn)
+            }
+            .ok_or_else(|| AppError::code(parsers::x::CODE_AUTH_REQUIRED))?;
 
-    let client = state.http();
-    let mut parser_state = {
-        let conn = state.read().await;
-        parsers::x::XState::load(&conn)
-    };
-    let page =
-        parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
-            .await
-            .map_err(parsers::x::XError::into_app_error)?;
-    {
-        let conn = state.db.lock().await;
-        parser_state.save(&conn);
+            let client = state.http();
+            let mut parser_state = {
+                let conn = state.read().await;
+                parsers::x::XState::load(&conn)
+            };
+            let page =
+                parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
+                    .await
+                    .map_err(parsers::x::XError::into_app_error)?;
+            {
+                let conn = state.db.lock().await;
+                parser_state.save(&conn);
+            }
+            Ok(ParserTestResult {
+                article_count: page.tweets.len(),
+            })
+        }
+        parsers::XIAOHONGSHU => {
+            let profile_id = parsers::xiaohongshu::sanitize_profile_input(&handle)
+                .ok_or_else(|| AppError::code(parsers::xiaohongshu::CODE_HANDLE_INVALID))?;
+            let cookie = {
+                let conn = state.read().await;
+                parsers::cookie_credentials(&conn, parsers::XIAOHONGSHU)
+            };
+            let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+            let page = parsers::xiaohongshu::fetch_user_notes(&client, &profile_id, cookie.as_deref())
+                .await
+                .map_err(parsers::xiaohongshu::XhsError::into_app_error)?;
+            Ok(ParserTestResult {
+                article_count: page.notes.len(),
+            })
+        }
+        parsers::KUAISHOU => {
+            let user_id = parsers::kuaishou::sanitize_profile_input(&handle)
+                .ok_or_else(|| AppError::code(parsers::kuaishou::CODE_HANDLE_INVALID))?;
+            let cookie = {
+                let conn = state.read().await;
+                parsers::cookie_credentials(&conn, parsers::KUAISHOU)
+            };
+            let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+            let page = parsers::kuaishou::fetch_creator_page(&client, &user_id, cookie.as_deref())
+                .await
+                .map_err(parsers::kuaishou::KsError::into_app_error)?;
+            Ok(ParserTestResult {
+                article_count: page.photos.len(),
+            })
+        }
+        _ => Err(AppError::code("parserUnknown")),
     }
-    Ok(ParserTestResult {
-        article_count: page.tweets.len(),
-    })
 }
 
 /// Feed discovery (feature F6). Searches the bundled curated directory for

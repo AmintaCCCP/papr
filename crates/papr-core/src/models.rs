@@ -20,6 +20,15 @@ pub enum SourceType {
     /// `ingestion::parsers::x`) instead of a feed document. The feed's URL is
     /// the profile URL itself; authentication lives in the `parsers` setting.
     X,
+    /// A Xiaohongshu (RED) blogger profile fetched by the built-in parser (see
+    /// `ingestion::parsers::xiaohongshu`). Works anonymously from the SSR
+    /// profile page; an optional session cookie upgrades articles to full
+    /// note detail. The feed's URL is the profile URL itself.
+    Xiaohongshu,
+    /// A Kuaishou creator profile fetched by the built-in parser (see
+    /// `ingestion::parsers::kuaishou`). The web API is captcha-gated for
+    /// anonymous traffic, so a pasted login cookie is effectively required.
+    Kuaishou,
     /// An RSSHub route executed by the bundled local engine (see
     /// `ingestion::rsshub`). The feed's URL is the `rsshub://<route path>`
     /// short link the user subscribed with; which routes are installed and
@@ -38,6 +47,8 @@ impl SourceType {
             SourceType::Reddit => "reddit",
             SourceType::Newsletter => "newsletter",
             SourceType::X => "x",
+            SourceType::Xiaohongshu => "xiaohongshu",
+            SourceType::Kuaishou => "kuaishou",
             SourceType::Rsshub => "rsshub",
         }
     }

@@ -9,6 +9,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
+import { isParserSourceType } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
 import { isMac } from "../lib/platform";
@@ -585,13 +586,14 @@ export default function Reader({ onToast }: Props) {
   const startTranslate = useTranslationJobs((s) => s.translate);
   const job = useTranslationJobs((s) => (id != null ? s.jobs[id] : undefined));
 
-  // X articles are rendered entirely by the parser, and that rendering is the
-  // final content — there is no web page behind it worth extracting. A URL
-  // fetch for `x.com/<user>/status/<id>` returns the logged-out SPA shell
-  // ("Log in or sign up", "Relevant people", the footer), so an extraction
-  // stored by an earlier version must never win over the card, and the
-  // extract/toggle controls are hidden below.
-  const isXPost = a?.sourceType === "x";
+  // Parser articles (X, xiaohongshu, kuaishou — see `parsers.ts`) are
+  // rendered entirely by their parser, and that rendering is the final
+  // content — there is no web page behind it worth extracting. A URL fetch
+  // for these permalinks returns the logged-out SPA shell (or, for xiaohongshu
+  // / kuaishou, a login or captcha wall), so an extraction stored by an
+  // earlier version must never win over the card, and the extract/toggle
+  // controls are hidden below.
+  const isXPost = a?.sourceType != null && isParserSourceType(a.sourceType);
   const hasExtracted = !!a?.extractedHtml && !isXPost;
   const canTranslate = !!(a?.extractedHtml || a?.contentHtml);
   const baseBody = isXPost

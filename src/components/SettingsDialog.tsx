@@ -1912,7 +1912,12 @@ function ParserSettingsModal({
     try {
       const res = await api.testParser(parserKey, handle);
       setTestOk(true);
-      setTestResult(t("settings.parsers.testOk", { count: res.articleCount }));
+      setTestResult(
+        t("settings.parsers.testOk", {
+          count: res.articleCount,
+          item: t(meta.itemKey),
+        }),
+      );
     } catch (e) {
       setTestOk(false);
       setTestResult(errorText(e));
@@ -1922,7 +1927,12 @@ function ParserSettingsModal({
   };
 
   const clear = () => {
-    onChange({ ...cfg, authToken: undefined, ct0: undefined });
+    // Wipe exactly the fields this parser shows — the others stay absent.
+    const wiped = { ...cfg };
+    for (const f of PARSER_FIELDS[parserKey]) {
+      delete wiped[f.key];
+    }
+    onChange(wiped);
     setTestOk(false);
     setTestResult(null);
   };
@@ -1949,7 +1959,7 @@ function ParserSettingsModal({
             onCommit={(v) => onChange({ ...cfg, [f.key]: v || undefined })}
           />
         ))}
-        <p className="integ-hint">{t("settings.parsers.cookieHint")}</p>
+        <p className="integ-hint">{t(meta.cookieHintKey)}</p>
 
         <div
           style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}
@@ -1957,8 +1967,8 @@ function ParserSettingsModal({
           <input
             className="s-text-input"
             style={{ flex: 1 }}
-            placeholder={t("settings.parsers.testHandlePlaceholder")}
-            aria-label={t("settings.parsers.testHandlePlaceholder")}
+            placeholder={t(meta.testPlaceholderKey)}
+            aria-label={t(meta.testPlaceholderKey)}
             {...NO_AUTOCORRECT}
             value={testHandle}
             onChange={(e) => setTestHandle(e.target.value)}

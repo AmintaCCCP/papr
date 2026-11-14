@@ -515,16 +515,37 @@
         "name": "X（Twitter）",
         "desc": "x.com/ユーザー名を購読し、そのユーザーの最新ツイートを取得します。"
       },
+      "xiaohongshu": {
+        "name": "小红书（RED）",
+        "desc": "小红书のブロガープロフィールを購読し、最新のノートを取得します（匿名で利用可能、Cookie で全文取得に対応）。"
+      },
+      "kuaishou": {
+        "name": "快手",
+        "desc": "快手クリエイターのプロフィールを購読し、最新の作品を取得します（Web API は匿名リクエストに CAPTCHA を返すため、Cookie 推奨）。"
+      },
       "configure": "設定",
       "field": {
         "authToken": "auth_token",
-        "ct0": "ct0"
+        "ct0": "ct0",
+        "cookie": "Cookie"
       },
-      "cookieHint": "認証情報は必須です：x.com にログインし、ブラウザの開発者ツール（アプリケーション → Cookie）から auth_token と ct0 の値をコピーしてください。取得はあなた自身のセッションを使い、認証情報はこの端末のデータベースにのみ保存されます。",
-      "testHandlePlaceholder": "ユーザー名（例：jack）",
+      "cookieHint": {
+        "x": "認証情報は必須です：x.com にログインし、ブラウザの開発者ツール（アプリケーション → Cookie）から auth_token と ct0 の値をコピーしてください。取得はあなた自身のセッションを使い、認証情報はこの端末のデータベースにのみ保存されます。",
+        "xiaohongshu": "Cookie は任意：匿名のままノートカードを取得できます。ログイン済みの Cookie ヘッダー（開発者ツール → ネットワーク → リクエストヘッダーの Cookie）を貼ると、ノート全文・画像・動画が取得できます。認証情報はこの端末にのみ保存されます。",
+        "kuaishou": "Cookie は任意ですが推奨：Web API は匿名リクエストに CAPTCHA を返します。ログイン済みの Cookie ヘッダー（開発者ツール → ネットワーク → リクエストヘッダーの Cookie）を貼ってください。取得は読み取り専用で低頻度に制限され、認証情報はこの端末にのみ保存されます。"
+      },
+      "testHandlePlaceholder": {
+        "x": "ユーザー名（例：jack）",
+        "generic": "プロフィール URL またはユーザー ID"
+      },
+      "item": {
+        "x": "件のツイート",
+        "xiaohongshu": "件のノート",
+        "kuaishou": "件の作品"
+      },
       "test": "接続テスト",
       "testing": "テスト中…",
-      "testOk": "接続成功：{{count}} 件のツイートを取得しました",
+      "testOk": "接続成功：{{count}} {{item}}を取得しました",
       "clear": "認証情報を消去"
     },
     "rsshub": {
@@ -803,6 +824,14 @@
     "aiEmptyResponse": "プロバイダが空の要約を返しました — モデルとプロンプトを確認してください",
     "parserDisabled": "このリンクは内蔵パーサーで処理されますが、対応するパーサーが無効です。設定 → パーサー で有効にしてください。",
     "parserUnknown": "不明なパーサーです。",
+    "xiaohongshuAuthInvalid": "小红书のセッションが無効です（Cookie が不正または期限切れ）。設定 → パーサー で Cookie を更新するか、削除して匿名利用してください。",
+    "xiaohongshuAccountUnavailable": "この小红書ブロガーにアクセスできません（プロフィールが存在しない・削除済み・制限中の可能性）。",
+    "xiaohongshuBlocked": "匿名リクエストが小红書のリスク管理に阻まれました（レート制限のクールダウン、または制限付きプロフィール）— 時間を置いて再試行するか、設定 → パーサー でログイン Cookie を貼ってください。続く場合は URL を確認してください。",
+    "xiaohongshuHandleInvalid": "小红書のプロフィール URL またはユーザー ID が不正です（24 文字の 16 進数）。",
+    "kuaishouCaptcha": "快手の Web API は匿名リクエストに CAPTCHA を返します（Web 署名はローカルで再現できません）。設定 → パーサー でログイン Cookie を貼るか、RSSHub ルートマーケットの快手ルート（ブラウザエンジンが必要）をご利用ください。",
+    "kuaishouAccountUnavailable": "この快手クリエイターにアクセスできません（プロフィールが存在しない・ ban 済み・制限中の可能性）。",
+    "kuaishouBlocked": "快手のリクエストが拒否されました（レート制限または署名検証失敗）— 時間を置いて再試行するか、設定 → パーサー でログイン Cookie を貼ってください。",
+    "kuaishouHandleInvalid": "快手のプロフィール URL またはユーザー ID が不正です。",
     "xAuthRequired": "X パーサーには認証情報が必要です：設定 → パーサー で auth_token と ct0 を設定してください。",
     "xAuthInvalid": "X の認証が無効になりました（auth_token/ct0 が不正または期限切れ）。設定 → パーサー で更新してください。",
     "xAccountUnavailable": "この X ユーザーのタイムラインを取得できません（アカウントが存在しない・制限中・削除済みの可能性）。",
