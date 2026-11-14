@@ -222,9 +222,16 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
     } else if (tab === "folo") {
       // Before a preview exists, Enter / the primary button fetches it; once
       // shown, they run the import itself (the folo tab therefore never
-      // submits a blind import).
+      // submits a blind import). The pending guard matches the button's
+      // disabled condition exactly: while a mapping-toggle refetch is in
+      // flight the shown preview is stale, so Enter must not import against
+      // it either.
       if (foloPreview) {
-        if (foloPreview.importable > 0 && !importFolo.isPending)
+        if (
+          foloPreview.importable > 0 &&
+          !importFolo.isPending &&
+          !fetchPreview.isPending
+        )
           importFolo.mutate();
       } else if (foloUrl.trim() && !fetchPreview.isPending) {
         fetchPreview.mutate({ url: foloUrl.trim(), mapTwitter: foloMapTwitter });

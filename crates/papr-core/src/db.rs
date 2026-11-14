@@ -2523,23 +2523,19 @@ pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag
 
 // ─────────────────────────── filter rules ───────────────────────────
 
-/// Parse a stored When-document (JSON `Vec<Vec<RuleCondition>>`). `None`
-/// (legacy rows) and unparsable JSON (hand-edited rows) both resolve at the
-/// caller: legacy rows synthesise their document from the keyword columns,
-/// garbage degrades to "never matches" rather than failing the whole list.
-fn parse_conditions(json: Option<String>) -> Option<Vec<Vec<RuleCondition>>> {
-    json.and_then(|s| serde_json::from_str(&s).ok())
-}
-
 fn row_to_rule(r: &rusqlite::Row) -> rusqlite::Result<Rule> {
     let field: String = r.get(4)?;
     let query: String = r.get(5)?;
-    let conditions = parse_conditions(r.get(8)?).unwrap_or_else(|| {
-        // Legacy keyword rule (pre-v24): `query` is a comma-separated keyword
-        // list with OR semantics — exactly one single-condition group per
-        // keyword. Splitting (not one keyword-per-line in a single group)
-        // preserves the original "any keyword fires" behaviour bit for bit.
-        query
+    // A SQL NULL document means a pre-v24 keyword rule; a non-NULL value that
+    // fails to parse means the document was corrupted (hand-edited, partial
+    // write) and must NOT be resurrected from the `field`/`query` summary —
+    // those columns are derived from the document, so rebuilding from them
+    // would silently change what the rule matches (a corrupted "title
+    // contains rust AND author eq bob" whose summary is `any / rust,bob`
+    // would start skipping every Rust article again). Corrupt → inert until
+    // the rule is re-saved; matching treats an empty document as no-match.
+    let conditions = match r.get::<_, Option<String>>(8)? {
+        None => query
             .split(',')
             .map(|t| t.trim())
             .filter(|t| !t.is_empty())
@@ -2550,8 +2546,15 @@ fn row_to_rule(r: &rusqlite::Row) -> rusqlite::Result<Rule> {
                     value: term.to_string(),
                 }]
             })
-            .collect()
-    });
+            .collect(),
+        Some(doc) => serde_json::from_str(&doc).unwrap_or_else(|e| {
+            log::warn!(
+                "rule {}: conditions JSON is corrupt ({e}); the rule matches nothing until it is re-saved",
+                r.get::<_, i64>(0).unwrap_or_default()
+            );
+            Vec::new()
+        }),
+    };
     let rewrites = parse_rewrites(r.get(9)?);
     Ok(Rule {
         id: r.get(0)?,
@@ -2566,7 +2569,7 @@ fn row_to_rule(r: &rusqlite::Row) -> rusqlite::Result<Rule> {
 }
 
 /// Parse a stored rewrite list (JSON `Vec<RuleRewrite>`); anything malformed
-/// degrades to "no rewrites" like a bad conditions document.
+/// degrades to "no rewrites" like a corrupt conditions document.
 fn parse_rewrites(json: Option<String>) -> Vec<RuleRewrite> {
     json.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -2837,10 +2840,9 @@ pub fn preview_rule(
 /// and the `articles_fts_ad` trigger keep dependent rows and the FTS index in
 /// sync, the same path retention cleanup relies on. `read` / `star` set the
 /// matching flag and skip rows that already carry it, so the returned count is
-/// the number of rows actually changed; `rewrite` returns the number of
-/// *matched* rows (a needle absent from a row's text still counts it —
-/// there is no cheap changed-only guard for a REPLACE update). `rewrite`
-/// replaces literal from→to
+/// the number of rows actually changed — and so does `rewrite`, whose
+/// changed-row set is tracked explicitly (`INSTR` containment, the same
+/// literal containment `REPLACE()` applies). `rewrite` replaces literal from→to
 /// pairs in the matched articles' text (title / summary / HTML body / plain
 /// body), the stored twin of [`apply_rewrites`] at ingestion; no UPDATE
 /// trigger keeps `articles_fts` fresh, so the matched rows' FTS entries are
@@ -2873,11 +2875,14 @@ pub fn apply_rule_to_existing(
             // pair could add or remove a later pair's needle from a row —
             // each pair must act on exactly the set the rule matched (the
             // stored twin of ingestion, which matches once and then applies
-            // every rewrite). A temp table holds the snapshot; everything
-            // commits or rolls back together.
+            // every rewrite). Temp tables hold the snapshot and the subset
+            // actually changed; everything commits or rolls back together.
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch("CREATE TEMP TABLE rule_hits (id INTEGER PRIMARY KEY)")?;
-            let n = tx.execute(
+            tx.execute_batch(
+                "CREATE TEMP TABLE rule_hits (id INTEGER PRIMARY KEY);
+                 CREATE TEMP TABLE rule_changed (id INTEGER PRIMARY KEY);",
+            )?;
+            tx.execute(
                 &format!("INSERT INTO rule_hits(id) SELECT id FROM articles WHERE {where_sql}"),
                 params_from_iter(binds.iter().cloned()),
             )?;
@@ -2885,6 +2890,23 @@ pub fn apply_rule_to_existing(
                 if rw.from.is_empty() {
                     continue;
                 }
+                // Record which rows this pair will actually change — `INSTR`
+                // is the same literal, case-sensitive containment `REPLACE()`
+                // applies — so derived caches are only rebuilt where the
+                // original text really changed and the returned count means
+                // "rows changed", like the read / star branches.
+                tx.execute(
+                    // Explicitly joined/qualified: bare column names would
+                    // resolve against `rule_hits`, which holds only ids.
+                    "INSERT OR IGNORE INTO rule_changed(id)
+                     SELECT h.id FROM rule_hits h
+                     JOIN articles a ON a.id = h.id
+                     WHERE INSTR(a.title, ?1) > 0
+                        OR INSTR(COALESCE(a.summary, ''), ?1) > 0
+                        OR INSTR(COALESCE(a.content_html, ''), ?1) > 0
+                        OR INSTR(COALESCE(a.body_text, ''), ?1) > 0",
+                    params![rw.from],
+                )?;
                 // Literal replacement on the same four text fields
                 // `apply_rewrites` touches at ingestion. SQLite's `REPLACE()`
                 // is byte-literal and case-sensitive — never a regex — which
@@ -2892,8 +2914,7 @@ pub fn apply_rule_to_existing(
                 // `REPLACE(NULL, …)` yields NULL, so nullable text columns
                 // keep their NULL when the row is untouched by the needle —
                 // the stored twin of `apply_rewrites`, where `None` stays
-                // `None`. `body_text` is NOT NULL but REPLACE needs no
-                // COALESCE for it either.
+                // `None`.
                 tx.execute(
                     "UPDATE articles SET
                         title        = REPLACE(title, ?1, ?2),
@@ -2904,18 +2925,44 @@ pub fn apply_rule_to_existing(
                     params![rw.from, rw.to],
                 )?;
             }
-            // No UPDATE trigger maintains articles_fts, so rebuild the
-            // matched rows' entries from their (possibly rewritten) columns.
+            // No UPDATE trigger maintains articles_fts, so the changed rows'
+            // entries need rebuilding — but the body column only where the
+            // indexed body *is* the feed text: rows with `extracted_html`
+            // were indexed from the extracted full text (`set_extracted_html`
+            // writes `html_to_text(extracted_html)`), which rewrites never
+            // touch, so their indexed body must survive the title rewrite.
             tx.execute(
                 "UPDATE articles_fts SET
                     title = (SELECT title     FROM articles WHERE id = articles_fts.rowid),
                     body  = (SELECT body_text FROM articles WHERE id = articles_fts.rowid)
-                 WHERE rowid IN (SELECT id FROM rule_hits)",
+                 WHERE rowid IN (SELECT id FROM rule_changed)
+                   AND rowid IN (SELECT id FROM articles WHERE extracted_html IS NULL)",
                 [],
             )?;
-            tx.execute_batch("DROP TABLE rule_hits")?;
+            tx.execute(
+                "UPDATE articles_fts SET
+                    title = (SELECT title FROM articles WHERE id = articles_fts.rowid)
+                 WHERE rowid IN (SELECT id FROM rule_changed)
+                   AND rowid IN (SELECT id FROM articles WHERE extracted_html IS NOT NULL)",
+                [],
+            )?;
+            // The cached translation and AI summary are derivatives of the
+            // original text: drop them so the reader never shows a rewritten
+            // original beside a pre-rewrite rendering. (The v17
+            // `article_preview_translations_au` trigger already cleared the
+            // list-preview cache when title / body_text were updated above.)
+            tx.execute(
+                "UPDATE articles SET
+                    translated_html = NULL, translated_lang = NULL,
+                    translated_title = NULL, ai_summary = NULL
+                 WHERE id IN (SELECT id FROM rule_changed)",
+                [],
+            )?;
+            let changed: i64 =
+                tx.query_row("SELECT COUNT(*) FROM rule_changed", [], |r| r.get(0))?;
+            tx.execute_batch("DROP TABLE rule_changed; DROP TABLE rule_hits;")?;
             tx.commit()?;
-            Ok(n)
+            Ok(changed as usize)
         }
         _ => Ok(0),
     }
@@ -5177,6 +5224,134 @@ mod tests {
         );
         let (n, _) = preview_rule(&conn, None, &doc).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn corrupt_conditions_document_is_inert_not_resurrected_from_summary() {
+        // A corrupt (hand-edited) conditions JSON must not fall back to the
+        // `field`/`query` summary: those columns are derived from the
+        // document, so rebuilding from them would silently change what the
+        // rule matches. The rule goes inert until re-saved instead.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+             VALUES ('corrupt', NULL, 'any', 'sponsored', 'skip', 0, '{\"not\": \"a document\"}')",
+            [],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+        assert!(
+            rules[0].conditions.is_empty(),
+            "a corrupt document must load as inert, not as the keyword summary"
+        );
+        let a = NewArticle {
+            guid: "g-corrupt".into(),
+            url: Some("https://example.com/corrupt".into()),
+            title: "SPONSORED post".into(),
+            author: Some("ads".into()),
+            summary: None,
+            content_html: None,
+            body_text: "sponsored".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(
+            upsert_article(&conn, feed_id, &a, false, &rules).unwrap(),
+            "the corrupt rule must not skip articles the summary would match"
+        );
+    }
+
+    #[test]
+    fn rewrite_backfill_preserves_extracted_fts_and_invalidates_derivatives() {
+        // - A row with `extracted_html` has its FTS body indexed from the
+        //   extracted full text (`set_extracted_html`), which rewrites never
+        //   touch: the title rewrite must not clobber that index with the
+        //   shorter feed body.
+        // - Rows whose original text actually changed lose their cached
+        //   translation and AI summary; matched-but-unchanged rows keep
+        //   theirs. The returned count is rows *changed*, not rows matched.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "x1", "Rust Weekly #1");
+        seed(&conn, feed_id, "x2", "A plain story");
+        // Rule matches x1 by title OR x2 by author; only x1's text carries
+        // the needle, so only x1 changes.
+        let doc = vec![
+            vec![cond("title", "contains", "Rust Weekly")],
+            vec![cond("author", "eq", "bob")],
+        ];
+        let rewrites = vec![RuleRewrite {
+            from: "Rust Weekly".into(),
+            to: "Rust Letter".into(),
+        }];
+
+        let x1: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'x1'", [], |r| r.get(0))
+            .unwrap();
+        let x2: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'x2'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute("UPDATE articles SET author = 'bob' WHERE id = ?1", [x2]).unwrap();
+        // x1: extracted full text (its FTS body is that text) + cached derivatives.
+        set_extracted_html(&conn, x1, "<p>quasar deep text</p>", None).unwrap();
+        set_translation(&conn, x1, "<p>old body</p>", "zh", Some("old title")).unwrap();
+        set_ai_summary(&conn, x1, "old summary").unwrap();
+        // x2: matched but unchanged — derivatives stay valid.
+        set_translation(&conn, x2, "<p>old body</p>", "zh", Some("old title")).unwrap();
+        set_ai_summary(&conn, x2, "old summary").unwrap();
+
+        let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
+        assert_eq!(changed, 1, "only x1's text actually contains the needle");
+
+        // The extracted-derived FTS body survives; both titles are rebuilt.
+        let quasar: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'quasar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quasar, 1, "the extracted body index must not be clobbered");
+        let letter: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'letter'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(letter, 1, "the rewritten title is searchable");
+        // x1's derivatives are dropped; x2's stay.
+        let (t1, s1): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT translated_html, ai_summary FROM articles WHERE id = ?1",
+                [x1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((t1, s1), (None, None), "changed rows lose stale derivatives");
+        let (t2, s2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT translated_html, ai_summary FROM articles WHERE id = ?1",
+                [x2],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (t2.as_deref(), s2.as_deref()),
+            (Some("<p>old body</p>"), Some("old summary")),
+            "matched-but-unchanged rows keep their derivatives"
+        );
+        // The rewritten title landed too.
+        let title: String = conn
+            .query_row("SELECT title FROM articles WHERE id = ?1", [x1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "Rust Letter #1");
     }
 
     #[test]
