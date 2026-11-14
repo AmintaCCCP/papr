@@ -1171,11 +1171,16 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     }
 
     let tx = conn.unchecked_transaction()?;
+    // `url` follows when the incoming article carries one: an anonymous card
+    // row stored without a permalink gains the real explore URL when its
+    // detail is fetched later. `COALESCE` keeps an absent incoming URL from
+    // clearing a stored one.
     tx.execute(
         "UPDATE articles
             SET title = ?2, summary = ?3, content_html = ?4, body_text = ?5,
                 image_url = COALESCE(?6, image_url),
                 published_at = COALESCE(?7, published_at),
+                url = COALESCE(?8, url),
                 extracted_html = NULL
           WHERE id = ?1",
         params![
@@ -1185,7 +1190,8 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             a.content_html,
             a.body_text,
             a.image_url,
-            a.published_at
+            a.published_at,
+            a.url
         ],
     )?;
     // Enclosures must follow the markup: the xiaohongshu pending-retry path
