@@ -306,12 +306,12 @@ pub fn convert_feed_url(folo_url: &str, map_twitter: bool) -> FeedConversion {
 /// Rewrite `twitter/user/<handle>` to the native X parser's profile form.
 /// Only the profile route maps — keyword, list, media and sibling Twitter
 /// routes have no parser equivalent and stay engine routes. A route carrying
-/// a query string (an RSSHub filter like `exclude_replies` or `limit`) also
-/// stays an engine route: the rewrite would silently drop the filter. The X
-/// parser's own handle validation gates the rewrite, so a route that could
-/// never be a real profile keeps its `rsshub://` form.
+/// a query string or fragment (an RSSHub filter like `exclude_replies` or
+/// `limit`, a share anchor) also stays an engine route: the rewrite would
+/// silently drop it. The X parser's own handle validation gates the rewrite,
+/// so a route that could never be a real profile keeps its `rsshub://` form.
 fn map_twitter_route(route: &str) -> Option<String> {
-    if route.contains('?') {
+    if route.contains(['?', '#']) {
         return None;
     }
     let segments: Vec<&str> = route.split('/').filter(|s| !s.is_empty()).collect();
@@ -511,6 +511,11 @@ mod tests {
             FeedConversion::Keep(
                 "rsshub://twitter/user/shao__meng?exclude_replies=1".to_string()
             )
+        );
+        // Same for fragments — the rewrite must not strip them either.
+        assert_eq!(
+            convert_feed_url("rsshub://twitter/user/alice#foo", true),
+            FeedConversion::Keep("rsshub://twitter/user/alice#foo".to_string())
         );
     }
 
