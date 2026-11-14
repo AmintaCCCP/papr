@@ -32,6 +32,14 @@ pub enum Normalized {
         /// The page to fetch in order to extract the channel id.
         page_url: String,
     },
+    /// The URL is a Kuaishou app share short link (`v.kuaishou.com/<token>`)
+    /// whose creator id can only be learned by following the redirect.
+    /// `add_feed` resolves it, then hands the canonical profile URL to the
+    /// parser add flow.
+    NeedsKuaishouResolution {
+        /// The short link to resolve (redirect-following GET).
+        short_url: String,
+    },
     /// Not a recognized special source — hand back to the normal feed /
     /// auto-discovery flow untouched.
     Untouched,
@@ -85,6 +93,27 @@ pub fn normalize_source(input: &str) -> Normalized {
         return Normalized::Feed {
             url: feed,
             source_type: SourceType::X,
+        };
+    }
+    // Xiaohongshu profile URLs route to the built-in parser the same way.
+    if let Some(feed) = super::parsers::xiaohongshu::normalize_xiaohongshu_url(&url) {
+        return Normalized::Feed {
+            url: feed,
+            source_type: SourceType::Xiaohongshu,
+        };
+    }
+    // Kuaishou: a profile URL routes to its parser; an app share short link
+    // needs a redirect follow before the profile URL is even known, so it
+    // gets its own resolution outcome (same shape as YouTube vanity links).
+    if let Some(feed) = super::parsers::kuaishou::normalize_kuaishou_url(&url) {
+        return Normalized::Feed {
+            url: feed,
+            source_type: SourceType::Kuaishou,
+        };
+    }
+    if super::parsers::kuaishou::is_kuaishou_short_url(&url) {
+        return Normalized::NeedsKuaishouResolution {
+            short_url: url.to_string(),
         };
     }
 
@@ -678,5 +707,41 @@ mod tests {
             youtube_feed_url("UCabc"),
             "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc"
         );
+    }
+
+    // ── Xiaohongshu / Kuaishou: built-in parser routes ─────────────────
+
+    #[test]
+    fn xiaohongshu_profile_url_routes_to_parser() {
+        let (url, st) = feed(normalize_source(
+            "https://www.xiaohongshu.com/user/profile/5e47b1ed0000000001006895?xsec_token=AB",
+        ));
+        assert_eq!(
+            url,
+            "https://www.xiaohongshu.com/user/profile/5e47b1ed0000000001006895"
+        );
+        assert_eq!(st, SourceType::Xiaohongshu);
+    }
+
+    #[test]
+    fn kuaishou_profile_url_routes_to_parser() {
+        for input in [
+            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4",
+            "https://live.kuaishou.com/profile/3x4kuwfd24jzzf4",
+        ] {
+            let (url, st) = feed(normalize_source(input));
+            assert_eq!(url, "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4");
+            assert_eq!(st, SourceType::Kuaishou, "{input}");
+        }
+    }
+
+    #[test]
+    fn kuaishou_short_link_needs_resolution() {
+        match normalize_source("https://v.kuaishou.com/KoHZ7psH") {
+            Normalized::NeedsKuaishouResolution { short_url } => {
+                assert_eq!(short_url, "https://v.kuaishou.com/KoHZ7psH");
+            }
+            other => panic!("expected NeedsKuaishouResolution, got {other:?}"),
+        }
     }
 }

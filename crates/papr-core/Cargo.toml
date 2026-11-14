@@ -27,6 +27,7 @@ ammonia.workspace = true
 dom_smoothie.workspace = true
 lol_html.workspace = true
 chrono.workspace = true
+rand.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 

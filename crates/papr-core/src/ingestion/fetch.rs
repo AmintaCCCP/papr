@@ -87,6 +87,40 @@ pub fn build_download_client(conn: &Connection) -> Client {
     build_client_inner(30 * 60, &proxy)
 }
 
+/// Build the client the browser-flavor built-in parsers (xiaohongshu,
+/// kuaishou) talk through: the user's proxy settings, but **no cookie jar and
+/// no redirect following**. Both properties are load-bearing:
+/// - reqwest's jar would `insert` a `Cookie` header over the parser's
+///   explicitly-built one whenever the jar holds cookies for the target host
+///   (upstream responses set `acw_tc`-style cookies on every hit), silently
+///   replacing the configured session — the jar must be off.
+/// - Redirects are inspected instead of followed: the xiaohongshu edge
+///   answers throttled visitors with a 302 onto its login page, which is a
+///   coded error, not a document to read; and a redirect must never be
+///   followed off-site with session cookies attached.
+pub fn build_parser_client(conn: &Connection) -> Client {
+    let timeout = db::setting_parsed::<u64>(conn, "net_timeout_sec", 30);
+    let proxy = db::get_setting(conn, "net_proxy")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "system".to_string());
+    let mut builder = Client::builder()
+        .cookie_store(false)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(timeout.clamp(5, 300)))
+        .connect_timeout(Duration::from_secs(10));
+    match proxy.as_str() {
+        "system" | "" => {}
+        "none" => builder = builder.no_proxy(),
+        custom => {
+            if let Ok(p) = reqwest::Proxy::all(custom) {
+                builder = builder.proxy(p);
+            }
+        }
+    }
+    builder.build().expect("failed to build reqwest client")
+}
+
 /// Result of a conditional GET against a feed URL.
 pub enum Fetched {
     /// Server returned 304 — the stored copy is still current.
@@ -136,7 +170,9 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
     let looks_like_html = head
         .get(..9)
         .is_some_and(|s| s.eq_ignore_ascii_case("<!doctype"))
-        || head.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("<html"));
+        || head
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("<html"));
     if !looks_like_html {
         return None;
     }
@@ -268,10 +304,7 @@ fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
 /// same client (its cookie jar carries whatever the challenge response set)
 /// and return the second response untouched. One hop only — if the target is
 /// itself a challenge page it is returned as-is rather than looping.
-async fn follow_challenge(
-    client: &Client,
-    target: &str,
-) -> AppResult<reqwest::Response> {
+async fn follow_challenge(client: &Client, target: &str) -> AppResult<reqwest::Response> {
     let resp = client.get(target).send().await?;
     Ok(resp.error_for_status()?)
 }
@@ -469,7 +502,8 @@ mod tests {
 
     #[test]
     fn challenge_redirect_absolute_target_and_single_quotes() {
-        let page = b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
+        let page =
+            b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
         assert_eq!(
             js_redirect_target(page, "https://example.com/").as_deref(),
             Some("https://example.com/feed?x=1")
@@ -518,12 +552,16 @@ mod tests {
 </script></html>";
         assert_eq!(js_redirect_target(in_string, "https://example.com/"), None);
         // Same for a commented-out call (line and block forms).
-        let line_comment =
-            b"<html><script>// location.replace('/missing')\n</script></html>";
-        assert_eq!(js_redirect_target(line_comment, "https://example.com/"), None);
-        let block_comment =
-            b"<html><script>/* location.replace('/missing') */</script></html>";
-        assert_eq!(js_redirect_target(block_comment, "https://example.com/"), None);
+        let line_comment = b"<html><script>// location.replace('/missing')\n</script></html>";
+        assert_eq!(
+            js_redirect_target(line_comment, "https://example.com/"),
+            None
+        );
+        let block_comment = b"<html><script>/* location.replace('/missing') */</script></html>";
+        assert_eq!(
+            js_redirect_target(block_comment, "https://example.com/"),
+            None
+        );
         // A real call after a quoted sample in the same script still wins.
         let mixed = b"<html><script>const s = \"location.replace('/sample')\";\
 location.replace('/real?a=1')</script></html>";

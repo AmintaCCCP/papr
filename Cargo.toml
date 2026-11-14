@@ -30,6 +30,10 @@ ammonia = "4.1.2"
 dom_smoothie = "0.17"
 lol_html = "2"
 chrono = { version = "0.4", features = ["serde"] }
+# Jittered request pacing for the browser-flavor built-in parsers (see
+# ingestion::parsers::transport): a perfectly regular request stream is
+# itself a bot fingerprint.
+rand = "0.8"
 anyhow = "1"
 thiserror = "2"
 log = "0.4"
