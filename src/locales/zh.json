@@ -392,7 +392,7 @@
     },
     "filters": {
       "title": "过滤规则",
-      "intro": "每篇新文章到达时都会经过这些规则；保存时也会立即套用到已匹配的已有文章。可屏蔽噪声关键词，或自动把你关心的内容标为已读 / 加星。",
+      "intro": "每篇新文章到达时都会经过这些规则：条件按「且 / 或」组合，命中的文章可丢弃、标为已读、加星，或做字面替换；保存时也会立即套用到已匹配的已有文章。",
       "newRule": "新建规则",
       "empty": "还没有规则。",
       "untitled": "未命名规则",
@@ -402,10 +402,7 @@
       "confirmSkipTitle": "删除已有文章？",
       "confirmSkipMessage": "这条「丢弃」规则匹配到 {{count}} 篇已保存的文章。保存后会将它们永久删除，此操作不可撤销。之后的新文章仍会照常被拦截。",
       "confirmSkipConfirm": "删除并保存",
-      "needQuery": "请至少输入一个关键词",
       "namePlaceholder": "规则名称（可选）",
-      "queryPlaceholder": "关键词，用逗号分隔",
-      "matchIn": "匹配范围",
       "thenLabel": "则",
       "scopeLabel": "应用于",
       "allFeeds": "全部订阅源",
@@ -413,16 +410,40 @@
         "title": "标题",
         "author": "作者",
         "content": "正文",
-        "any": "任意位置"
+        "any": "任意位置",
+        "url": "链接"
       },
       "action": {
         "skip": "丢弃",
         "read": "标为已读",
-        "star": "加星"
+        "star": "加星",
+        "rewrite": "替换文本"
       },
       "preview": {
         "checking": "检测中…",
-        "count": "匹配到 {{count}} 篇已有文章"
+        "count": "匹配到 {{count}} 篇已有文章",
+        "invalid": "条件无法求值（请检查正则表达式等输入）"
+      },
+      "whenLabel": "当文章满足",
+      "and": "且",
+      "or": "或",
+      "addCondition": "添加条件",
+      "addGroup": "添加条件组",
+      "valuePlaceholder": "输入值",
+      "regexPlaceholder": "正则表达式（如 (?i)rust\\d）",
+      "rewritesTitle": "替换（字面替换，区分大小写）",
+      "rewriteFrom": "查找",
+      "rewriteTo": "替换为",
+      "addRewrite": "添加替换",
+      "rewritesHint": "替换会应用到标题、摘要与正文；保存时也会同步改写已匹配的已有文章。",
+      "needCondition": "请至少填写一个完整条件",
+      "needRewrite": "请填写每条替换的查找文本",
+      "operator": {
+        "contains": "包含",
+        "not_contains": "不包含",
+        "eq": "等于",
+        "not_eq": "不等于",
+        "regex": "正则匹配"
       }
     },
     "sync": {
@@ -820,7 +841,6 @@
     "emptyFolderName": "文件夹名称不能为空",
     "tagNameExists": "已存在同名标签",
     "folderNameExists": "已存在同名文件夹",
-    "emptyRuleQuery": "请为规则至少输入一个关键词",
     "noFeedFound": "在该网址未找到可订阅的源",
     "responseTooLarge": "服务器响应过大",
     "alreadySubscribed": "已经订阅过这个源了",
@@ -878,7 +898,14 @@
     "feedUrlChanged": "该订阅源已在其他窗口被编辑 — 请重新打开对话框后再修改",
     "foloInvalidRef": "这不是 Folo 列表链接 — 请粘贴 app.folo.is/share/lists/… 形式的分享链接或纯数字 ID",
     "foloListNotFound": "Folo 上没有这个列表 — 链接可能有误，或列表已被删除",
-    "foloTokenRejected": "Folo 拒绝了这个 token — 请在「设置 → 订阅」中检查后重试"
+    "foloTokenRejected": "Folo 拒绝了这个 token — 请在「设置 → 订阅」中检查后重试",
+    "emptyRuleCondition": "请为规则至少填写一个完整条件",
+    "badRuleCondition": "规则条件无效：未知字段或操作符、值为空，或正则无法编译",
+    "badRuleAction": "未知的规则动作",
+    "needRuleRewrite": "替换规则至少需要一条替换对",
+    "emptyRuleRewrite": "替换对的查找文本不能为空",
+    "tooManyRuleConditions": "条件数量超出上限",
+    "tooManyRuleRewrites": "替换对数量超出上限"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

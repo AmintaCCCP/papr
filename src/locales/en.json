@@ -392,7 +392,7 @@
     },
     "filters": {
       "title": "Filter rules",
-      "intro": "Rules run on every new article as it arrives — and, when you save, on matching articles you already have. Skip noisy keywords, or auto mark-read / star the things you care about.",
+      "intro": "Rules run on every new article: conditions combine with and / or, and a match can skip, mark read, star, or literally rewrite the article — and, when you save, matching articles you already have are handled the same way.",
       "newRule": "New rule",
       "empty": "No rules yet.",
       "untitled": "Untitled rule",
@@ -402,10 +402,7 @@
       "confirmSkipTitle": "Delete existing articles?",
       "confirmSkipMessage": "This discard rule matches {{count}} articles you already have. Saving will permanently delete them — this can't be undone. New articles will still be filtered going forward.",
       "confirmSkipConfirm": "Delete & save",
-      "needQuery": "Enter at least one keyword",
       "namePlaceholder": "Rule name (optional)",
-      "queryPlaceholder": "Keywords, comma-separated",
-      "matchIn": "Match in",
       "thenLabel": "Then",
       "scopeLabel": "Applies to",
       "allFeeds": "All feeds",
@@ -413,16 +410,40 @@
         "title": "title",
         "author": "author",
         "content": "content",
-        "any": "anywhere"
+        "any": "anywhere",
+        "url": "URL"
       },
       "action": {
         "skip": "Skip",
         "read": "Mark read",
-        "star": "Star"
+        "star": "Star",
+        "rewrite": "Rewrite text"
       },
       "preview": {
         "checking": "Checking…",
-        "count": "Matches {{count}} existing articles"
+        "count": "Matches {{count}} existing articles",
+        "invalid": "Conditions can't be evaluated (check regex patterns and values)"
+      },
+      "whenLabel": "When an article…",
+      "and": "and",
+      "or": "or",
+      "addCondition": "Add condition",
+      "addGroup": "Add condition group",
+      "valuePlaceholder": "Value",
+      "regexPlaceholder": "Regular expression, e.g. (?i)rust\\d",
+      "rewritesTitle": "Replacements (literal, case-sensitive)",
+      "rewriteFrom": "Find",
+      "rewriteTo": "Replace with",
+      "addRewrite": "Add replacement",
+      "rewritesHint": "Replacements apply to the title, summary and body; saving also rewrites matching articles you already have.",
+      "needCondition": "Fill in at least one complete condition",
+      "needRewrite": "Fill in the find text of every replacement",
+      "operator": {
+        "contains": "contains",
+        "not_contains": "does not contain",
+        "eq": "equals",
+        "not_eq": "does not equal",
+        "regex": "matches regex"
       }
     },
     "sync": {
@@ -820,7 +841,6 @@
     "emptyFolderName": "Folder name can't be empty",
     "tagNameExists": "A tag with that name already exists",
     "folderNameExists": "A folder with that name already exists",
-    "emptyRuleQuery": "Enter at least one keyword for the rule",
     "noFeedFound": "No feed found at that URL",
     "responseTooLarge": "The server's response was too large",
     "alreadySubscribed": "You are already subscribed to this feed",
@@ -878,7 +898,14 @@
     "feedUrlChanged": "The feed was edited in another window — reopen the dialog to make your change",
     "foloInvalidRef": "Not a Folo list reference — paste a share link like app.folo.is/share/lists/… or the bare list id",
     "foloListNotFound": "Folo has no such list — the link may be wrong, or the list was deleted",
-    "foloTokenRejected": "Folo rejected the token — check it in Settings → Subscriptions and retry"
+    "foloTokenRejected": "Folo rejected the token — check it in Settings → Subscriptions and retry",
+    "emptyRuleCondition": "Enter at least one complete condition for the rule",
+    "badRuleCondition": "Invalid rule condition: unknown field or operator, an empty value, or a pattern that doesn't compile",
+    "badRuleAction": "Unknown rule action",
+    "needRuleRewrite": "A rewrite rule needs at least one replacement pair",
+    "emptyRuleRewrite": "The find text of a replacement pair can't be empty",
+    "tooManyRuleConditions": "Too many conditions",
+    "tooManyRuleRewrites": "Too many replacement pairs"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

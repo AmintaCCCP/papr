@@ -206,8 +206,46 @@ export interface Tag {
   articleCount: number;
 }
 
-export type RuleField = "title" | "author" | "content" | "any";
-export type RuleAction = "skip" | "read" | "star";
+export type RuleField = "title" | "author" | "content" | "any" | "url";
+export type RuleOperator =
+  | "contains"
+  | "not_contains"
+  | "eq"
+  | "not_eq"
+  | "regex";
+export type RuleAction = "skip" | "read" | "star" | "rewrite";
+
+/** Runtime mirrors of models.rs's RULE_* constants — the Select options for
+ *  the rule editor are built from these so the two sides stay in lockstep. */
+export const RULE_FIELDS: RuleField[] = [
+  "title",
+  "author",
+  "content",
+  "any",
+  "url",
+];
+export const RULE_OPERATORS: RuleOperator[] = [
+  "contains",
+  "not_contains",
+  "eq",
+  "not_eq",
+  "regex",
+];
+export const RULE_ACTIONS: RuleAction[] = ["skip", "read", "star", "rewrite"];
+
+/** One When-condition: `value` tested against one `field` with one `operator`.
+ *  Mirrors models::RuleCondition. */
+export interface RuleCondition {
+  field: RuleField;
+  operator: RuleOperator;
+  value: string;
+}
+
+/** A literal from→to replacement applied by a `rewrite` rule. */
+export interface RuleRewrite {
+  from: string;
+  to: string;
+}
 
 /** Dry-run result for a draft filter rule (see preview_rule command). */
 export interface RulePreview {
@@ -220,9 +258,12 @@ export interface Rule {
   name: string;
   enabled: boolean;
   feedId: number | null;
-  field: RuleField;
-  query: string;
+  /** When-document: conditions are ANDed within a group, groups ORed across —
+   *  the rule fires when every condition of any one group matches. */
+  conditions: RuleCondition[][];
   action: RuleAction;
+  /** Literal replacements, only used when `action` is "rewrite". */
+  rewrites: RuleRewrite[];
   position: number;
 }
 
