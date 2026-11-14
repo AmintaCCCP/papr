@@ -75,7 +75,25 @@
     "discoverNoResults": "No feeds found — try a different keyword or paste a URL.",
     "discoverError": "Search failed — check your connection and try again.",
     "discoverFromPage": "Found on this page",
-    "discoverAdd": "Add"
+    "discoverAdd": "Add",
+    "tabFolo": "Folo list",
+    "foloHint": "Paste a Folo list share link to preview and import all of its feeds at once.",
+    "foloUrlPlaceholder": "https://app.folo.is/share/lists/…",
+    "foloUrlLabel": "Folo list link or ID",
+    "foloFetch": "Fetch preview",
+    "foloFetching": "Fetching…",
+    "foloImport": "Import {{count}} feeds",
+    "foloImporting": "Importing…",
+    "foloBy": "by {{owner}}",
+    "foloStats": "{{feeds}} feeds · {{subscribers}} subscribers",
+    "foloTruncated": "Folo embeds only the first {{visible}} of {{total}} feeds anonymously. Set a Folo token in Settings → Subscriptions to import them all.",
+    "foloUnsupported": "{{count}} feeds have no papr equivalent and will be skipped.",
+    "foloMappedBadge": "X",
+    "foloUnsupportedBadge": "unsupported",
+    "foloMapTwitter": "Rewrite Twitter routes to the native X parser",
+    "foloImported": "Imported {{imported}} feeds, skipped {{skipped}} already subscribed",
+    "foloUnsupportedNote": "{{count}} unsupported",
+    "foloTruncatedNote": "the list holds {{total}} — anonymous access sees only part"
   },
   "editFeed": {
     "title": "Edit feed",
@@ -364,7 +382,13 @@
       "noMatch": "No matching feeds.",
       "opmlExported": "OPML exported",
       "opmlImported": "Imported {{count}} feeds from OPML",
-      "unsubscribed": "Unsubscribed from {{title}}"
+      "unsubscribed": "Unsubscribed from {{title}}",
+      "foloTokenTitle": "Folo",
+      "foloTokenLabel": "Folo API token (optional)",
+      "foloTokenDesc": "Paste an access token from a logged-in Folo session so list imports see every feed (anonymous access only embeds the first few). Stored in plaintext in the local database, like the parser credentials.",
+      "foloTokenPlaceholder": "Paste a token (empty = anonymous access)",
+      "foloTokenSaved": "Folo token saved",
+      "foloTokenCleared": "Folo token cleared"
     },
     "filters": {
       "title": "Filter rules",
@@ -851,7 +875,10 @@
     "rsshubEngineChecksum": "The downloaded engine archive failed the sha256 check.",
     "rsshubEngineEnvTooLarge": "The merged route environment variables are too large for a process environment — remove or shorten some route variables in the marketplace.",
     "editUrlUnsupported": "This subscription's address can't be edited — unsubscribe and re-add it with the new source",
-    "feedUrlChanged": "The feed was edited in another window — reopen the dialog to make your change"
+    "feedUrlChanged": "The feed was edited in another window — reopen the dialog to make your change",
+    "foloInvalidRef": "Not a Folo list reference — paste a share link like app.folo.is/share/lists/… or the bare list id",
+    "foloListNotFound": "Folo has no such list — the link may be wrong, or the list was deleted",
+    "foloTokenRejected": "Folo rejected the token — check it in Settings → Subscriptions and retry"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

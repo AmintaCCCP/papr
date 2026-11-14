@@ -180,6 +180,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OpmlCmd,
     },
+    /// Import the feeds of a shared Folo list.
+    Folo {
+        #[command(subcommand)]
+        cmd: FoloCmd,
+    },
     /// Read or change settings.
     Settings {
         #[command(subcommand)]
@@ -398,6 +403,29 @@ enum OpmlCmd {
 }
 
 #[derive(Subcommand)]
+enum FoloCmd {
+    /// Import a shared Folo list's feeds (share link or bare list id).
+    ///
+    /// Anonymous requests only see the list's first few feeds — pass a Folo
+    /// access token (--token or the stored `folo_token` setting) to lift the
+    /// cap.
+    Import {
+        /// The share link (https://app.folo.is/share/lists/<id>) or list id.
+        url: String,
+        /// Place the imported feeds in this folder id.
+        #[arg(long, value_name = "ID")]
+        folder: Option<i64>,
+        /// Keep `rsshub://twitter/user/*` routes as RSSHub engine routes
+        /// instead of rewriting them to the native X parser (default: rewrite).
+        #[arg(long)]
+        no_map_twitter: bool,
+        /// A Folo access token, overriding the stored `folo_token` setting.
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SettingsCmd {
     /// Print a setting's value.
     Get { key: String },
@@ -515,6 +543,7 @@ async fn run(cli: Cli) -> Result<String, AxiError> {
         Some(Cmd::Newsletters) => cmd_newsletters(&path),
         Some(Cmd::Newsletter { cmd }) => cmd_newsletter(&path, cmd),
         Some(Cmd::Opml { cmd }) => cmd_opml(&path, cmd),
+        Some(Cmd::Folo { cmd }) => cmd_folo_import(&path, cmd).await,
         Some(Cmd::Settings { cmd }) => cmd_settings(&path, cmd),
         Some(Cmd::Stats) => cmd_stats(&path),
         Some(Cmd::Admin { cmd }) => cmd_admin(&path, cmd),
@@ -1574,6 +1603,101 @@ fn cmd_opml(path: &Path, cmd: OpmlCmd) -> Result<String, AxiError> {
                 None => Ok(xml),
             }
         }
+    }
+}
+
+/// Import the feeds of a shared Folo list — the CLI twin of the desktop's
+/// Folo import tab. Anonymous requests carry Folo's backend cap (only the
+/// first few feeds of a list are embedded); a stored or `--token` Folo token
+/// lifts it.
+async fn cmd_folo_import(path: &Path, cmd: FoloCmd) -> Result<String, AxiError> {
+    let FoloCmd::Import {
+        url,
+        folder,
+        no_map_twitter,
+        token,
+    } = cmd;
+    let conn = open_rw(path)?;
+    // Token precedence: --token wins, then the stored folo_token setting,
+    // then anonymous.
+    let token = match token {
+        Some(t) if !t.trim().is_empty() => Some(t),
+        _ => db::get_setting(&conn, "folo_token")
+            .map_err(db_err)?
+            .filter(|t| !t.trim().is_empty()),
+    };
+    let client = http_client()?;
+    let list = papr_core::folo::fetch_list(&client, &url, token.as_deref())
+        .await
+        .map_err(folo_err)?;
+    let (rows, unsupported) = papr_core::folo::to_imported(&list, !no_map_twitter, None);
+    let (added, skipped) =
+        papr_core::folo::import_feeds(&conn, &rows, folder).map_err(db_err)?;
+
+    let mut d = Doc::new();
+    let mut import = serde_json::Map::new();
+    import.insert("list".into(), json!(list.title));
+    import.insert("imported".into(), json!(added));
+    import.insert("skipped".into(), json!(skipped));
+    import.insert("unsupported".into(), json!(unsupported));
+    if list.truncated() {
+        import.insert("feedsVisible".into(), json!(list.feeds.len()));
+        import.insert("feedCount".into(), json!(list.feed_count));
+    }
+    d.set("import", Value::Object(import));
+    let mut help = Vec::new();
+    if list.truncated() {
+        help.push(format!(
+            "Folo embeds only {} of {} feeds for anonymous access — set a Folo token \
+(`papr settings set folo_token <token>` or --token) to import the rest",
+            list.feeds.len(),
+            list.feed_count
+        ));
+    }
+    if added > 0 {
+        help.push("Run `papr refresh` to fetch the imported feeds".into());
+    }
+    // Only promise the engine leg when the import actually kept engine
+    // routes — a fully Twitter-mapped list has none to speak of.
+    let kept_engine_routes = rows.iter().any(|r| {
+        r.feed_url
+            .get(..9)
+            .is_some_and(|s| s.eq_ignore_ascii_case("rsshub://"))
+    });
+    if kept_engine_routes {
+        help.push(
+            "`rsshub://` feeds fetch through the desktop app's local RSSHub engine".into(),
+        );
+    }
+    if !help.is_empty() {
+        d.help(help);
+    }
+    Ok(d.into_toon())
+}
+
+/// Translate Folo-fetch failures into actionable CLI messages — coded core
+/// errors render as bare codes otherwise.
+fn folo_err(e: papr_core::error::AppError) -> AxiError {
+    use papr_core::error::AppError;
+    match &e {
+        AppError::Coded("foloInvalidRef") => AxiError::runtime_help(
+            "not a Folo list reference",
+            vec![
+                "Pass a share link like https://app.folo.is/share/lists/<id> \
+(or the bare list id)".into(),
+            ],
+        ),
+        AppError::Coded("foloListNotFound") => AxiError::runtime(
+            "Folo returned no such list (the link may be wrong, or the list was deleted)",
+        ),
+        AppError::Coded("foloTokenRejected") => AxiError::runtime_help(
+            "Folo rejected the access token",
+            vec![
+                "Check the token (`papr settings get folo_token` shows the stored one)".into(),
+                "Drop --token to import anonymously (the list's first few feeds only)".into(),
+            ],
+        ),
+        _ => clean_err("could not fetch the Folo list", e),
     }
 }
 

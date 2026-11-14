@@ -812,6 +812,79 @@ function ReadingSection() {
 }
 
 /* ── subscriptions ───────────────────────────────────────── */
+
+/** The optional Folo API token, stored under the `folo_token` setting.
+ *  With it, Folo shared-list imports see a list's full feed membership;
+ *  without it Folo's backend embeds only the first few feeds. Saved on
+ *  blur / Enter, like the other free-text fields. */
+function FoloTokenGroup({ onToast }: { onToast: (m: string) => void }) {
+  const { t } = useTranslation();
+  // `null` while loading — the input stays empty and disabled until the
+  // stored value lands, so a save can't race the initial read.
+  const [stored, setStored] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+
+  useEffect(() => {
+    api
+      .getSetting("folo_token")
+      .then((v) => {
+        setStored(v ?? "");
+        setDraft(v ?? "");
+      })
+      .catch(() => setStored(""));
+  }, []);
+
+  const save = async () => {
+    if (stored === null) return;
+    const next = draft.trim();
+    if (next === stored.trim()) return;
+    try {
+      await api.setSetting("folo_token", next);
+      setStored(next);
+      onToast(
+        t(
+          next
+            ? "settings.subscriptions.foloTokenSaved"
+            : "settings.subscriptions.foloTokenCleared",
+        ),
+      );
+    } catch (e) {
+      reportError(e);
+    }
+  };
+
+  return (
+    <div className="settings-group" style={{ marginBottom: 18 }}>
+      <h3 className="settings-group-title">
+        {t("settings.subscriptions.foloTokenTitle")}
+      </h3>
+      <Row
+        label={t("settings.subscriptions.foloTokenLabel")}
+        desc={t("settings.subscriptions.foloTokenDesc")}
+      >
+        <input
+          className="modal-input"
+          type="password"
+          style={{ width: 240, marginBottom: 0 }}
+          {...NO_AUTOCORRECT}
+          disabled={stored === null}
+          value={draft}
+          placeholder={t("settings.subscriptions.foloTokenPlaceholder")}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={save}
+          onKeyDown={(e) => {
+            // Enter just blurs — the blur handler performs the save, so
+            // calling save() here too would fire two identical writes.
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+        />
+      </Row>
+    </div>
+  );
+}
+
 function SubscriptionsSection({
   feeds,
   onToast,
@@ -967,6 +1040,7 @@ function SubscriptionsSection({
         </div>
       </div>
       <RsshubEngineGroup />
+      <FoloTokenGroup onToast={onToast} />
       <div className="settings-group">
         <h3 className="settings-group-title">
           {t("settings.subscriptions.feedsCount", { count: filtered.length })}

@@ -75,7 +75,25 @@
     "discoverNoResults": "未找到订阅源 — 换个关键词或粘贴一个网址试试。",
     "discoverError": "搜索失败 — 请检查网络连接后重试。",
     "discoverFromPage": "在此页面发现",
-    "discoverAdd": "添加"
+    "discoverAdd": "添加",
+    "tabFolo": "Folo 列表",
+    "foloHint": "粘贴 Folo 列表分享链接，预览后一次性导入其中全部订阅源。",
+    "foloUrlPlaceholder": "https://app.folo.is/share/lists/…",
+    "foloUrlLabel": "Folo 列表链接或 ID",
+    "foloFetch": "获取预览",
+    "foloFetching": "获取中…",
+    "foloImport": "导入 {{count}} 个订阅",
+    "foloImporting": "导入中…",
+    "foloBy": "来自 {{owner}}",
+    "foloStats": "{{feeds}} 个订阅 · {{subscribers}} 人订阅",
+    "foloTruncated": "Folo 匿名访问只返回前 {{visible}} 个订阅（列表共 {{total}} 个）。在「设置 → 订阅」中配置 Folo token 可导入全部。",
+    "foloUnsupported": "{{count}} 个订阅暂不支持导入，将被跳过。",
+    "foloMappedBadge": "X",
+    "foloUnsupportedBadge": "不支持",
+    "foloMapTwitter": "将 Twitter 路由映射为原生 X 解析器",
+    "foloImported": "已导入 {{imported}} 个订阅，跳过 {{skipped}} 个已存在",
+    "foloUnsupportedNote": "另有 {{count}} 个暂不支持",
+    "foloTruncatedNote": "列表共 {{total}} 个，匿名访问只能获取部分"
   },
   "editFeed": {
     "title": "编辑订阅源",
@@ -364,7 +382,13 @@
       "noMatch": "没有匹配的订阅源。",
       "opmlExported": "OPML 已导出",
       "opmlImported": "已从 OPML 导入 {{count}} 个订阅源",
-      "unsubscribed": "已退订 {{title}}"
+      "unsubscribed": "已退订 {{title}}",
+      "foloTokenTitle": "Folo",
+      "foloTokenLabel": "Folo API token（可选）",
+      "foloTokenDesc": "粘贴 Folo 网页版登录态的 access token，导入 Folo 列表时即可获取全部订阅（匿名只能取前几个）。token 与解析器凭据一样，明文存储在本机数据库中。",
+      "foloTokenPlaceholder": "粘贴 token（留空则匿名访问）",
+      "foloTokenSaved": "Folo token 已保存",
+      "foloTokenCleared": "Folo token 已清除"
     },
     "filters": {
       "title": "过滤规则",
@@ -851,7 +875,10 @@
     "rsshubEngineChecksum": "下载的引擎包未通过 sha256 校验。",
     "rsshubEngineEnvTooLarge": "合并后的路由环境变量超出进程环境大小上限 —— 请在市场里移除或缩短部分路由变量。",
     "editUrlUnsupported": "该订阅源的地址不支持编辑 — 请退订后按新来源重新添加",
-    "feedUrlChanged": "该订阅源已在其他窗口被编辑 — 请重新打开对话框后再修改"
+    "feedUrlChanged": "该订阅源已在其他窗口被编辑 — 请重新打开对话框后再修改",
+    "foloInvalidRef": "这不是 Folo 列表链接 — 请粘贴 app.folo.is/share/lists/… 形式的分享链接或纯数字 ID",
+    "foloListNotFound": "Folo 上没有这个列表 — 链接可能有误，或列表已被删除",
+    "foloTokenRejected": "Folo 拒绝了这个 token — 请在「设置 → 订阅」中检查后重试"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

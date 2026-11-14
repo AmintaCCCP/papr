@@ -2422,6 +2422,66 @@ button { font-family: inherit; }
 .discover-url { font-family: var(--mono); font-size: 11px; }
 .discover-add { padding: 4px 9px; font-size: 11.5px; flex-shrink: 0; }
 
+/* Folo list import (the Add-feed dialog's third tab). The preview card
+   reuses the discover row styles; only the list header, the truncation /
+   unsupported warnings and the mapped badges are its own. */
+.folo-preview {
+  border: 1px solid var(--hair-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.folo-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px 8px;
+}
+.folo-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.folo-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.folo-warning {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--hover);
+  padding: 7px 12px;
+  border-top: 1px solid var(--hair);
+}
+.folo-feed-list {
+  max-height: 200px;
+  overflow-y: auto;
+  border-top: 1px solid var(--hair);
+}
+.folo-unsupported { opacity: 0.55; }
+.folo-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  border: 1px solid var(--hair-strong);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.folo-map-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+}
+
 /* ── Explore dialog — marketplace gallery of the curated feed directory ── */
 .modal-explore {
   width: 880px;

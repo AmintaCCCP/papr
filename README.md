@@ -68,6 +68,11 @@ This fork enhances Papr with richer export workflows, a Folo-style inline AI rea
 - **IME Candidate Escape No Longer Closes Dialogs**: Every dialog, popover and the command palette guards Escape with `isComposing` — cancelling a CJK/IME candidate window no longer tears down the dialog the user is typing in (the same guard `Enter` submits already had).
 - **Nested-Modal Escape Scoping**: Inner modals (RSSHub env editor, uninstall confirms, parser credential dialogs) own Escape while open; the outer dialog no longer closes both layers at once.
 
+### 7. Folo Shared-List Import
+- **One-Click List Migration**: Paste a Folo share link (`app.folo.is/share/lists/…`) into the add-feed dialog's new "Folo list" tab to preview a list — title, owner, subscriber count, every feed — and import all of it in one transaction, deduplicated and grouped into a folder of your choice. The CLI twin is `papr folo import <share-link-or-id>`.
+- **Native Parser Rewrites**: `rsshub://twitter/user/*` routes are rewritten to `https://x.com/<handle>` and served by the built-in X parser (with your existing credentials) instead of RSSHub's credential-hungry Twitter routes; every other `rsshub://` route flows into the local engine as usual. Unrecognized schemes are counted and skipped, never silently dropped.
+- **Anonymous Cap, Lifted by Token**: Folo's backend embeds only the first few feeds of a shared list for anonymous access — the preview and the import report say so explicitly. Pasting an optional Folo access token (Settings → Subscriptions) lifts the cap and imports the list's full membership.
+
 ---
 
 Papr is two front-ends over **one local database**:

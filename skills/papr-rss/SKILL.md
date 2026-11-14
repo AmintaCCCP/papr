@@ -53,6 +53,7 @@ papr rules | papr rule create "<name>" "<keywords>" --action star
 papr highlights [--article <id>] | papr highlight create <article_id> "<quote>"
 papr newsletters | papr newsletter add --title .. --host .. --user .. --password ..
 papr opml import <file> | papr opml export
+papr folo import <share-link-or-id> [--folder <id>] [--token <t>]   # import a shared Folo list's feeds
 papr settings get <key> | papr settings set <key> <value>
 papr stats
 ```

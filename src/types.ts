@@ -118,6 +118,50 @@ export interface DiscoveryResult {
   fromDirectory: boolean;
 }
 
+/** One feed of a Folo list, as the import preview renders it (mirrors
+ * commands::FoloPreviewFeed). */
+export interface FoloPreviewFeed {
+  /** The URL an import would store — possibly rewritten to the native X
+   * parser's form, else Folo's original. */
+  url: string;
+  title: string;
+  /** true → the URL was rewritten to the native X parser's form. */
+  mapped: boolean;
+  /** true → no papr equivalent; an import skips this feed. */
+  unsupported: boolean;
+}
+
+/** A Folo shared list fetched for preview (mirrors commands::FoloListPreview).
+ * Anonymous requests embed only the list's first few feeds — `truncated`
+ * says when Folo's backend cap hid part of it. */
+export interface FoloListPreview {
+  listId: string;
+  title: string;
+  description: string | null;
+  image: string | null;
+  ownerName: string | null;
+  subscriptionCount: number;
+  /** Total feeds in the list per Folo's own counter. */
+  feedCount: number;
+  /** How many of the embedded feeds an import would take. */
+  importable: number;
+  /** How many embedded feeds have no papr equivalent. */
+  unsupported: number;
+  truncated: boolean;
+  feeds: FoloPreviewFeed[];
+}
+
+/** Result of importing a Folo list (mirrors commands::FoloImportReport). */
+export interface FoloImportReport {
+  listTitle: string;
+  imported: number;
+  skipped: number;
+  unsupported: number;
+  /** The list's total size when Folo only embedded part of it, null when
+   * everything arrived. */
+  truncatedTotal: number | null;
+}
+
 export interface Folder {
   id: number;
   name: string;
