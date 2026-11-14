@@ -562,8 +562,7 @@ const FEED_COLUMNS: &str = "\
     FROM feeds f";
 
 pub fn list_feeds(conn: &Connection) -> AppResult<Vec<Feed>> {
-    let mut stmt =
-        conn.prepare(&format!("{FEED_COLUMNS} ORDER BY f.title COLLATE NOCASE"))?;
+    let mut stmt = conn.prepare(&format!("{FEED_COLUMNS} ORDER BY f.title COLLATE NOCASE"))?;
     let rows = stmt
         .query_map([], map_feed_row)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -624,8 +623,7 @@ pub const PARSER_SOURCE_TYPES_IN: &str = "('x', 'xiaohongshu', 'kuaishou')";
 /// newsletters (IMAP leg), the built-in parser source types (parser leg) and
 /// the engine-run rsshub sources (engine leg). None of these feed_urls is a
 /// plain feed document a conditional GET could parse.
-pub const NON_HTTP_SOURCE_TYPES: &str =
-    "('newsletter', 'x', 'xiaohongshu', 'kuaishou', 'rsshub')";
+pub const NON_HTTP_SOURCE_TYPES: &str = "('newsletter', 'x', 'xiaohongshu', 'kuaishou', 'rsshub')";
 
 /// All feeds that need an HTTP fetch. Newsletter, parser and rsshub sources
 /// are excluded — newsletters are polled over IMAP, parser feeds are fetched
@@ -1150,15 +1148,17 @@ pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult
 /// list replaces the stored one, so a card-to-fulltext upgrade carries its
 /// video media along; an empty list never clears what is stored.
 pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
-    let existing: Option<(i64, Option<String>, Option<String>, String)> = conn
+    /// The stored renderer-owned columns of one parser article row.
+    type StoredRow = (i64, Option<String>, Option<String>, String, Option<String>);
+    let existing: Option<StoredRow> = conn
         .query_row(
-            "SELECT id, content_html, extracted_html, body_text
+            "SELECT id, content_html, extracted_html, body_text, url
              FROM articles WHERE feed_id = ?1 AND guid = ?2",
             params![feed_id, a.guid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((id, content_html, extracted_html, body_text)) = existing else {
+    let Some((id, content_html, extracted_html, body_text, stored_url)) = existing else {
         return Ok(false);
     };
     // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
@@ -1166,7 +1166,11 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     let rendered_differs =
         content_html.as_deref() != a.content_html.as_deref() || body_text != a.body_text;
     let stale_extraction = extracted_html.is_some();
-    if !rendered_differs && !stale_extraction {
+    // A URL the stored row lacks counts as a change too: the permalink
+    // backfill must land even when the body is byte-identical (an anonymous
+    // card row whose detail upgrade re-renders to the same markup).
+    let url_backfill = a.url.is_some() && stored_url.as_deref() != a.url.as_deref();
+    if !rendered_differs && !stale_extraction && !url_backfill {
         return Ok(false);
     }
 
@@ -1285,9 +1289,7 @@ pub fn parser_feeds_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<P
         "SELECT id, source_type, feed_url FROM feeds WHERE source_type IN {PARSER_SOURCE_TYPES_IN} AND id = ?1"
     ))?;
     let rows = stmt
-        .query_map(params![feed_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?
+        .query_map(params![feed_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -3617,6 +3619,68 @@ mod tests {
     }
 
     #[test]
+    fn refresh_parser_article_backfills_url_without_touching_the_body() {
+        // The xiaohongshu pending-retry path can re-render a stored row to
+        // byte-identical markup while carrying the permalink the anonymous
+        // card was stored without — the URL backfill must land on its own,
+        // not only when the body happens to change.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://www.xiaohongshu.com/user/profile/5e47b1ed0000000001006895",
+            None,
+            "给我开饭",
+            None,
+            SourceType::Xiaohongshu,
+            None,
+        )
+        .unwrap();
+        let article = NewArticle {
+            guid: "xhs-5e47b1ed0000000001006895-1794462771000-bd93f046".into(),
+            url: None,
+            title: "这期偏韩系".into(),
+            author: None,
+            summary: Some("这期偏韩系".into()),
+            content_html: Some("<div class=\"x-xhs-card\">card</div>".into()),
+            body_text: "card".into(),
+            image_url: None,
+            published_at: Some("2026-11-12T05:52:51+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &article, false, &[]).unwrap());
+
+        // Same body, same markup, but the upgraded article now knows its
+        // permalink: the refresh must report a change and store the URL.
+        let upgraded = NewArticle {
+            url: Some(
+                "https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token=ABz9token="
+                    .into(),
+            ),
+            ..article.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &upgraded).unwrap());
+        let (url, content): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT url, content_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, article.guid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            url.as_deref(),
+            Some("https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token=ABz9token=")
+        );
+        // The body was genuinely untouched.
+        assert_eq!(
+            content.as_deref(),
+            Some("<div class=\"x-xhs-card\">card</div>")
+        );
+
+        // And the next refresh with the same article is a no-op again.
+        assert!(!refresh_parser_article(&conn, feed_id, &upgraded).unwrap());
+    }
+
+    #[test]
     fn refresh_parser_article_ignores_unknown_rows() {
         let conn = test_conn();
         let feed_id = insert_feed(
@@ -3685,11 +3749,7 @@ mod tests {
         // The parser leg selects exactly the X feed, in all four scopes.
         assert_eq!(
             parser_feeds_to_refresh(&conn).unwrap(),
-            vec![(
-                2,
-                "x".to_string(),
-                "https://x.com/jack".to_string()
-            )]
+            vec![(2, "x".to_string(), "https://x.com/jack".to_string())]
         );
         assert!(!parser_feeds_due_for_refresh(&conn, 30).unwrap().is_empty());
         assert_eq!(parser_feeds_for_feed(&conn, 2).unwrap().len(), 1);

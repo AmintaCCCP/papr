@@ -170,7 +170,9 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
     let looks_like_html = head
         .get(..9)
         .is_some_and(|s| s.eq_ignore_ascii_case("<!doctype"))
-        || head.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("<html"));
+        || head
+            .get(..5)
+            .is_some_and(|s| s.eq_ignore_ascii_case("<html"));
     if !looks_like_html {
         return None;
     }
@@ -302,10 +304,7 @@ fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
 /// same client (its cookie jar carries whatever the challenge response set)
 /// and return the second response untouched. One hop only — if the target is
 /// itself a challenge page it is returned as-is rather than looping.
-async fn follow_challenge(
-    client: &Client,
-    target: &str,
-) -> AppResult<reqwest::Response> {
+async fn follow_challenge(client: &Client, target: &str) -> AppResult<reqwest::Response> {
     let resp = client.get(target).send().await?;
     Ok(resp.error_for_status()?)
 }
@@ -503,7 +502,8 @@ mod tests {
 
     #[test]
     fn challenge_redirect_absolute_target_and_single_quotes() {
-        let page = b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
+        let page =
+            b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
         assert_eq!(
             js_redirect_target(page, "https://example.com/").as_deref(),
             Some("https://example.com/feed?x=1")
@@ -552,12 +552,16 @@ mod tests {
 </script></html>";
         assert_eq!(js_redirect_target(in_string, "https://example.com/"), None);
         // Same for a commented-out call (line and block forms).
-        let line_comment =
-            b"<html><script>// location.replace('/missing')\n</script></html>";
-        assert_eq!(js_redirect_target(line_comment, "https://example.com/"), None);
-        let block_comment =
-            b"<html><script>/* location.replace('/missing') */</script></html>";
-        assert_eq!(js_redirect_target(block_comment, "https://example.com/"), None);
+        let line_comment = b"<html><script>// location.replace('/missing')\n</script></html>";
+        assert_eq!(
+            js_redirect_target(line_comment, "https://example.com/"),
+            None
+        );
+        let block_comment = b"<html><script>/* location.replace('/missing') */</script></html>";
+        assert_eq!(
+            js_redirect_target(block_comment, "https://example.com/"),
+            None
+        );
         // A real call after a quoted sample in the same script still wins.
         let mixed = b"<html><script>const s = \"location.replace('/sample')\";\
 location.replace('/real?a=1')</script></html>";

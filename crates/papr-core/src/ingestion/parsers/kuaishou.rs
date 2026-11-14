@@ -103,7 +103,9 @@ pub type KsResult<T> = Result<T, KsError>;
 /// letters/digits (the web profile path's format, e.g. `3x4kuwfd24jzzf4`).
 pub fn is_valid_profile_id(id: &str) -> bool {
     (10..=24).contains(&id.len())
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// Recognize a pasted profile URL — `https://www.kuaishou.com/profile/<id>`
@@ -138,12 +140,7 @@ pub fn is_kuaishou_short_url(url: &Url) -> bool {
     url.host_str()
         .map(|h| h.to_lowercase() == "v.kuaishou.com")
         .unwrap_or(false)
-        && url
-            .path()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .count()
-            == 1
+        && url.path().split('/').filter(|s| !s.is_empty()).count() == 1
 }
 
 /// Recover the profile id from a stored canonical feed URL. The inverse of
@@ -271,8 +268,8 @@ fn operation_payload<'a>(response: &'a Value, operation: &str) -> Option<&'a Val
 
 /// Parse the `visionProfile` response.
 pub fn parse_profile_response(response: &str) -> KsResult<KsProfile> {
-    let value: Value = serde_json::from_str(response)
-        .map_err(|e| KsError::Parse(format!("profile json: {e}")))?;
+    let value: Value =
+        serde_json::from_str(response).map_err(|e| KsError::Parse(format!("profile json: {e}")))?;
     let payload = operation_payload(&value, "visionProfile");
     let result = payload
         .and_then(|p| p.get("result"))
@@ -336,7 +333,10 @@ pub fn parse_photo_list_response(response: &str) -> KsResult<(Vec<KsPhoto>, Stri
         .unwrap_or_default()
         .to_string();
     let mut photos = Vec::new();
-    if let Some(feeds) = payload.and_then(|p| p.get("feeds")).and_then(|f| f.as_array()) {
+    if let Some(feeds) = payload
+        .and_then(|p| p.get("feeds"))
+        .and_then(|f| f.as_array())
+    {
         for feed in feeds {
             let photo = feed.get("photo");
             let id = photo
@@ -387,9 +387,7 @@ pub fn parse_photo_list_response(response: &str) -> KsResult<(Vec<KsPhoto>, Stri
                     .and_then(|p| p.get("timestamp"))
                     .and_then(|v| v.as_i64()),
                 like_count: photo
-                    .and_then(|p| {
-                        p.get("realLikeCount").or_else(|| p.get("likeCount"))
-                    })
+                    .and_then(|p| p.get("realLikeCount").or_else(|| p.get("likeCount")))
                     .and_then(|v| v.as_i64())
                     .filter(|n| *n >= 0)
                     .map(|n| n.to_string()),
@@ -472,13 +470,17 @@ pub fn photo_to_article(photo: &KsPhoto, profile_url: &str) -> crate::db::NewArt
         body_text: photo.caption.clone(),
         image_url: photo.cover.clone(),
         published_at: photo.timestamp_ms.and_then(ms_to_rfc3339),
-        enclosures: photo.video.as_ref().map(|video| {
-            vec![crate::models::Enclosure {
-                url: video.clone(),
-                mime_type: Some("video/mp4".into()),
-                length: None,
-            }]
-        }).unwrap_or_default(),
+        enclosures: photo
+            .video
+            .as_ref()
+            .map(|video| {
+                vec![crate::models::Enclosure {
+                    url: video.clone(),
+                    mime_type: Some("video/mp4".into()),
+                    length: None,
+                }]
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -538,12 +540,20 @@ pub async fn fetch_creator_page(
     let author_from_list = photos.first().and_then(|p| p.author.clone());
     let fallback_profile = || KsProfile {
         user_id: user_id.to_string(),
-        name: author_from_list.clone().unwrap_or_else(|| user_id.to_string()),
+        name: author_from_list
+            .clone()
+            .unwrap_or_else(|| user_id.to_string()),
         avatar: None,
         bio: None,
         fan: None,
     };
-    let profile = match graphql(client, &build_vision_profile_body(user_id), &referer, cookie).await
+    let profile = match graphql(
+        client,
+        &build_vision_profile_body(user_id),
+        &referer,
+        cookie,
+    )
+    .await
     {
         Ok(response) => match parse_profile_response(&response) {
             Ok(profile) => profile,
@@ -614,14 +624,13 @@ mod tests {
     #[test]
     fn profile_id_round_trip() {
         assert_eq!(
-            profile_id_from_feed_url("https://www.kuaishou.com/profile/3x4kuwfd24jzzf4")
-                .as_deref(),
+            profile_id_from_feed_url("https://www.kuaishou.com/profile/3x4kuwfd24jzzf4").as_deref(),
             Some("3x4kuwfd24jzzf4")
         );
-        assert!(profile_id_from_feed_url(
-            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4?fid=1"
-        )
-        .is_none());
+        assert!(
+            profile_id_from_feed_url("https://www.kuaishou.com/profile/3x4kuwfd24jzzf4?fid=1")
+                .is_none()
+        );
         assert!(profile_id_from_feed_url("https://www.kuaishou.com/short-video/x").is_none());
     }
 
@@ -635,7 +644,10 @@ mod tests {
             sanitize_profile_input("https://live.kuaishou.com/profile/3x4kuwfd24jzzf4"),
             Some("3x4kuwfd24jzzf4".to_string())
         );
-        assert_eq!(sanitize_profile_input("https://v.kuaishou.com/KoHZ7psH"), None);
+        assert_eq!(
+            sanitize_profile_input("https://v.kuaishou.com/KoHZ7psH"),
+            None
+        );
     }
 
     /* ── request bodies ────────────────────────────────────────────── */
@@ -666,7 +678,10 @@ mod tests {
         let p = parse_profile_response(&profile_response()).unwrap();
         assert_eq!(p.name, "创作者昵称");
         assert_eq!(p.user_id, "3x4kuwfd24jzzf4");
-        assert_eq!(p.avatar.as_deref(), Some("https://p2-pro.a.yximgs.com/uhead/abc.jpg"));
+        assert_eq!(
+            p.avatar.as_deref(),
+            Some("https://p2-pro.a.yximgs.com/uhead/abc.jpg")
+        );
         assert_eq!(p.bio.as_deref(), Some("作者简介"));
         assert_eq!(p.fan.as_deref(), Some("123456"));
     }
@@ -679,7 +694,10 @@ mod tests {
             Err(KsError::Captcha)
         ));
         let blocked = r#"{"data":{"result":2}}"#;
-        assert!(matches!(parse_profile_response(blocked), Err(KsError::Blocked)));
+        assert!(matches!(
+            parse_profile_response(blocked),
+            Err(KsError::Blocked)
+        ));
         let gone = r#"{"data":{"result":99}}"#;
         assert!(matches!(
             parse_profile_response(gone),
@@ -710,12 +728,18 @@ mod tests {
         assert_eq!(photos.len(), 2);
         assert_eq!(photos[0].id, "3xphoto00001");
         assert_eq!(photos[0].caption, "第一条作品");
-        assert_eq!(photos[0].video.as_deref(), Some("https://p2-pro.a.yximgs.com/video1.mp4"));
+        assert_eq!(
+            photos[0].video.as_deref(),
+            Some("https://p2-pro.a.yximgs.com/video1.mp4")
+        );
         assert_eq!(photos[0].timestamp_ms, Some(1794462771000));
         assert_eq!(photos[0].like_count.as_deref(), Some("120"));
         // Works without an mp4 fall back to the cover; hidden like counts drop.
         assert!(photos[1].video.is_none());
-        assert_eq!(photos[1].cover.as_deref(), Some("https://p2-pro.a.yximgs.com/cover2.jpg"));
+        assert_eq!(
+            photos[1].cover.as_deref(),
+            Some("https://p2-pro.a.yximgs.com/cover2.jpg")
+        );
         assert!(photos[1].like_count.is_none());
     }
 
@@ -741,10 +765,7 @@ mod tests {
             timestamp_ms: Some(1794462771000),
             like_count: Some("120".into()),
         };
-        let article = photo_to_article(
-            &photo,
-            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4",
-        );
+        let article = photo_to_article(&photo, "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4");
         assert_eq!(article.guid, "3xphoto00001");
         assert!(article
             .url
@@ -773,10 +794,7 @@ mod tests {
             timestamp_ms: Some(1794370000000),
             like_count: None,
         };
-        let article = photo_to_article(
-            &photo,
-            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4",
-        );
+        let article = photo_to_article(&photo, "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4");
         assert!(article.title.starts_with("作品 20"));
         let html = article.content_html.unwrap();
         assert!(html.contains("<img src="));

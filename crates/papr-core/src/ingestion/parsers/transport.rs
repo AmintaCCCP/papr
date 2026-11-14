@@ -67,7 +67,11 @@ pub fn browser_document_headers(host: &str, cookie: Option<&str>) -> Vec<(String
 /// The Chrome XHR/fetch header group for JSON API calls (kuaishou's GraphQL
 /// endpoint). Same UA family, but `sec-fetch-*` describe a same-origin CORS
 /// request rather than a navigation.
-pub fn browser_api_headers(host: &str, referer: &str, cookie: Option<&str>) -> Vec<(String, String)> {
+pub fn browser_api_headers(
+    host: &str,
+    referer: &str,
+    cookie: Option<&str>,
+) -> Vec<(String, String)> {
     let profile = &PROFILES[0];
     let v = profile.brand_version;
     let mut headers: Vec<(String, String)> = vec![
@@ -75,7 +79,10 @@ pub fn browser_api_headers(host: &str, referer: &str, cookie: Option<&str>) -> V
         ("Accept".into(), "application/json, text/plain, */*".into()),
         ("Accept-Language".into(), "zh-CN,zh;q=0.9,en;q=0.8".into()),
         ("Content-Type".into(), "application/json".into()),
-        ("sec-ch-ua".into(), format!(r#""Chromium";v="{v}", "Not(A:Brand";v="24", "Google Chrome";v="{v}""#)),
+        (
+            "sec-ch-ua".into(),
+            format!(r#""Chromium";v="{v}", "Not(A:Brand";v="24", "Google Chrome";v="{v}""#),
+        ),
         ("sec-ch-ua-mobile".into(), "?0".into()),
         ("sec-ch-ua-platform".into(), r#""macOS""#.into()),
         ("Sec-Fetch-Dest".into(), "empty".into()),
@@ -136,7 +143,13 @@ mod tests {
         // sec-ch-ua and UA must claim the same major version.
         let ua = &headers[0].1;
         let sec = headers.iter().find(|(n, _)| n == "sec-ch-ua").unwrap();
-        let ua_major = ua.split("Chrome/").nth(1).unwrap().split('.').next().unwrap();
+        let ua_major = ua
+            .split("Chrome/")
+            .nth(1)
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap();
         assert!(sec.1.contains(&format!("v=\"{ua_major}\"")));
     }
 

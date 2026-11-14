@@ -38,9 +38,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use url::Url;
 
-use super::transport::{
-    browser_document_headers, is_host_or_subdomain, jittered_delay_ms, pace,
-};
+use super::transport::{browser_document_headers, is_host_or_subdomain, jittered_delay_ms, pace};
 
 /// The site every xiaohongshu request must stay on.
 const REGISTRABLE_DOMAIN: &str = "xiaohongshu.com";
@@ -123,7 +121,10 @@ pub type XhsResult<T> = Result<T, XhsError>;
 /// True for a syntactically valid Xiaohongshu profile id: exactly 24
 /// lowercase hex characters (the site's own format).
 pub fn is_valid_profile_id(id: &str) -> bool {
-    id.len() == 24 && id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    id.len() == 24
+        && id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 /// Recognize a pasted profile URL — `https://www.xiaohongshu.com/user/profile/<id>`
@@ -427,9 +428,11 @@ fn unwrap_raw(value: Value) -> Value {
 
 /// Parse the normalized JSON of one profile page into metadata + notes.
 pub fn parse_profile_state(json: &str) -> XhsResult<XhsUserPage> {
-    let state: XhsInitialState = serde_json::from_str(json)
-        .map_err(|e| XhsError::Parse(format!("initial state: {e}")))?;
-    let user = state.user.ok_or_else(|| XhsError::Parse("no `user` node".into()))?;
+    let state: XhsInitialState =
+        serde_json::from_str(json).map_err(|e| XhsError::Parse(format!("initial state: {e}")))?;
+    let user = state
+        .user
+        .ok_or_else(|| XhsError::Parse("no `user` node".into()))?;
 
     let page_data = user
         .user_page_data
@@ -445,7 +448,9 @@ pub fn parse_profile_state(json: &str) -> XhsResult<XhsUserPage> {
     let nickname = basic
         .nickname
         .filter(|n| !n.trim().is_empty())
-        .ok_or_else(|| XhsError::Parse("basicInfo has no nickname (cookie expired or gated?)".into()))?;
+        .ok_or_else(|| {
+            XhsError::Parse("basicInfo has no nickname (cookie expired or gated?)".into())
+        })?;
     let profile = XhsProfileMeta {
         nickname,
         desc: basic.desc.filter(|d| !d.trim().is_empty()),
@@ -476,25 +481,25 @@ fn collect_notes(value: &Value, out: &mut Vec<XhsNote>) {
         let Some(card) = parsed.note_card else {
             continue;
         };
-                let note_id = parsed
-                    .id
-                    .filter(|s| !s.is_empty())
-                    .or(card.note_id.filter(|s| !s.is_empty()));
-                let xsec_token = parsed
-                    .xsec_token
-                    .filter(|s| !s.is_empty())
-                    .or(card.xsec_token.filter(|s| !s.is_empty()));
-                let title = card
-                    .display_title
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_default();
-                let cover = card
-                    .cover
-                    .and_then(|c| c.url_default)
-                    .filter(|s| !s.is_empty());
-                if note_id.is_none() && title.is_empty() && cover.is_none() {
-                    continue;
-                }
+        let note_id = parsed
+            .id
+            .filter(|s| !s.is_empty())
+            .or(card.note_id.filter(|s| !s.is_empty()));
+        let xsec_token = parsed
+            .xsec_token
+            .filter(|s| !s.is_empty())
+            .or(card.xsec_token.filter(|s| !s.is_empty()));
+        let title = card
+            .display_title
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_default();
+        let cover = card
+            .cover
+            .and_then(|c| c.url_default)
+            .filter(|s| !s.is_empty());
+        if note_id.is_none() && title.is_empty() && cover.is_none() {
+            continue;
+        }
         out.push(XhsNote {
             note_id,
             xsec_token,
@@ -548,12 +553,9 @@ struct XhsVideoStream {
 
 /// Parse the normalized JSON of a note detail page into the full note body.
 /// Returns `(title, desc, kind, time_ms, images, video_urls)`.
-pub fn parse_note_detail_state(
-    json: &str,
-    expect_note_id: &str,
-) -> XhsResult<XhsNoteDetailParsed> {
-    let state: Value = serde_json::from_str(json)
-        .map_err(|e| XhsError::Parse(format!("detail state: {e}")))?;
+pub fn parse_note_detail_state(json: &str, expect_note_id: &str) -> XhsResult<XhsNoteDetailParsed> {
+    let state: Value =
+        serde_json::from_str(json).map_err(|e| XhsError::Parse(format!("detail state: {e}")))?;
     let note_node = state
         .get("note")
         .ok_or_else(|| XhsError::Parse("no `note` node".into()))?;
@@ -591,10 +593,7 @@ pub fn parse_note_detail_state(
     if let Some(video) = detail.video.as_ref() {
         // `media.stream.<codec>[*].masterUrl`, codecs tried in the web
         // client's preference order (h264 first — widest player support).
-        if let Some(streams) = video
-            .pointer("/media/stream")
-            .and_then(|s| s.as_object())
-        {
+        if let Some(streams) = video.pointer("/media/stream").and_then(|s| s.as_object()) {
             for codec in ["h264", "av1", "h265", "h266"] {
                 if let Some(list) = streams.get(codec).and_then(|v| v.as_array()) {
                     for stream in list {
@@ -733,10 +732,7 @@ pub fn note_detail_html(detail: &XhsNoteDetailParsed, note_id: &str, token: &str
         }
     }
     for image in &detail.images {
-        html.push_str(&format!(
-            "<p><img src=\"{}\"></p>",
-            escape_html_text(image)
-        ));
+        html.push_str(&format!("<p><img src=\"{}\"></p>", escape_html_text(image)));
     }
     if let Some(desc) = &detail.desc {
         // Plain text with newlines → paragraphs; the sanitizer has the final
@@ -766,9 +762,9 @@ pub fn note_to_article(
     // URL-dedup pass (`article_precheck`, dedup_enabled) reject every card
     // after the first — the card HTML keeps the profile link as the way in.
     let url = match (&note.note_id, &note.xsec_token) {
-        (Some(id), Some(token)) => format!(
-            "https://{WEB_HOST}/explore/{id}?xsec_token={token}&xsec_source=pc_user"
-        ),
+        (Some(id), Some(token)) => {
+            format!("https://{WEB_HOST}/explore/{id}?xsec_token={token}&xsec_source=pc_user")
+        }
         (Some(id), None) => format!("https://{WEB_HOST}/explore/{id}"),
         _ => String::new(),
     };
@@ -824,11 +820,7 @@ pub fn note_to_article(
 /// status and landing page onto the error taxonomy. Cookies travel only in
 /// the explicit header — never a jar — so they cannot leak even if the edge
 /// redirected.
-async fn get_document(
-    client: &Client,
-    url: &str,
-    cookie: Option<&str>,
-) -> XhsResult<String> {
+async fn get_document(client: &Client, url: &str, cookie: Option<&str>) -> XhsResult<String> {
     let mut req = client.get(url);
     for (name, value) in browser_document_headers(WEB_HOST, cookie) {
         req = req.header(name, value);
@@ -863,8 +855,8 @@ async fn get_document(
     let bytes = crate::ingestion::fetch::read_capped(resp)
         .await
         .map_err(|e| XhsError::Transport(e.to_string()))?;
-    let html = String::from_utf8(bytes)
-        .map_err(|_| XhsError::Parse("response is not UTF-8".into()))?;
+    let html =
+        String::from_utf8(bytes).map_err(|_| XhsError::Parse("response is not UTF-8".into()))?;
     if html.contains("fe-verify-box") {
         return Err(XhsError::Blocked);
     }
@@ -894,9 +886,8 @@ pub async fn fetch_note_detail(
     xsec_token: &str,
     cookie: &str,
 ) -> XhsResult<XhsNoteDetailParsed> {
-    let url = format!(
-        "https://{WEB_HOST}/explore/{note_id}?xsec_token={xsec_token}&xsec_source=pc_user"
-    );
+    let url =
+        format!("https://{WEB_HOST}/explore/{note_id}?xsec_token={xsec_token}&xsec_source=pc_user");
     let html = get_document(client, &url, Some(cookie)).await?;
     let json = extract_initial_state(&html)
         .ok_or_else(|| XhsError::Parse("no __INITIAL_STATE__ on note page".into()))?;
@@ -1104,8 +1095,7 @@ mod tests {
         // Real SSR pages are full of Chinese text; the scanner must walk by
         // `char`, not by byte (a +1 slice inside a CJK code point panics).
         let html = "<script>window.__INITIAL_STATE__={\"a\":\"今天去一家新店\",\"b\":undefined,\"c\":\"undefined未定义\"}</script>";
-        let v: Value =
-            serde_json::from_str(&extract_initial_state(html).unwrap()).unwrap();
+        let v: Value = serde_json::from_str(&extract_initial_state(html).unwrap()).unwrap();
         assert_eq!(v["a"], "今天去一家新店");
         assert!(v["b"].is_null());
         // `undefined` inside a CJK string stays a literal.
@@ -1235,7 +1225,10 @@ mod tests {
         assert_eq!(d.kind.as_deref(), Some("video"));
         assert_eq!(d.images, vec!["https://sns-webpic-qc.xhscdn.com/img1"]);
         // h264 masterUrl wins over the consumer-key fallback.
-        assert_eq!(d.video_urls, vec!["https://sns-video-hw.xhscdn.com/stream/66.mp4"]);
+        assert_eq!(
+            d.video_urls,
+            vec!["https://sns-video-hw.xhscdn.com/stream/66.mp4"]
+        );
         assert_eq!(d.time_ms, Some(1794111111000));
     }
 
@@ -1276,7 +1269,9 @@ mod tests {
         assert_ne!(g1, note_guid("5e47b1ed0000000001006895", &other));
         // No time at all still yields a deterministic guid.
         other.time_ms = None;
-        assert!(note_guid("5e47b1ed0000000001006895", &other).contains("xhs-5e47b1ed0000000001006895-"));
+        assert!(
+            note_guid("5e47b1ed0000000001006895", &other).contains("xhs-5e47b1ed0000000001006895-")
+        );
     }
 
     #[test]
@@ -1302,12 +1297,19 @@ mod tests {
         // Anonymous cards carry no permalink URL (URL-dedup would collapse
         // them onto one row); the profile link lives in the card HTML.
         assert!(article.url.is_none());
-        assert!(article.content_html.as_deref().unwrap().contains("/user/profile/"));
+        assert!(article
+            .content_html
+            .as_deref()
+            .unwrap()
+            .contains("/user/profile/"));
         let html = article.content_html.unwrap();
         assert!(html.contains("sns-webpic-qc.xhscdn.com/cover"));
         assert!(html.contains("x-xhs-card"));
         assert!(html.contains("♥ 199"));
-        assert_eq!(article.image_url.as_deref(), Some("http://sns-webpic-qc.xhscdn.com/cover"));
+        assert_eq!(
+            article.image_url.as_deref(),
+            Some("http://sns-webpic-qc.xhscdn.com/cover")
+        );
         assert!(article.published_at.is_some());
     }
 
@@ -1339,11 +1341,9 @@ mod tests {
             None,
         );
         // Permalink with the token, per the detail-page contract.
-        assert!(article
-            .url
-            .as_deref()
-            .unwrap()
-            .starts_with("https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token="));
+        assert!(article.url.as_deref().unwrap().starts_with(
+            "https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token="
+        ));
         let html = article.content_html.unwrap();
 
         assert!(html.contains("<video"));
@@ -1399,7 +1399,10 @@ mod tests {
         assert_eq!(loaded.pending.get(&1).unwrap().len(), MAX_PENDING_PER_FEED);
         let taken = loaded.take(1, 10);
         assert_eq!(taken.len(), 10);
-        assert_eq!(taken[0].note_id, format!("note{:024}", 40 - MAX_PENDING_PER_FEED));
+        assert_eq!(
+            taken[0].note_id,
+            format!("note{:024}", 40 - MAX_PENDING_PER_FEED)
+        );
     }
 
     #[test]

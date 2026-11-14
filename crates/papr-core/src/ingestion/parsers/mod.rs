@@ -248,7 +248,10 @@ mod tests {
         // The SQL lists name no parser the registry does not know.
         for quoted in ["'x'", "'xiaohongshu'", "'kuaishou'"] {
             let id = quoted.trim_matches('\'');
-            assert!(PARSER_IDS.contains(&id), "db list has unknown parser '{id}'");
+            assert!(
+                PARSER_IDS.contains(&id),
+                "db list has unknown parser '{id}'"
+            );
         }
     }
 }

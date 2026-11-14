@@ -876,8 +876,8 @@ async fn poll_kuaishou_feeds(
                     .iter()
                     .map(|photo| kuaishou::photo_to_article(photo, feed_url))
                     .collect();
-                let inserted = upsert_articles(db, *feed_id, &articles, dedup, rules, "kuaishou")
-                    .await;
+                let inserted =
+                    upsert_articles(db, *feed_id, &articles, dedup, rules, "kuaishou").await;
                 total_new += inserted;
                 let conn = db.lock().await;
                 for article in &articles {
