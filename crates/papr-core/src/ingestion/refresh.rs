@@ -649,61 +649,75 @@ async fn poll_xiaohongshu_feeds(
         };
 
         // ── pending retry phase (earlier cycles' backlog, cookie mode) ──
+        // The backlog belongs to cookie mode only: without a cookie the
+        // entries stay queued untouched (no detail traffic — the anonymous
+        // contract reads profile cards alone), and the queue keeps its
+        // entries for when a cookie arrives.
+        //
         // The guid is the one the original card row stored: the detail page's
         // title/time may differ from the card's, so the retry article pins it
         // instead of recomputing.
         let mut retried: Vec<db::NewArticle> = Vec::new();
-        for pending in state.take(*feed_id, xiaohongshu::MAX_DETAILS_PER_REFRESH) {
-            let Some(token) = pending.xsec_token.as_deref() else {
-                continue;
-            };
-            xiaohongshu::pace_details().await;
-            match xiaohongshu::fetch_note_detail(
-                client,
-                &pending.note_id,
-                token,
-                cookie.as_deref().unwrap_or_default(),
-            )
-            .await
-            {
-                Ok(parsed) => {
-                    let note = xiaohongshu::XhsNote {
-                        note_id: Some(pending.note_id.clone()),
-                        xsec_token: pending.xsec_token.clone(),
-                        title: parsed.title.clone().unwrap_or_default(),
-                        kind: parsed.kind.clone(),
-                        time_ms: parsed.time_ms,
-                        cover: parsed.images.first().cloned(),
-                        author: None,
-                        liked_count: None,
-                    };
-                    retried.push(xiaohongshu::note_to_article(
-                        &profile_id,
-                        feed_url,
-                        &note,
-                        Some(&parsed),
-                        Some(&pending.guid),
-                    ));
-                }
-                Err(e) => {
-                    log::warn!(
-                        "xiaohongshu parser: pending detail retry failed ({}): {e}",
-                        pending.note_id
-                    );
-                    // Re-queue for the next cycle.
-                    state.enqueue(
-                        *feed_id,
-                        xiaohongshu::XhsPendingNote {
-                            note_id: pending.note_id.clone(),
+        let mut detail_attempts = 0usize;
+        if cookie.is_some() {
+            for pending in state.take(*feed_id, xiaohongshu::MAX_DETAILS_PER_REFRESH) {
+                let Some(token) = pending.xsec_token.as_deref() else {
+                    continue;
+                };
+                // The budget counts *attempts*, not successes: ten upstream
+                // failures must leave nothing left for this cycle, not open
+                // a second window.
+                detail_attempts += 1;
+                xiaohongshu::pace_details().await;
+                match xiaohongshu::fetch_note_detail(
+                    client,
+                    &pending.note_id,
+                    token,
+                    cookie.as_deref().unwrap_or_default(),
+                )
+                .await
+                {
+                    Ok(parsed) => {
+                        let note = xiaohongshu::XhsNote {
+                            note_id: Some(pending.note_id.clone()),
                             xsec_token: pending.xsec_token.clone(),
-                            guid: pending.guid.clone(),
-                        },
-                    );
+                            title: parsed.title.clone().unwrap_or_default(),
+                            kind: parsed.kind.clone(),
+                            time_ms: parsed.time_ms,
+                            cover: parsed.images.first().cloned(),
+                            author: None,
+                            liked_count: None,
+                        };
+                        retried.push(xiaohongshu::note_to_article(
+                            &profile_id,
+                            feed_url,
+                            &note,
+                            Some(&parsed),
+                            Some(&pending.guid),
+                        ));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "xiaohongshu parser: pending detail retry failed ({}): {e}",
+                            pending.note_id
+                        );
+                        // Re-queue for the next cycle.
+                        state.enqueue(
+                            *feed_id,
+                            xiaohongshu::XhsPendingNote {
+                                note_id: pending.note_id.clone(),
+                                xsec_token: pending.xsec_token.clone(),
+                                guid: pending.guid.clone(),
+                            },
+                        );
+                    }
                 }
             }
         }
         if !retried.is_empty() {
             upsert_articles(db, *feed_id, &retried, dedup, rules, "xiaohongshu").await;
+            // Upgraded rows carry the full text the card row lacked — push
+            // the refreshed markup (and enclosures) into them.
             let conn = db.lock().await;
             for article in &retried {
                 let _ = db::refresh_parser_article(&conn, *feed_id, article);
@@ -716,11 +730,16 @@ async fn poll_xiaohongshu_feeds(
                 let profile_url = feed_url.clone();
                 let known = existing_guids(db, *feed_id, &profile_id, &page.notes).await;
                 let mut articles: Vec<db::NewArticle> = Vec::with_capacity(page.notes.len());
-                // The per-cycle budget counts *detail fetches*, not cards, and
-                // is shared with the retry phase above: a page of existing
+                // Rows ingested as genuinely new this cycle — the only ones
+                // whose markup `refresh_parser_article` may rewrite. Re-running
+                // it over existing rows would replace a stored full-text body
+                // with the card the profile page ships.
+                let mut fresh: Vec<db::NewArticle> = Vec::new();
+                // The per-cycle budget counts *detail attempts*, not cards,
+                // and is shared with the retry phase above: a page of existing
                 // cards must not eat it before the first genuinely new note
                 // gets its full text.
-                let mut details_used = retried.len();
+                let mut details_used = detail_attempts;
                 for note in &page.notes {
                     let guid = xiaohongshu::note_guid(&profile_id, note);
                     let is_new = !known.contains(&guid);
@@ -766,19 +785,23 @@ async fn poll_xiaohongshu_feeds(
                             },
                         );
                     }
-                    articles.push(xiaohongshu::note_to_article(
+                    let article = xiaohongshu::note_to_article(
                         &profile_id,
                         &profile_url,
                         note,
                         detail.as_ref(),
                         None,
-                    ));
+                    );
+                    if is_new {
+                        fresh.push(article.clone());
+                    }
+                    articles.push(article);
                 }
                 let inserted =
                     upsert_articles(db, *feed_id, &articles, dedup, rules, "xiaohongshu").await;
                 total_new += inserted;
                 let conn = db.lock().await;
-                for article in &articles {
+                for article in &fresh {
                     let _ = db::refresh_parser_article(&conn, *feed_id, article);
                 }
                 let _ = db::touch_feed(&conn, *feed_id);
@@ -791,9 +814,17 @@ async fn poll_xiaohongshu_feeds(
             }
         }
     }
+    // Merge-save: this leg held the state across many network waits, during
+    // which `add_xiaohongshu_feed` may have persisted entries for other
+    // feeds. Overwrite only the queues this leg actually processed and keep
+    // the rest of the latest blob.
     {
         let conn = db.lock().await;
-        state.save(&conn);
+        let mut latest = xiaohongshu::XhsState::load(&conn);
+        for (feed_id, queue) in &state.pending {
+            latest.pending.insert(*feed_id, queue.clone());
+        }
+        latest.save(&conn);
     }
     total_new
 }

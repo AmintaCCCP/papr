@@ -530,9 +530,9 @@
         "cookie": "Cookie"
       },
       "cookieHint": {
-        "x": "Credentials are required: sign in to x.com, then copy the auth_token and ct0 cookie values from your browser's developer tools (Application → Cookies). Fetching uses your own session; credentials never leave this machine.",
-        "xiaohongshu": "Cookie optional: anonymous mode already fetches note cards; paste your logged-in Cookie header (devtools → Network → a request's Cookie header) to unlock full note text with images and video. Credentials never leave this machine.",
-        "kuaishou": "Cookie optional but recommended: the web API answers anonymous requests with a captcha, so paste your logged-in Cookie header (devtools → Network → a request's Cookie header). Fetches are read-only and heavily throttled; credentials never leave this machine."
+        "x": "Credentials are required: sign in to x.com, then copy the auth_token and ct0 cookie values from your browser's developer tools (Application → Cookies). Fetching uses your own session: credentials are stored only in this machine's database and are sent exclusively to x.com itself.",
+        "xiaohongshu": "Cookie optional: anonymous mode already fetches note cards; paste your logged-in Cookie header (devtools → Network → a request's Cookie header) to unlock full note text with images and video. Credentials are stored only in this machine's database and are sent exclusively to xiaohongshu.com itself.",
+        "kuaishou": "Cookie optional but recommended: the web API answers anonymous requests with a captcha, so paste your logged-in Cookie header (devtools → Network → a request's Cookie header). Fetches are read-only and heavily throttled; credentials are stored only in this machine's database and are sent exclusively to kuaishou.com itself."
       },
       "testHandlePlaceholder": {
         "x": "username, e.g. jack",

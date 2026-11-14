@@ -1146,7 +1146,9 @@ pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult
 /// `extracted_html`: for a parser feed that column can only hold a previous web
 /// extraction of the site's SPA shell, which is exactly what must not win over
 /// the rendered card. Read state, stars, read-later, tags, highlights and the
-/// AI summary are deliberately left alone.
+/// AI summary are deliberately left alone. A non-empty incoming enclosure
+/// list replaces the stored one, so a card-to-fulltext upgrade carries its
+/// video media along; an empty list never clears what is stored.
 pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
     let existing: Option<(i64, Option<String>, Option<String>, String)> = conn
         .query_row(
@@ -1186,6 +1188,20 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             a.published_at
         ],
     )?;
+    // Enclosures must follow the markup: the xiaohongshu pending-retry path
+    // upgrades a card row (no enclosure) to a full-text video note (mp4), and
+    // leaving the old list in place would make `get_article` return media-less
+    // content. Only an incoming non-empty list rewrites — an empty one never
+    // destroys what is stored.
+    if !a.enclosures.is_empty() {
+        tx.execute("DELETE FROM enclosures WHERE article_id = ?1", params![id])?;
+        for e in &a.enclosures {
+            tx.execute(
+                "INSERT INTO enclosures(article_id, url, mime_type, length) VALUES (?1,?2,?3,?4)",
+                params![id, e.url, e.mime_type, e.length],
+            )?;
+        }
+    }
     tx.execute(
         "UPDATE articles_fts SET title = ?2, body = ?3 WHERE rowid = ?1",
         params![id, a.title, a.body_text],
@@ -1483,6 +1499,7 @@ pub fn rsshub_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Ve
 // ─────────────────────────── articles ───────────────────────────
 
 /// A parsed article ready for insertion.
+#[derive(Debug, Clone)]
 pub struct NewArticle {
     pub guid: String,
     pub url: Option<String>,

@@ -9,7 +9,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
-import { isParserSourceType } from "../lib/parsers";
+import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
 import { isMac } from "../lib/platform";
@@ -594,6 +594,13 @@ export default function Reader({ onToast }: Props) {
   // earlier version must never win over the card, and the extract/toggle
   // controls are hidden below.
   const isXPost = a?.sourceType != null && isParserSourceType(a.sourceType);
+  // The source badge carries each parser platform's own glyph (PARSER_META),
+  // not a hardcoded X — xiaohongshu and kuaishou articles are parser posts
+  // too, and "X" would mislabel them.
+  const parserGlyph =
+    a && isParserSourceType(a.sourceType)
+      ? PARSER_META[a.sourceType as ParserKey].glyph
+      : "X";
   const hasExtracted = !!a?.extractedHtml && !isXPost;
   const canTranslate = !!(a?.extractedHtml || a?.contentHtml);
   const baseBody = isXPost
@@ -1124,7 +1131,7 @@ export default function Reader({ onToast }: Props) {
           >
             {isXPost ? (
               <span className="src-badge" aria-hidden="true">
-                X
+                {parserGlyph}
               </span>
             ) : (
               <Icon name="rss" size={13} />

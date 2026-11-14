@@ -531,32 +531,34 @@ pub async fn fetch_creator_page(
         parse_photo_list_response(&response)?
     };
     // The photo list already carries per-row author names; `visionProfile`
-    // only pins down the nickname/avatar for the feed row itself. When the
-    // creator has no works (or the operation is gated), fall back to the
-    // list's own author so a feed can still be born.
+    // only pins down the nickname/avatar for the feed row itself. The
+    // metadata call's failure is tolerable only while the list actually
+    // yielded works to fall back on — an empty list plus a captcha must
+    // propagate, or subscribing would "succeed" with a nameless feed.
     let author_from_list = photos.first().and_then(|p| p.author.clone());
+    let fallback_profile = || KsProfile {
+        user_id: user_id.to_string(),
+        name: author_from_list.clone().unwrap_or_else(|| user_id.to_string()),
+        avatar: None,
+        bio: None,
+        fan: None,
+    };
     let profile = match graphql(client, &build_vision_profile_body(user_id), &referer, cookie).await
     {
-        Ok(response) => parse_profile_response(&response).unwrap_or_else(|_| KsProfile {
-            user_id: user_id.to_string(),
-            name: author_from_list.unwrap_or_else(|| user_id.to_string()),
-            avatar: None,
-            bio: None,
-            fan: None,
-        }),
+        Ok(response) => match parse_profile_response(&response) {
+            Ok(profile) => profile,
+            Err(e) => {
+                if photos.is_empty() {
+                    return Err(e);
+                }
+                fallback_profile()
+            }
+        },
         Err(e) => {
-            // A captcha/blocked on the metadata call with works present still
-            // yields a usable feed; propagate only when there is nothing else.
             if photos.is_empty() {
                 return Err(e);
             }
-            KsProfile {
-                user_id: user_id.to_string(),
-                name: author_from_list.unwrap_or_else(|| user_id.to_string()),
-                avatar: None,
-                bio: None,
-                fan: None,
-            }
+            fallback_profile()
         }
     };
     Ok(KsUserPage { profile, photos })

@@ -761,12 +761,16 @@ pub fn note_to_article(
     detail: Option<&XhsNoteDetailParsed>,
     guid_override: Option<&str>,
 ) -> crate::db::NewArticle {
+    // Only notes with a real id get a permalink. Anonymous cards have no id,
+    // and pointing every one of them at the profile URL would make the
+    // URL-dedup pass (`article_precheck`, dedup_enabled) reject every card
+    // after the first — the card HTML keeps the profile link as the way in.
     let url = match (&note.note_id, &note.xsec_token) {
         (Some(id), Some(token)) => format!(
             "https://{WEB_HOST}/explore/{id}?xsec_token={token}&xsec_source=pc_user"
         ),
         (Some(id), None) => format!("https://{WEB_HOST}/explore/{id}"),
-        _ => profile_url.to_string(),
+        _ => String::new(),
     };
     let title = if note.title.trim().is_empty() {
         // Untitled notes exist (pure video drops). A stable, readable title
@@ -790,11 +794,14 @@ pub fn note_to_article(
         guid: guid_override
             .map(String::from)
             .unwrap_or_else(|| note_guid(profile_id, note)),
-        url: Some(url.clone()),
+        url: (!url.is_empty()).then_some(url.clone()),
         title,
         author: note.author.clone(),
         summary: Some(note.title.clone()),
-        content_html: Some(crate::sanitize::sanitize_parser(&content_html, Some(&url))),
+        content_html: Some(crate::sanitize::sanitize_parser(
+            &content_html,
+            (!url.is_empty()).then_some(url.as_str()),
+        )),
         body_text,
         image_url: note.cover.clone(),
         published_at: note.time_ms.and_then(ms_to_rfc3339),
@@ -1292,7 +1299,10 @@ mod tests {
             None,
         );
         assert!(article.title == "这期偏韩系");
-        assert!(article.url.unwrap().contains("/user/profile/"));
+        // Anonymous cards carry no permalink URL (URL-dedup would collapse
+        // them onto one row); the profile link lives in the card HTML.
+        assert!(article.url.is_none());
+        assert!(article.content_html.as_deref().unwrap().contains("/user/profile/"));
         let html = article.content_html.unwrap();
         assert!(html.contains("sns-webpic-qc.xhscdn.com/cover"));
         assert!(html.contains("x-xhs-card"));

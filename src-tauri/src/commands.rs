@@ -105,9 +105,10 @@ pub async fn add_feed(
                 )
             }
             Normalized::NeedsKuaishouResolution { short_url } => {
-                // An app share short link: follow the redirect (host-checked)
-                // to learn the canonical profile URL, then run the parser flow.
-                let profile_url = resolve_kuaishou_short_url(&client, &short_url).await?;
+                // An app share short link: follow the redirect (each hop
+                // host-checked before it is sent) to learn the canonical
+                // profile URL, then run the parser flow.
+                let profile_url = resolve_kuaishou_short_url(&state, &short_url).await?;
                 (profile_url, Some(SourceType::Kuaishou))
             }
             Normalized::Untouched => (url.clone(), None),
@@ -333,30 +334,38 @@ pub struct ParserTestResult {
 }
 
 /// Follow a Kuaishou app share short link (`v.kuaishou.com/<token>`) to its
-/// canonical profile URL. The parser client does not follow redirects, so
-/// each hop is read from the `Location` header and host-checked before
-/// continuing — at most 3 hops, and a landing host outside kuaishou.com
-/// fails outright, so the share token can never bounce the app off-site.
+/// canonical profile URL. Runs on the dedicated parser client (no cookie
+/// jar, no automatic redirect following), so every hop is read from the
+/// `Location` header and **validated before it is requested** — at most 3
+/// hops, and any landing host outside kuaishou.com fails outright, so the
+/// share token can never bounce the app off-site.
 async fn resolve_kuaishou_short_url(
-    client: &reqwest::Client,
+    state: &State<'_, AppState>,
     short_url: &str,
 ) -> AppResult<String> {
+    let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
     let mut url = short_url.to_string();
     for _ in 0..3 {
-        let resp = client.get(&url).send().await?;
-        let final_url = resp.url().clone();
-        let status = resp.status();
+        // The next hop must be a kuaishou.com URL before anything is sent.
+        let next = Url::parse(&url)?;
         if !crate::ingestion::parsers::transport::is_host_or_subdomain(
-            &final_url,
+            &next,
             "kuaishou.com",
         ) {
             return Err(AppError::code("kuaishouHandleInvalid"));
         }
-        if !status.is_redirection() {
-            return crate::ingestion::parsers::kuaishou::normalize_kuaishou_url(&final_url)
+        let resp = client.get(next).send().await?;
+        if !crate::ingestion::parsers::transport::is_host_or_subdomain(
+            resp.url(),
+            "kuaishou.com",
+        ) {
+            return Err(AppError::code("kuaishouHandleInvalid"));
+        }
+        if !resp.status().is_redirection() {
+            return crate::ingestion::parsers::kuaishou::normalize_kuaishou_url(resp.url())
                 .or_else(|| {
                     crate::ingestion::parsers::kuaishou::profile_id_from_feed_url(
-                        final_url.as_ref(),
+                        resp.url().as_ref(),
                     )
                     .map(|id| format!("https://www.kuaishou.com/profile/{id}"))
                 })
@@ -368,7 +377,7 @@ async fn resolve_kuaishou_short_url(
             .and_then(|v| v.to_str().ok())
             .map(String::from)
             .ok_or_else(|| AppError::code("kuaishouHandleInvalid"))?;
-        url = Url::parse(final_url.as_str())?.join(&location)?.to_string();
+        url = resp.url().join(&location)?.to_string();
     }
     Err(AppError::code("kuaishouHandleInvalid"))
 }
