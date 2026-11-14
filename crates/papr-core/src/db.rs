@@ -1703,6 +1703,12 @@ pub fn apply_rewrites(a: &mut NewArticle, rewrites: &[RuleRewrite]) {
             // sprinkle `to` between every character (`str::replace` would).
             continue;
         }
+        if rw.from == rw.to {
+            // A no-op pair: skipping it here keeps the ingestion path in
+            // lockstep with the backfill, where a no-op pair must not count
+            // a row as changed or invalidate its derivative caches.
+            continue;
+        }
         a.title = a.title.replace(&rw.from, &rw.to);
         a.summary = a.summary.take().map(|s| s.replace(&rw.from, &rw.to));
         a.content_html = a
@@ -2886,8 +2892,21 @@ pub fn apply_rule_to_existing(
                 &format!("INSERT INTO rule_hits(id) SELECT id FROM articles WHERE {where_sql}"),
                 params_from_iter(binds.iter().cloned()),
             )?;
+            // The literal-containment predicate for one rewrite needle,
+            // evaluated against an `articles` row bound to the alias `a`.
+            let needle_hit = "INSTR(a.title, ?1) > 0 \
+                        OR INSTR(COALESCE(a.summary, ''), ?1) > 0 \
+                        OR INSTR(COALESCE(a.content_html, ''), ?1) > 0 \
+                        OR INSTR(COALESCE(a.body_text, ''), ?1) > 0";
             for rw in rewrites {
                 if rw.from.is_empty() {
+                    continue;
+                }
+                if rw.from == rw.to {
+                    // A no-op pair: skipping it keeps the backfill in
+                    // lockstep with the ingestion path and keeps a
+                    // needle-hit on a from==to pair from counting a row as
+                    // changed or invalidating its caches.
                     continue;
                 }
                 // Record which rows this pair will actually change — `INSTR`
@@ -2898,13 +2917,12 @@ pub fn apply_rule_to_existing(
                 tx.execute(
                     // Explicitly joined/qualified: bare column names would
                     // resolve against `rule_hits`, which holds only ids.
-                    "INSERT OR IGNORE INTO rule_changed(id)
-                     SELECT h.id FROM rule_hits h
-                     JOIN articles a ON a.id = h.id
-                     WHERE INSTR(a.title, ?1) > 0
-                        OR INSTR(COALESCE(a.summary, ''), ?1) > 0
-                        OR INSTR(COALESCE(a.content_html, ''), ?1) > 0
-                        OR INSTR(COALESCE(a.body_text, ''), ?1) > 0",
+                    &format!(
+                        "INSERT OR IGNORE INTO rule_changed(id)
+                         SELECT h.id FROM rule_hits h
+                         JOIN articles a ON a.id = h.id
+                         WHERE {needle_hit}"
+                    ),
                     params![rw.from],
                 )?;
                 // Literal replacement on the same four text fields
@@ -2914,14 +2932,22 @@ pub fn apply_rule_to_existing(
                 // `REPLACE(NULL, …)` yields NULL, so nullable text columns
                 // keep their NULL when the row is untouched by the needle —
                 // the stored twin of `apply_rewrites`, where `None` stays
-                // `None`.
+                // `None`. The containment guard keeps untouched rows from
+                // being updated at all — an UPDATE that lists title /
+                // body_text fires the v17 preview-translation trigger for
+                // every row it touches, changed or not.
                 tx.execute(
-                    "UPDATE articles SET
-                        title        = REPLACE(title, ?1, ?2),
-                        summary      = REPLACE(summary, ?1, ?2),
-                        content_html = REPLACE(content_html, ?1, ?2),
-                        body_text    = REPLACE(body_text, ?1, ?2)
-                     WHERE id IN (SELECT id FROM rule_hits)",
+                    &format!(
+                        "UPDATE articles SET
+                            title        = REPLACE(title, ?1, ?2),
+                            summary      = REPLACE(summary, ?1, ?2),
+                            content_html = REPLACE(content_html, ?1, ?2),
+                            body_text    = REPLACE(body_text, ?1, ?2)
+                         WHERE id IN (SELECT id FROM rule_hits)
+                           AND id IN (SELECT a.id FROM rule_hits h
+                                      JOIN articles a ON a.id = h.id
+                                      WHERE {needle_hit})"
+                    ),
                     params![rw.from, rw.to],
                 )?;
             }
@@ -5352,6 +5378,111 @@ mod tests {
             .query_row("SELECT title FROM articles WHERE id = ?1", [x1], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "Rust Letter #1");
+    }
+
+    #[test]
+    fn rewrite_backfill_leaves_matched_but_untouched_rows_alone() {
+        // A matched row whose text the needle never touches must not be
+        // updated at all: SQLite's UPDATE OF trigger (v17,
+        // `article_preview_translations_au`) fires for every row an UPDATE
+        // touches, changed or not, so a blanket update would drop
+        // still-valid preview translations on untouched rows.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "n1", "Weekly roundup");
+        seed(&conn, feed_id, "n2", "Weekly recap");
+        let rewrites = vec![RuleRewrite {
+            from: "roundup".into(),
+            to: "meeting".into(),
+        }];
+        let doc = vec![vec![cond("title", "contains", "Weekly")]];
+        let ids: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, guid FROM articles WHERE guid IN ('n1','n2')")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for (id, guid) in &ids {
+            set_translation(&conn, *id, "<p>old</p>", "zh", Some("old")).unwrap();
+            set_ai_summary(&conn, *id, "old summary").unwrap();
+            set_preview_translation(&conn, *id, "old title", "old snippet", "zh", "test")
+                .unwrap();
+            let _ = guid;
+        }
+        let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
+        assert_eq!(changed, 1, "only n1 carries the needle");
+
+        for (id, guid) in &ids {
+            let (title, th, ai, pt): (String, Option<String>, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT title, translated_html, ai_summary,
+                            (SELECT COUNT(*) FROM article_preview_translations
+                              WHERE article_id = articles.id)
+                     FROM articles WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            if guid == "n1" {
+                assert_eq!(title, "Weekly meeting");
+                assert_eq!((th, ai, pt), (None, None, 0), "changed row: derivatives dropped");
+            } else {
+                assert_eq!(title, "Weekly recap");
+                assert_eq!(
+                    (th.as_deref(), ai.as_deref(), pt),
+                    (Some("<p>old</p>"), Some("old summary"), 1),
+                    "untouched row: all caches survive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_backfill_treats_from_equal_to_pairs_as_noops() {
+        // A from==to pair can never change text (REPLACE with an identical
+        // replacement is a no-op): a needle hit on one must not count the
+        // row as changed or invalidate its derivative caches.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "p1", "Weekly roundup");
+        let id: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'p1'", [], |r| r.get(0))
+            .unwrap();
+        set_translation(&conn, id, "<p>old</p>", "zh", Some("old")).unwrap();
+        set_ai_summary(&conn, id, "old summary").unwrap();
+        set_preview_translation(&conn, id, "old title", "old snippet", "zh", "test").unwrap();
+
+        let doc = vec![vec![cond("title", "contains", "Weekly")]];
+        let rewrites = vec![RuleRewrite {
+            from: "Weekly".into(),
+            to: "Weekly".into(),
+        }];
+        let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
+        assert_eq!(changed, 0, "a no-op pair changes nothing");
+
+        let (title, th, ai, pt): (String, Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT title, translated_html, ai_summary,
+                        (SELECT COUNT(*) FROM article_preview_translations
+                          WHERE article_id = articles.id)
+                 FROM articles WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Weekly roundup");
+        assert_eq!(
+            (th.as_deref(), ai.as_deref(), pt),
+            (Some("<p>old</p>"), Some("old summary"), 1),
+            "no caches may be invalidated by a no-op pair"
+        );
     }
 
     #[test]
