@@ -515,16 +515,37 @@
         "name": "X（Twitter）",
         "desc": "直接订阅 x.com/用户名，抓取该用户的最新推文。"
       },
+      "xiaohongshu": {
+        "name": "小红书",
+        "desc": "直接订阅小红书博主主页，抓取其最新笔记（匿名即可用，粘贴 Cookie 可读全文）。"
+      },
+      "kuaishou": {
+        "name": "快手",
+        "desc": "订阅快手创作者主页，抓取其最新作品（网页端对匿名请求有验证码，建议粘贴 Cookie）。"
+      },
       "configure": "配置",
       "field": {
         "authToken": "auth_token",
-        "ct0": "ct0"
+        "ct0": "ct0",
+        "cookie": "Cookie"
       },
-      "cookieHint": "凭据为必填项：登录 x.com 后，从浏览器开发者工具（应用 → Cookie）复制 auth_token 与 ct0 两个 Cookie 的值。抓取使用你自己的登录会话，凭据只保存在本机数据库中。",
-      "testHandlePlaceholder": "用户名，如 jack",
+      "cookieHint": {
+        "x": "凭据为必填项：登录 x.com 后，从浏览器开发者工具（应用 → Cookie）复制 auth_token 与 ct0 两个 Cookie 的值。抓取使用你自己的登录会话：凭据只保存在本机数据库中，且仅随请求头发给 x.com 自身。",
+        "xiaohongshu": "Cookie 选填：匿名即可订阅并抓取笔记卡片；粘贴登录 Cookie（开发者工具 → 网络 → 请求头里的 Cookie 整串）可解锁笔记全文与图片视频。凭据只保存在本机数据库中，且仅随请求头发给小红书自身。",
+        "kuaishou": "Cookie 选填：快手网页端对匿名请求返回验证码，粘贴登录 Cookie（开发者工具 → 网络 → 请求头里的 Cookie 整串）后可正常抓取。抓取只用只读请求、低频节流；凭据只保存在本机数据库中，且仅随请求头发给快手自身。"
+      },
+      "testHandlePlaceholder": {
+        "x": "用户名，如 jack",
+        "generic": "主页链接或用户 ID"
+      },
+      "item": {
+        "x": "推文",
+        "xiaohongshu": "条笔记",
+        "kuaishou": "个作品"
+      },
       "test": "测试连接",
       "testing": "测试中…",
-      "testOk": "连接成功：抓到 {{count}} 条推文",
+      "testOk": "连接成功：抓到 {{count}} {{item}}",
       "clear": "清除凭据"
     },
     "rsshub": {
@@ -805,6 +826,14 @@
     "aiEmptyResponse": "服务商返回了空摘要——请检查模型与提示词",
     "parserDisabled": "该链接由内置解析器处理，但对应解析器未启用——请到 设置 → 解析器 中开启。",
     "parserUnknown": "未知的解析器。",
+    "xiaohongshuAuthInvalid": "小红书会话已失效（Cookie 无效或过期）——可在 设置 → 解析器 中更新 Cookie，或清除后匿名使用。",
+    "xiaohongshuAccountUnavailable": "该小红书博主不可访问（主页可能不存在、已注销或被限制）。",
+    "xiaohongshuBlocked": "匿名访问被小红书风控拦截（限流冷却中，或该主页受限）——稍后重试，或到 设置 → 解析器 中粘贴登录 Cookie；若持续出现，请确认主页链接有效。",
+    "xiaohongshuHandleInvalid": "无效的小红书博主主页链接或用户 ID（24 位十六进制）。",
+    "kuaishouCaptcha": "快手网页端对匿名请求返回验证码（其网页签名无法在本地复刻）。请到 设置 → 解析器 中粘贴登录 Cookie；或改用 RSSHub 路由市场的快手路由（需浏览器版引擎）。",
+    "kuaishouAccountUnavailable": "该快手创作者不可访问（主页可能不存在、已封禁或被限制）。",
+    "kuaishouBlocked": "快手请求被风控拦截（限流或签名校验失败）——稍后重试，或到 设置 → 解析器 中粘贴登录 Cookie。",
+    "kuaishouHandleInvalid": "无效的快手主页链接或用户 ID。",
     "xAuthRequired": "X 解析器需要登录凭据：请到 设置 → 解析器 中配置 auth_token 与 ct0。",
     "xAuthInvalid": "X 鉴权已失效（auth_token/ct0 无效或过期），请到 设置 → 解析器 中更新凭据。",
     "xAccountUnavailable": "无法获取该 X 用户的时间线（账号可能不存在、受限或已注销）。",

@@ -9,6 +9,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
+import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
 import { isMac } from "../lib/platform";
@@ -585,13 +586,21 @@ export default function Reader({ onToast }: Props) {
   const startTranslate = useTranslationJobs((s) => s.translate);
   const job = useTranslationJobs((s) => (id != null ? s.jobs[id] : undefined));
 
-  // X articles are rendered entirely by the parser, and that rendering is the
-  // final content — there is no web page behind it worth extracting. A URL
-  // fetch for `x.com/<user>/status/<id>` returns the logged-out SPA shell
-  // ("Log in or sign up", "Relevant people", the footer), so an extraction
-  // stored by an earlier version must never win over the card, and the
-  // extract/toggle controls are hidden below.
-  const isXPost = a?.sourceType === "x";
+  // Parser articles (X, xiaohongshu, kuaishou — see `parsers.ts`) are
+  // rendered entirely by their parser, and that rendering is the final
+  // content — there is no web page behind it worth extracting. A URL fetch
+  // for these permalinks returns the logged-out SPA shell (or, for xiaohongshu
+  // / kuaishou, a login or captcha wall), so an extraction stored by an
+  // earlier version must never win over the card, and the extract/toggle
+  // controls are hidden below.
+  const isXPost = a?.sourceType != null && isParserSourceType(a.sourceType);
+  // The source badge carries each parser platform's own glyph (PARSER_META),
+  // not a hardcoded X — xiaohongshu and kuaishou articles are parser posts
+  // too, and "X" would mislabel them.
+  const parserGlyph =
+    a && isParserSourceType(a.sourceType)
+      ? PARSER_META[a.sourceType as ParserKey].glyph
+      : "X";
   const hasExtracted = !!a?.extractedHtml && !isXPost;
   const canTranslate = !!(a?.extractedHtml || a?.contentHtml);
   const baseBody = isXPost
@@ -1122,7 +1131,7 @@ export default function Reader({ onToast }: Props) {
           >
             {isXPost ? (
               <span className="src-badge" aria-hidden="true">
-                X
+                {parserGlyph}
               </span>
             ) : (
               <Icon name="rss" size={13} />

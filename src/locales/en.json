@@ -515,16 +515,37 @@
         "name": "X (Twitter)",
         "desc": "Subscribe to x.com/username and fetch that user's latest tweets."
       },
+      "xiaohongshu": {
+        "name": "Xiaohongshu (RED)",
+        "desc": "Subscribe to a xiaohongshu.com blogger profile and fetch their latest notes (works anonymously; a cookie unlocks full text)."
+      },
+      "kuaishou": {
+        "name": "Kuaishou",
+        "desc": "Subscribe to a kuaishou.com creator profile and fetch their latest works (the web API is captcha-gated; a cookie is recommended)."
+      },
       "configure": "Configure",
       "field": {
         "authToken": "auth_token",
-        "ct0": "ct0"
+        "ct0": "ct0",
+        "cookie": "Cookie"
       },
-      "cookieHint": "Credentials are required: sign in to x.com, then copy the auth_token and ct0 cookie values from your browser's developer tools (Application → Cookies). Fetching uses your own session; credentials never leave this machine.",
-      "testHandlePlaceholder": "username, e.g. jack",
+      "cookieHint": {
+        "x": "Credentials are required: sign in to x.com, then copy the auth_token and ct0 cookie values from your browser's developer tools (Application → Cookies). Fetching uses your own session: credentials are stored only in this machine's database and are sent exclusively to x.com itself.",
+        "xiaohongshu": "Cookie optional: anonymous mode already fetches note cards; paste your logged-in Cookie header (devtools → Network → a request's Cookie header) to unlock full note text with images and video. Credentials are stored only in this machine's database and are sent exclusively to xiaohongshu.com itself.",
+        "kuaishou": "Cookie optional but recommended: the web API answers anonymous requests with a captcha, so paste your logged-in Cookie header (devtools → Network → a request's Cookie header). Fetches are read-only and heavily throttled; credentials are stored only in this machine's database and are sent exclusively to kuaishou.com itself."
+      },
+      "testHandlePlaceholder": {
+        "x": "username, e.g. jack",
+        "generic": "profile URL or user ID"
+      },
+      "item": {
+        "x": "tweets",
+        "xiaohongshu": "notes",
+        "kuaishou": "works"
+      },
       "test": "Test connection",
       "testing": "Testing…",
-      "testOk": "Connection works: fetched {{count}} tweets",
+      "testOk": "Connection works: fetched {{count}} {{item}}",
       "clear": "Clear credentials"
     },
     "rsshub": {
@@ -805,6 +826,14 @@
     "aiEmptyResponse": "The provider returned an empty summary — check the model and prompt",
     "parserDisabled": "This link is handled by a built-in parser that is disabled — enable it in Settings → Parsers.",
     "parserUnknown": "Unknown parser.",
+    "xiaohongshuAuthInvalid": "The Xiaohongshu session was rejected (cookie invalid or expired) — update the cookie in Settings → Parsers, or clear it to stay anonymous.",
+    "xiaohongshuAccountUnavailable": "This Xiaohongshu blogger is unavailable (the profile may not exist, be deactivated, or be restricted).",
+    "xiaohongshuBlocked": "The anonymous request was stopped by Xiaohongshu risk control (rate-limit cooldown, or a gated profile) — retry later, or paste a login cookie in Settings → Parsers; if it persists, double-check the profile URL.",
+    "xiaohongshuHandleInvalid": "Invalid Xiaohongshu profile URL or user ID (24 hex characters).",
+    "kuaishouCaptcha": "Kuaishou answered the anonymous request with a captcha (its web signature cannot be reproduced locally). Paste a login cookie in Settings → Parsers; or use the Kuaishou route from the RSSHub marketplace (needs the browser engine).",
+    "kuaishouAccountUnavailable": "This Kuaishou creator is unavailable (the profile may not exist, be banned, or be restricted).",
+    "kuaishouBlocked": "The Kuaishou request was refused (rate limited or signature check failed) — retry later, or paste a login cookie in Settings → Parsers.",
+    "kuaishouHandleInvalid": "Invalid Kuaishou profile URL or user ID.",
     "xAuthRequired": "The X parser requires credentials: configure auth_token and ct0 in Settings → Parsers.",
     "xAuthInvalid": "X authentication has expired (auth_token/ct0 invalid) — update the credentials in Settings → Parsers.",
     "xAccountUnavailable": "This X user's timeline is unavailable (the account may not exist, be restricted, or be gone).",

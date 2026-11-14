@@ -614,16 +614,28 @@ fn map_feed_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Feed> {
 /// the last two are the stored revalidators for a conditional GET.
 pub type FeedToRefresh = (i64, String, Option<String>, Option<String>);
 
+/// The `IN (…)` operand list naming every built-in parser's `source_type` —
+/// the parser leg's query filter (`refresh::poll_parsers`). Mirrors the
+/// registry in `ingestion::parsers`; a cross-check test pins the two
+/// together so a new parser cannot be half-registered.
+pub const PARSER_SOURCE_TYPES_IN: &str = "('x', 'xiaohongshu', 'kuaishou')";
+
+/// The `NOT IN (…)` operand list every plain-HTTP query filters with:
+/// newsletters (IMAP leg), the built-in parser source types (parser leg) and
+/// the engine-run rsshub sources (engine leg). None of these feed_urls is a
+/// plain feed document a conditional GET could parse.
+pub const NON_HTTP_SOURCE_TYPES: &str =
+    "('newsletter', 'x', 'xiaohongshu', 'kuaishou', 'rsshub')";
+
 /// All feeds that need an HTTP fetch. Newsletter, parser and rsshub sources
 /// are excluded — newsletters are polled over IMAP, parser feeds are fetched
 /// by the parser leg (see `refresh::poll_parsers`) and rsshub routes run
 /// through the local engine (see `refresh::poll_rsshub`); none of their
 /// feed_urls is a plain feed document a conditional GET could parse.
 pub fn feeds_to_refresh(conn: &Connection) -> AppResult<Vec<FeedToRefresh>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub')",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, feed_url, etag, last_modified FROM feeds\n         WHERE source_type NOT IN {NON_HTTP_SOURCE_TYPES}"
+    ))?;
     let rows = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -642,14 +654,9 @@ pub const REFRESH_OFF_MINUTES: i64 = 525_600;
 /// by the background scheduler; the manual refresh still fetches every feed via
 /// `feeds_to_refresh`.
 pub fn feeds_due_for_refresh(conn: &Connection, global_min: i64) -> AppResult<Vec<FeedToRefresh>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub')
-           AND COALESCE(refresh_interval_min, ?1) < ?2
-           AND ( last_fetched_at IS NULL
-                 OR (julianday('now') - julianday(last_fetched_at)) * 1440.0
-                    >= COALESCE(refresh_interval_min, ?1) )",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, feed_url, etag, last_modified FROM feeds\n         WHERE source_type NOT IN {NON_HTTP_SOURCE_TYPES}\n           AND COALESCE(refresh_interval_min, ?1) < ?2\n           AND ( last_fetched_at IS NULL\n                 OR (julianday('now') - julianday(last_fetched_at)) * 1440.0\n                    >= COALESCE(refresh_interval_min, ?1) )"
+    ))?;
     let rows = stmt
         .query_map(params![global_min, REFRESH_OFF_MINUTES], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -663,10 +670,10 @@ pub fn feeds_due_for_refresh(conn: &Connection, global_min: i64) -> AppResult<Ve
 /// (a newsletter over IMAP, an X timeline via the parser leg, or an rsshub
 /// route via the engine leg).
 pub fn feeds_to_refresh_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<FeedToRefresh>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub') AND id = ?1",
-    )?;
+         WHERE source_type NOT IN {NON_HTTP_SOURCE_TYPES} AND id = ?1"
+    ))?;
     let rows = stmt
         .query_map(params![feed_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -680,10 +687,10 @@ pub fn feeds_to_refresh_in_folder(
     conn: &Connection,
     folder_id: i64,
 ) -> AppResult<Vec<FeedToRefresh>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT id, feed_url, etag, last_modified FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub') AND folder_id = ?1",
-    )?;
+         WHERE source_type NOT IN {NON_HTTP_SOURCE_TYPES} AND folder_id = ?1"
+    ))?;
     let rows = stmt
         .query_map(params![folder_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -819,12 +826,12 @@ pub fn delete_feed(conn: &Connection, id: i64) -> AppResult<()> {
 /// own `import_opml` included) would treat as an RSS feed and then fail to
 /// HTTP-fetch forever, with the credentials not even carried.
 pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Option<String>)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT f.title, f.feed_url, fo.name
          FROM feeds f LEFT JOIN folders fo ON fo.id = f.folder_id
-         WHERE f.source_type NOT IN ('newsletter', 'x', 'rsshub')
-         ORDER BY fo.name, f.title",
-    )?;
+         WHERE f.source_type NOT IN {NON_HTTP_SOURCE_TYPES}
+         ORDER BY fo.name, f.title"
+    ))?;
     let rows = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -835,10 +842,10 @@ pub fn feeds_for_export(conn: &Connection) -> AppResult<Vec<(String, String, Opt
 /// `newsletter`, parser and rsshub sources (those have no upstream feed URL
 /// the server could subscribe to), matching the OPML-export filter.
 pub fn feed_urls_for_sync(conn: &Connection) -> AppResult<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT feed_url FROM feeds
-         WHERE source_type NOT IN ('newsletter', 'x', 'rsshub') AND feed_url <> ''",
-    )?;
+         WHERE source_type NOT IN {NON_HTTP_SOURCE_TYPES} AND feed_url <> ''"
+    ))?;
     let rows = stmt
         .query_map([], |r| r.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1139,7 +1146,9 @@ pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult
 /// `extracted_html`: for a parser feed that column can only hold a previous web
 /// extraction of the site's SPA shell, which is exactly what must not win over
 /// the rendered card. Read state, stars, read-later, tags, highlights and the
-/// AI summary are deliberately left alone.
+/// AI summary are deliberately left alone. A non-empty incoming enclosure
+/// list replaces the stored one, so a card-to-fulltext upgrade carries its
+/// video media along; an empty list never clears what is stored.
 pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
     let existing: Option<(i64, Option<String>, Option<String>, String)> = conn
         .query_row(
@@ -1179,6 +1188,20 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             a.published_at
         ],
     )?;
+    // Enclosures must follow the markup: the xiaohongshu pending-retry path
+    // upgrades a card row (no enclosure) to a full-text video note (mp4), and
+    // leaving the old list in place would make `get_article` return media-less
+    // content. Only an incoming non-empty list rewrites — an empty one never
+    // destroys what is stored.
+    if !a.enclosures.is_empty() {
+        tx.execute("DELETE FROM enclosures WHERE article_id = ?1", params![id])?;
+        for e in &a.enclosures {
+            tx.execute(
+                "INSERT INTO enclosures(article_id, url, mime_type, length) VALUES (?1,?2,?3,?4)",
+                params![id, e.url, e.mime_type, e.length],
+            )?;
+        }
+    }
     tx.execute(
         "UPDATE articles_fts SET title = ?2, body = ?3 WHERE rowid = ?1",
         params![id, a.title, a.body_text],
@@ -1187,14 +1210,42 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     Ok(true)
 }
 
-/// `(feed_id, feed_url)` for every parser feed (`source_type = 'x'`), the
-/// shape the parser leg of `refresh_core` needs — the feed_url carries the
-/// handle, and no revalidators exist because the GraphQL API sends no
-/// conditional-GET headers.
-pub fn parser_feeds_to_refresh(conn: &Connection) -> AppResult<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x'")?;
+/// One parser feed handed to the refresh leg: the row id, the parser that
+/// owns it (`source_type`) and its canonical URL.
+pub type ParserFeed = (i64, String, String);
+
+/// The subset of `guids` already stored for `feed_id` — the "is this item
+/// new" check the xiaohongshu leg uses to spend note-detail fetches (cookie
+/// mode) only on genuinely new notes.
+pub fn filter_existing_guids(
+    conn: &Connection,
+    feed_id: i64,
+    guids: &[String],
+) -> AppResult<Vec<String>> {
+    if guids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT guid FROM articles WHERE feed_id = ?1")?;
+    let stored: std::collections::HashSet<String> = stmt
+        .query_map(params![feed_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(guids
+        .iter()
+        .filter(|g| stored.contains(*g))
+        .cloned()
+        .collect())
+}
+
+/// `(feed_id, source_type, feed_url)` for every parser feed, the shape the
+/// parser leg of `refresh_core` needs — `source_type` names the parser that
+/// owns the feed and the feed_url carries its handle / profile id. No
+/// revalidators exist: the upstream APIs send no conditional-GET headers.
+pub fn parser_feeds_to_refresh(conn: &Connection) -> AppResult<Vec<ParserFeed>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, source_type, feed_url FROM feeds WHERE source_type IN {PARSER_SOURCE_TYPES_IN}"
+    ))?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -1205,40 +1256,46 @@ pub fn parser_feeds_to_refresh(conn: &Connection) -> AppResult<Vec<(i64, String)
 pub fn parser_feeds_due_for_refresh(
     conn: &Connection,
     global_min: i64,
-) -> AppResult<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, feed_url FROM feeds WHERE source_type = 'x'
+) -> AppResult<Vec<ParserFeed>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, source_type, feed_url FROM feeds WHERE source_type IN {PARSER_SOURCE_TYPES_IN}
          AND COALESCE(refresh_interval_min, ?1) < ?2
          AND ( last_fetched_at IS NULL
                OR (julianday('now') - julianday(last_fetched_at)) * 1440.0
-                  >= COALESCE(refresh_interval_min, ?1) )",
-    )?;
+                  >= COALESCE(refresh_interval_min, ?1) )"
+    ))?;
     let rows = stmt
         .query_map(params![global_min, REFRESH_OFF_MINUTES], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-/// `(feed_id, feed_url)` for one parser feed by id — the per-feed manual
-/// refresh. Empty when the id is not a parser feed.
-pub fn parser_feeds_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<(i64, String)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x' AND id = ?1")?;
+/// `(feed_id, source_type, feed_url)` for one parser feed by id — the
+/// per-feed manual refresh. Empty when the id is not a parser feed.
+pub fn parser_feeds_for_feed(conn: &Connection, feed_id: i64) -> AppResult<Vec<ParserFeed>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, source_type, feed_url FROM feeds WHERE source_type IN {PARSER_SOURCE_TYPES_IN} AND id = ?1"
+    ))?;
     let rows = stmt
-        .query_map(params![feed_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![feed_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-/// `(feed_id, feed_url)` for the parser feeds in a folder — the per-folder
-/// manual refresh.
-pub fn parser_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Vec<(i64, String)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, feed_url FROM feeds WHERE source_type = 'x' AND folder_id = ?1")?;
+/// `(feed_id, source_type, feed_url)` for the parser feeds in a folder —
+/// the per-folder manual refresh.
+pub fn parser_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Vec<ParserFeed>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, source_type, feed_url FROM feeds WHERE source_type IN {PARSER_SOURCE_TYPES_IN} AND folder_id = ?1"
+    ))?;
     let rows = stmt
-        .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map(params![folder_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -1442,6 +1499,7 @@ pub fn rsshub_feeds_in_folder(conn: &Connection, folder_id: i64) -> AppResult<Ve
 // ─────────────────────────── articles ───────────────────────────
 
 /// A parsed article ready for insertion.
+#[derive(Debug, Clone)]
 pub struct NewArticle {
     pub guid: String,
     pub url: Option<String>,
@@ -3621,7 +3679,11 @@ mod tests {
         // The parser leg selects exactly the X feed, in all four scopes.
         assert_eq!(
             parser_feeds_to_refresh(&conn).unwrap(),
-            vec![(2, "https://x.com/jack".to_string())]
+            vec![(
+                2,
+                "x".to_string(),
+                "https://x.com/jack".to_string()
+            )]
         );
         assert!(!parser_feeds_due_for_refresh(&conn, 30).unwrap().is_empty());
         assert_eq!(parser_feeds_for_feed(&conn, 2).unwrap().len(), 1);

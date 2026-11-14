@@ -14,7 +14,10 @@
 //! refresh queries and polled by a dedicated leg in `refresh_core` — the
 //! exact pattern the newsletter sources already follow.
 
+pub mod kuaishou;
+pub mod transport;
 pub mod x;
+pub mod xiaohongshu;
 
 use crate::db;
 use crate::models::SourceType;
@@ -23,9 +26,18 @@ use serde::Deserialize;
 
 /// The X (Twitter) parser's registry id.
 pub const X: &str = "x";
+/// The Xiaohongshu (RED) parser's registry id.
+pub const XIAOHONGSHU: &str = "xiaohongshu";
+/// The Kuaishou parser's registry id.
+pub const KUAISHOU: &str = "kuaishou";
 
 /// Every parser id papr ships, in settings-page display order.
-pub const PARSER_IDS: &[&str] = &[X];
+pub const PARSER_IDS: &[&str] = &[X, XIAOHONGSHU, KUAISHOU];
+
+/// The `source_type` values owned by built-in parsers, as a SQL fragment for
+/// the `IN (…)` lists the refresh / export / sync queries filter with. Kept
+/// in one place so a new parser cannot be half-registered.
+pub const PARSER_SOURCE_TYPES_SQL: &str = "'x', 'xiaohongshu', 'kuaishou'";
 
 /// `true` when `source_type` belongs to a built-in parser. Such feeds are
 /// excluded from the plain-HTTP refresh / OPML-export / sync queries and are
@@ -33,6 +45,8 @@ pub const PARSER_IDS: &[&str] = &[X];
 /// parsers land.
 pub fn is_parser_source_type(source_type: &str) -> bool {
     source_type == SourceType::X.as_str()
+        || source_type == SourceType::Xiaohongshu.as_str()
+        || source_type == SourceType::Kuaishou.as_str()
 }
 
 /// Configuration of one parser, edited by the settings UI inside the `parsers`
@@ -45,6 +59,10 @@ pub struct ParserConfig {
     pub auth_token: Option<String>,
     /// X: the `ct0` CSRF cookie (sent back as `X-CSRF-Token`).
     pub ct0: Option<String>,
+    /// Xiaohongshu / Kuaishou: the pasted `Cookie` header from a logged-in
+    /// browser session. Optional for both — xiaohongshu works anonymously
+    /// from the SSR page, kuaishou's web API is captcha-gated without it.
+    pub cookie: Option<String>,
 }
 
 /// The whole `parsers` settings blob: one entry per parser id.
@@ -52,12 +70,16 @@ pub struct ParserConfig {
 #[serde(default)]
 pub struct ParsersSettings {
     pub x: ParserConfig,
+    pub xiaohongshu: ParserConfig,
+    pub kuaishou: ParserConfig,
 }
 
 impl ParsersSettings {
     pub fn config(&self, id: &str) -> &ParserConfig {
         match id {
             X => &self.x,
+            XIAOHONGSHU => &self.xiaohongshu,
+            KUAISHOU => &self.kuaishou,
             _ => {
                 debug_assert!(false, "unknown parser id {id}");
                 // A static empty config keeps callers total on stale ids.
@@ -97,6 +119,15 @@ pub fn x_credentials(conn: &Connection) -> Option<(String, String)> {
         return None;
     }
     Some((auth.to_string(), ct0.to_string()))
+}
+
+/// A parser's pasted `Cookie` header value (xiaohongshu / kuaishou), trimmed.
+/// `None` when absent or blank — callers treat that as "anonymous mode".
+pub fn cookie_credentials(conn: &Connection, id: &str) -> Option<String> {
+    let settings = load_settings(conn);
+    let cfg = settings.config(id);
+    let cookie = cfg.cookie.as_deref()?.trim();
+    (!cookie.is_empty()).then(|| cookie.to_string())
 }
 
 #[cfg(test)]
@@ -152,7 +183,72 @@ mod tests {
     #[test]
     fn parser_source_type_matches_only_x() {
         assert!(is_parser_source_type("x"));
+        assert!(is_parser_source_type("xiaohongshu"));
+        assert!(is_parser_source_type("kuaishou"));
         assert!(!is_parser_source_type("rss"));
         assert!(!is_parser_source_type("newsletter"));
+        assert!(!is_parser_source_type("rsshub"));
+    }
+
+    #[test]
+    fn cookie_credentials_round_trip_and_blank_handling() {
+        let conn = conn();
+        assert!(cookie_credentials(&conn, XIAOHONGSHU).is_none());
+        db::set_setting(
+            &conn,
+            "parsers",
+            r#"{"xiaohongshu":{"enabled":true,"cookie":" a=1; b=2 "}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cookie_credentials(&conn, XIAOHONGSHU).as_deref(),
+            Some("a=1; b=2")
+        );
+        // A blank cookie is not a credential; an unrelated parser stays empty.
+        db::set_setting(
+            &conn,
+            "parsers",
+            r#"{"xiaohongshu":{"enabled":true,"cookie":"   "},"kuaishou":{"enabled":true}}"#,
+        )
+        .unwrap();
+        assert!(cookie_credentials(&conn, XIAOHONGSHU).is_none());
+        assert!(cookie_credentials(&conn, KUAISHOU).is_none());
+    }
+
+    #[test]
+    fn new_parser_configs_default_off() {
+        let conn = conn();
+        assert!(!parser_enabled(&conn, XIAOHONGSHU));
+        assert!(!parser_enabled(&conn, KUAISHOU));
+        db::set_setting(&conn, "parsers", "not json").unwrap();
+        assert!(!parser_enabled(&conn, XIAOHONGSHU));
+    }
+
+    #[test]
+    fn registry_and_db_source_type_lists_agree() {
+        // The refresh leg filters by `db::PARSER_SOURCE_TYPES_IN`; the plain
+        // HTTP queries exclude everything it names plus newsletter/rsshub.
+        // A new parser registered in one place but not the other would either
+        // never refresh or be fetched as a feed document — pin the two.
+        let parser_ids: Vec<&str> = PARSER_IDS.to_vec();
+        for id in parser_ids {
+            assert!(
+                db::PARSER_SOURCE_TYPES_IN.contains(&format!("'{id}'").as_str()),
+                "parser '{id}' missing from db::PARSER_SOURCE_TYPES_IN"
+            );
+            assert!(
+                db::NON_HTTP_SOURCE_TYPES.contains(&format!("'{id}'").as_str()),
+                "parser '{id}' missing from db::NON_HTTP_SOURCE_TYPES"
+            );
+            assert!(
+                is_parser_source_type(id),
+                "registry id '{id}' is not a parser source type"
+            );
+        }
+        // The SQL lists name no parser the registry does not know.
+        for quoted in ["'x'", "'xiaohongshu'", "'kuaishou'"] {
+            let id = quoted.trim_matches('\'');
+            assert!(PARSER_IDS.contains(&id), "db list has unknown parser '{id}'");
+        }
     }
 }
