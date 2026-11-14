@@ -305,10 +305,15 @@ pub fn convert_feed_url(folo_url: &str, map_twitter: bool) -> FeedConversion {
 
 /// Rewrite `twitter/user/<handle>` to the native X parser's profile form.
 /// Only the profile route maps — keyword, list, media and sibling Twitter
-/// routes have no parser equivalent and stay engine routes. The X parser's
-/// own handle validation gates the rewrite, so a route that could never be
-/// a real profile keeps its `rsshub://` form.
+/// routes have no parser equivalent and stay engine routes. A route carrying
+/// a query string (an RSSHub filter like `exclude_replies` or `limit`) also
+/// stays an engine route: the rewrite would silently drop the filter. The X
+/// parser's own handle validation gates the rewrite, so a route that could
+/// never be a real profile keeps its `rsshub://` form.
 fn map_twitter_route(route: &str) -> Option<String> {
+    if route.contains('?') {
+        return None;
+    }
     let segments: Vec<&str> = route.split('/').filter(|s| !s.is_empty()).collect();
     if segments.len() != 3
         || !segments[0].eq_ignore_ascii_case("twitter")
@@ -493,6 +498,19 @@ mod tests {
         assert_eq!(
             convert_feed_url("rsshub://bilibili/user/video/2267573", true),
             FeedConversion::Keep("rsshub://bilibili/user/video/2267573".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_filtered_twitter_routes_whole() {
+        // A query is the user's RSSHub filter (exclude_replies, limit, …) —
+        // rewriting to x.com would silently drop it, so the route stays an
+        // engine route, query included.
+        assert_eq!(
+            convert_feed_url("rsshub://twitter/user/shao__meng?exclude_replies=1", true),
+            FeedConversion::Keep(
+                "rsshub://twitter/user/shao__meng?exclude_replies=1".to_string()
+            )
         );
     }
 

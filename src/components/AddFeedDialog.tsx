@@ -182,11 +182,15 @@ export default function AddFeedDialog({ onClose, onToast, initialUrl }: Props) {
     if (tab === "feed") {
       if (url.trim() && !add.isPending) add.mutate(url.trim());
     } else if (tab === "folo") {
-      // Enter / primary button first fetches the preview; once a preview is
-      // shown, the primary button flips to the import itself (the folo tab
-      // therefore never submits a blind import).
-      if (!foloPreview && foloUrl.trim() && !fetchPreview.isPending)
+      // Before a preview exists, Enter / the primary button fetches it; once
+      // shown, they run the import itself (the folo tab therefore never
+      // submits a blind import).
+      if (foloPreview) {
+        if (foloPreview.importable > 0 && !importFolo.isPending)
+          importFolo.mutate();
+      } else if (foloUrl.trim() && !fetchPreview.isPending) {
         fetchPreview.mutate();
+      }
     } else {
       if (nlHost.trim() && nlUser.trim() && nlPass && !addNewsletter.isPending)
         addNewsletter.mutate();
