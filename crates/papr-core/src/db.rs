@@ -578,6 +578,19 @@ pub fn feed_by_id(conn: &Connection, id: i64) -> AppResult<Option<Feed>> {
         .map_err(Into::into)
 }
 
+/// A feed's current `feed_url`. The refresh-completion guard reads this under
+/// the same write lock it would apply its outcome through: a feed re-pointed
+/// mid-refresh (the edit-feed dialog) must not receive the old URL's result.
+pub fn feed_url_by_id(conn: &Connection, id: i64) -> AppResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT feed_url FROM feeds WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 fn map_feed_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Feed> {
     Ok(Feed {
         id: r.get(0)?,
@@ -1493,6 +1506,31 @@ pub fn upsert_article(
     dedup: bool,
     rules: &[Rule],
 ) -> AppResult<bool> {
+    let Some((start_read, start_starred)) = article_precheck(conn, feed_id, a, dedup, rules)?
+    else {
+        return Ok(false);
+    };
+    // The article row, its FTS index entry, and its enclosures must land
+    // together — a partial insert leaves an unsearchable or enclosure-less
+    // article. Wrap them in a transaction so a mid-loop failure rolls back.
+    let tx = conn.unchecked_transaction()?;
+    let inserted = insert_article_row(&tx, feed_id, a, start_read, start_starred)?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// The decision half of [`upsert_article`]: dedup, retention tombstones and
+/// filter rules, all pure reads. `None` = skip the article outright (a `skip`
+/// rule, a tombstoned or deduplicated guid); `Some((read, starred))` carries
+/// the rule-tinted start state for the insert half. Callers that already hold
+/// a transaction run this first, then [`insert_article_row`] inside it.
+pub fn article_precheck(
+    conn: &Connection,
+    feed_id: i64,
+    a: &NewArticle,
+    dedup: bool,
+    rules: &[Rule],
+) -> AppResult<Option<(bool, bool)>> {
     if dedup {
         if let Some(url) = a.url.as_deref().filter(|u| !u.is_empty()) {
             let exists: bool = conn.query_row(
@@ -1501,7 +1539,7 @@ pub fn upsert_article(
                 |r| r.get(0),
             )?;
             if exists {
-                return Ok(false);
+                return Ok(None);
             }
         }
     }
@@ -1517,7 +1555,7 @@ pub fn upsert_article(
         |r| r.get(0),
     )?;
     if tombstoned {
-        return Ok(false);
+        return Ok(None);
     }
     // Apply filter rules: skip wins outright; read / star tint the new row.
     let (mut start_read, mut start_starred) = (false, false);
@@ -1526,16 +1564,26 @@ pub fn upsert_article(
             continue;
         }
         match rule.action.as_str() {
-            "skip" => return Ok(false),
+            "skip" => return Ok(None),
             "read" => start_read = true,
             "star" => start_starred = true,
             _ => {}
         }
     }
-    // The article row, its FTS index entry, and its enclosures must land
-    // together — a partial insert leaves an unsearchable or enclosure-less
-    // article. Wrap them in a transaction so a mid-loop failure rolls back.
-    let tx = conn.unchecked_transaction()?;
+    Ok(Some((start_read, start_starred)))
+}
+
+/// The write half of [`upsert_article`]: the article row, its FTS index entry
+/// and its enclosures. Must run inside a caller-owned transaction (rusqlite
+/// has no nested BEGIN, so this never opens one of its own) — `upsert_article`
+/// is the standalone, transaction-wrapping entry point.
+pub fn insert_article_row(
+    tx: &Connection,
+    feed_id: i64,
+    a: &NewArticle,
+    start_read: bool,
+    start_starred: bool,
+) -> AppResult<bool> {
     let n = tx.execute(
         "INSERT INTO articles
             (feed_id, guid, url, title, author, summary, content_html, body_text,
@@ -1571,7 +1619,6 @@ pub fn upsert_article(
             params![id, e.url, e.mime_type, e.length],
         )?;
     }
-    tx.commit()?;
     // A row inserted but pre-marked read by a `read` rule is not "new" from
     // the user's point of view — report it as not-inserted so it is excluded
     // from new-article tallies.

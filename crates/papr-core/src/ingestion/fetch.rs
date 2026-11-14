@@ -106,9 +106,17 @@ pub enum Fetched {
 /// page whose only content is `location.replace("/path?token=…")` — a browser
 /// follows it (with the cookie the response set) and gets the real document.
 /// A plain HTTP client stops there and reports "could not parse the feed" on
-/// what is actually a block page. The recognisable shape is deliberately
-/// narrow: a small document (challenges are a few hundred bytes of script and
-/// markup; a real feed or article is kilobytes) containing exactly that call.
+/// what is actually a block page.
+///
+/// The recognisable shape is deliberately narrow, on two axes: the document
+/// must be small (challenges are a few hundred bytes; a real feed or article
+/// is kilobytes), and the `location.replace` call must live inside a
+/// `<script>` element on a page that carries no visible story beyond it
+/// (empty body, at most a short title). The DOM-level checks keep page
+/// content from impersonating a challenge — a feed-discovery page that quotes
+/// the call in a `<pre>` code sample keeps its prose visible and is rejected,
+/// so following it never fetches the quoted example URL.
+///
 /// Returns the `location.replace` argument with JSON escapes (`\/`) decoded,
 /// resolved against `base_url` when it is relative. `None` for anything else.
 pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
@@ -127,9 +135,32 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
     if !looks_like_html {
         return None;
     }
-    let start = text.find("location.replace(")?;
-    let rest = &text[start + "location.replace(".len()..];
-    let rest = rest.trim_start();
+    let dom = scraper::Html::parse_fragment(&text);
+    let mut script_call: Option<String> = None;
+    let mut visible_chars = 0usize;
+    for node in dom.tree.nodes() {
+        let scraper::Node::Text(t) = node.value() else {
+            continue;
+        };
+        let in_script = node
+            .ancestors()
+            .any(|a| a.value().as_element().is_some_and(|e| e.name() == "script"));
+        if in_script {
+            if script_call.is_none() {
+                if let Some(idx) = t.find("location.replace(") {
+                    script_call = Some(t[idx..].to_string());
+                }
+            }
+        } else {
+            visible_chars += t.trim().chars().count();
+        }
+    }
+    // Visible text beyond the script means page content, not a challenge.
+    if visible_chars > 32 {
+        return None;
+    }
+    let call = script_call?;
+    let rest = call["location.replace(".len()..].trim_start();
     // The argument is a single- or double-quoted string; take up to the
     // matching quote (the pages we target never nest quotes inside).
     let quote = rest.chars().next()?;
@@ -181,6 +212,11 @@ pub async fn conditional_get(
         return Ok(Fetched::NotModified);
     }
     let resp = resp.error_for_status()?;
+    // Resolve the challenge target against the *final* URL, not the request
+    // URL — the feed host may have HTTP-redirected along the way, and a
+    // relative `location.replace('?token=…')` only means what a browser
+    // thinks it means at the document's own address.
+    let final_url = resp.url().to_string();
     let header = |name: reqwest::header::HeaderName| {
         resp.headers()
             .get(&name)
@@ -193,7 +229,7 @@ pub async fn conditional_get(
     // An anti-bot challenge in place of the feed document: follow its JS
     // redirect once and serve whatever comes back (with the second response's
     // revalidation headers).
-    if let Some(target) = js_redirect_target(&bytes, url) {
+    if let Some(target) = js_redirect_target(&bytes, &final_url) {
         let resp = follow_challenge(client, &target).await?;
         let read_header = |name: reqwest::header::HeaderName| {
             resp.headers()
@@ -371,6 +407,32 @@ mod tests {
         // No redirect at all.
         let plain = b"<!doctype html><html><body>hello</body></html>";
         assert_eq!(js_redirect_target(plain, "https://example.com/"), None);
+    }
+
+    #[test]
+    fn quoted_call_in_page_content_is_not_a_challenge() {
+        // A feed-discovery page quoting the call in a `<pre>` sample: the
+        // redirect lives in visible page text, not in a script, so following
+        // it would fetch the quoted example URL instead of a feed.
+        let quoted = b"<!doctype html><html><head><title>Site - subscribe</title>\
+<link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed\"></head>\
+<body><pre>location.replace('/missing')</pre></body></html>";
+        assert_eq!(js_redirect_target(quoted, "https://example.com/"), None);
+        // A commented-out call is content too.
+        let commented = b"<html><body><!-- location.replace('/nope') --></body></html>";
+        assert_eq!(js_redirect_target(commented, "https://example.com/"), None);
+    }
+
+    #[test]
+    fn redirect_only_page_with_a_title_is_a_challenge() {
+        // Empty body + script + a short title: the shape many challenge pages
+        // carry. Visible text stays within the contentless budget.
+        let titled = b"<html><head><title>Redirecting...</title></head><body>\
+<script>location.replace('/next?a=1')</script></body></html>";
+        assert_eq!(
+            js_redirect_target(titled, "https://example.com/x").as_deref(),
+            Some("https://example.com/next?a=1")
+        );
     }
 
     #[test]

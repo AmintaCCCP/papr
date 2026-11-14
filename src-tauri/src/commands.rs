@@ -877,14 +877,20 @@ pub async fn edit_feed_url(state: State<'_, AppState>, id: i64, url: String) -> 
         // One transaction: the URL swap, metadata adoption and article import
         // land together or not at all — a mid-import failure must not leave
         // the feed pointing at the new document with only some of its
-        // articles. Scoped so the non-Send connection guard never crosses the
-        // await below.
+        // articles. The write half runs via `insert_article_row` because
+        // `upsert_article` opens its own transaction and rusqlite has no
+        // nested BEGIN. Scoped so the non-Send connection guard never crosses
+        // the await below.
         let tx = conn.unchecked_transaction()?;
         db::edit_feed_url(&tx, id, &feed_url, source_type, &title)?;
         let dedup = db::setting_flag(&tx, "dedup_enabled", false);
         let rules = db::active_rules(&tx).unwrap_or_default();
         for article in &parsed.articles {
-            db::upsert_article(&tx, id, article, dedup, &rules)?;
+            if let Some((start_read, start_starred)) =
+                db::article_precheck(&tx, id, article, dedup, &rules)?
+            {
+                db::insert_article_row(&tx, id, article, start_read, start_starred)?;
+            }
         }
         // The document was fetched here, so record it — otherwise the feed
         // reads as "never refreshed" and the scheduler polls it again right

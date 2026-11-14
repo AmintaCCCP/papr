@@ -46,6 +46,18 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<unknown>(null);
+  // Invalidate a pending save when this dialog instance unmounts: while a
+  // save is in flight the user can still close (Escape/backdrop) and open the
+  // dialog for another feed, and the old task's completion must not call the
+  // now-new instance's onClose — it would close the new dialog and drop its
+  // unsaved input. Cache refreshes still run regardless.
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+    };
+  }, []);
 
   // Escape closes the dialog regardless of focused control, with the IME
   // guard the other dialogs use (the URL field is a live CJK input target).
@@ -86,9 +98,9 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
         // feed row. refreshAfterBulk covers both without over-invalidating.
         actions.refreshAfterBulk();
         qc.invalidateQueries({ queryKey: ["feeds"] });
-        onToast(t("editFeed.toastSaved"));
+        if (aliveRef.current) onToast(t("editFeed.toastSaved"));
       }
-      onClose();
+      if (aliveRef.current) onClose();
     } catch (e) {
       setError(e);
       setSaving(false);

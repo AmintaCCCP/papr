@@ -229,6 +229,28 @@ pub async fn refresh_core(
         let Ok((feed_id, feed_url, outcome)) = joined else {
             continue;
         };
+        // Edit-guard: a feed re-pointed while this fetch was in flight (the
+        // edit-feed dialog) must not receive the old URL's outcome — every
+        // write below keys on `feed_id` alone, so a stale result would
+        // overwrite the new address's articles, metadata and revalidators
+        // with the old document's. Re-read the address under the same write
+        // lock the outcome is applied through; a mismatch (or a row that has
+        // since been deleted) drops the result as if the feed never answered.
+        let stale = {
+            let conn = db.lock().await;
+            db::feed_url_by_id(&conn, feed_id)
+                .ok()
+                .flatten()
+                .is_none_or(|current| current != feed_url)
+        };
+        if stale {
+            on_event(RefreshProgress::FeedDone {
+                feed_id,
+                new_articles: 0,
+                error: None,
+            });
+            continue;
+        }
         let mut new_here = 0usize;
         let mut error: Option<String> = None;
 

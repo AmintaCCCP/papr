@@ -24,6 +24,11 @@ export interface TranslationJob {
   lang: string;
   /** The engine this job was started with (`llm` / `google` / `deepl` / `bing`). */
   engine: string;
+  /** Identity of this job run. Starting a new translation replaces the store
+   *  entry, but the replaced job's IPC channel keeps delivering events — every
+   *  handler checks this token against the store before patching, so a late
+   *  event from a dead run can never write into its replacement. */
+  token: number;
 }
 
 interface TranslationState {
@@ -37,11 +42,19 @@ interface TranslationState {
   clear: (articleId: number) => void;
 }
 
+let nextToken = 1;
+
 export const useTranslationJobs = create<TranslationState>((set, get) => {
-  const patch = (articleId: number, fn: (j: TranslationJob) => TranslationJob) =>
+  // Patch the article's job only when `token` is still the registered run —
+  // see `token` on TranslationJob.
+  const patchIfCurrent = (
+    articleId: number,
+    token: number,
+    fn: (j: TranslationJob) => TranslationJob,
+  ) =>
     set((s) => {
       const cur = s.jobs[articleId];
-      if (!cur) return s;
+      if (!cur || cur.token !== token) return s;
       return { jobs: { ...s.jobs, [articleId]: fn(cur) } };
     });
 
@@ -59,38 +72,48 @@ export const useTranslationJobs = create<TranslationState>((set, get) => {
         cur.engine === engine
       )
         return;
+      const token = nextToken++;
       set((s) => ({
         jobs: {
           ...s.jobs,
-          [articleId]: { status: "translating", done: 0, total: 0, html: "", title: "", lang, engine },
+          [articleId]: {
+            status: "translating",
+            done: 0,
+            total: 0,
+            html: "",
+            title: "",
+            lang,
+            engine,
+            token,
+          },
         },
       }));
 
       api
         .aiTranslate(articleId, lang, engine, (e) => {
           if (e.type === "start") {
-            patch(articleId, (j) => ({ ...j, total: e.data.total }));
+            patchIfCurrent(articleId, token, (j) => ({ ...j, total: e.data.total }));
           } else if (e.type === "title") {
-            patch(articleId, (j) => ({ ...j, title: e.data.title }));
+            patchIfCurrent(articleId, token, (j) => ({ ...j, title: e.data.title }));
           } else if (e.type === "batch") {
-            patch(articleId, (j) => ({
+            patchIfCurrent(articleId, token, (j) => ({
               ...j,
               done: e.data.done,
               html: j.html + e.data.html,
             }));
           } else if (e.type === "done") {
-            patch(articleId, (j) => ({ ...j, html: e.data.html, status: "done" }));
+            patchIfCurrent(articleId, token, (j) => ({ ...j, html: e.data.html, status: "done" }));
           }
         })
         .then(() => {
           // The `done` event normally flips the status; guard against it being
           // missed so a finished job never sticks on "translating".
-          patch(articleId, (j) =>
+          patchIfCurrent(articleId, token, (j) =>
             j.status === "translating" ? { ...j, status: "done" } : j,
           );
         })
         .catch((err) => {
-          patch(articleId, (j) => ({ ...j, status: "error" }));
+          patchIfCurrent(articleId, token, (j) => ({ ...j, status: "error" }));
           reportError(err);
         });
     },

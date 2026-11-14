@@ -21,6 +21,7 @@ import Reader from "./components/Reader";
 import CommandPalette, { type CommandAction } from "./components/CommandPalette";
 import SettingsDialog from "./components/SettingsDialog";
 import AddFeedDialog from "./components/AddFeedDialog";
+import EditFeedDialog from "./components/EditFeedDialog";
 import ExploreDialog from "./components/ExploreDialog";
 import RsshubMarketplaceDialog from "./components/RsshubMarketplaceDialog";
 import PromptDialog from "./components/PromptDialog";
@@ -112,6 +113,10 @@ export default function App() {
   const [explore, setExplore] = useState(false);
   const [rsshubMarket, setRsshubMarket] = useState(false);
   const [newFolder, setNewFolder] = useState(false);
+  // The sidebar's feed-edit dialog (URL + per-feed settings). Owned here — not
+  // in the Sidebar — so its open state joins the modal mirror below and the
+  // reader's floating webview hides while it is up.
+  const [editFeed, setEditFeed] = useState<Feed | null>(null);
 
   // Mirror "any covering modal is open" into the store. The reader's
   // original-page view is a native child webview that floats above the whole
@@ -119,8 +124,10 @@ export default function App() {
   // reader watches this flag and tears the view down while a modal is up.
   const setModalOpen = useUi((s) => s.setModalOpen);
   useEffect(() => {
-    setModalOpen(cpOpen || settings.open || addFeed || explore || newFolder);
-  }, [cpOpen, settings.open, addFeed, explore, newFolder, setModalOpen]);
+    setModalOpen(
+      cpOpen || settings.open || addFeed || explore || newFolder || !!editFeed,
+    );
+  }, [cpOpen, settings.open, addFeed, explore, newFolder, editFeed, setModalOpen]);
 
   // ── apply appearance to the document root ──
   useEffect(() => {
@@ -539,6 +546,7 @@ export default function App() {
             onExplore={() => setExplore(true)}
             onOpenSettings={openSettings}
             onSearchClick={() => setCpOpen(true)}
+            onEditFeed={(feed) => setEditFeed(feed)}
             onRefresh={doRefresh}
             refreshing={refreshing}
             onToast={showToast}
@@ -621,6 +629,14 @@ export default function App() {
         <ExploreDialog
           onClose={() => setExplore(false)}
           onToast={showToast}
+        />
+      )}
+
+      {editFeed && (
+        <EditFeedDialog
+          feed={editFeed}
+          onToast={showToast}
+          onClose={() => setEditFeed(null)}
         />
       )}
 

@@ -602,12 +602,21 @@ export default function Reader({ onToast }: Props) {
   const cachedValid = !!a?.translatedHtml && a.translatedLang === targetLang;
   const translatedBody =
     jobForTarget?.html || (cachedValid ? a?.translatedHtml ?? "" : "");
-  // The title rides the same translation as the body (same language), so it
-  // is only shown when the body translation is actually displayed. Rows cached
-  // before title translation have no title — the original stays.
-  const translatedTitle = showTranslation
-    ? jobForTarget?.title || (cachedValid ? a?.translatedTitle ?? "" : "")
-    : "";
+  // The title must come from the same translation run as the body on screen:
+  // a fresh job's title paired with a still-cached body (or the reverse) would
+  // show two different translations at once. So when the displayed body comes
+  // from the job (streaming or finished) take the job's title — the original
+  // heading stays until the job's own title event lands — and when the body
+  // comes from the DB cache take the cached title. Rows cached before title
+  // translation have neither — the original title shows.
+  const bodyFromJob = !!jobForTarget && (!!jobForTarget.html || translating);
+  const translatedTitle = !showTranslation
+    ? ""
+    : bodyFromJob
+      ? jobForTarget.title
+      : cachedValid
+        ? a?.translatedTitle ?? ""
+        : "";
   const hasTranslation = !!translatedBody;
   const showToggle = hasTranslation || translating;
   const body = showTranslation
