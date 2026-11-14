@@ -10,6 +10,7 @@ import { tagColor, TAG_PALETTE } from "../lib/tagColors";
 import type { ArticleQuery, Feed, Folder, Tag } from "../types";
 import Icon, { type IconName } from "./Icon";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
+import EditFeedDialog from "./EditFeedDialog";
 import FeedAvatar from "./FeedAvatar";
 import PromptDialog from "./PromptDialog";
 
@@ -129,6 +130,9 @@ export default function Sidebar({
 
   const [menu, setMenu] = useState<Menu | null>(null);
   const [prompt, setPrompt] = useState<Prompt | null>(null);
+  // The feed-edit dialog (view/change the feed URL, per-feed auto-translate
+  // and open mode) — one open feed at a time, from the feed context menu.
+  const [editFeed, setEditFeed] = useState<Feed | null>(null);
   const [dragId, setDragId] = useState<number | null>(null);
   const [dropFolder, setDropFolder] = useState<number | "none" | null>(null);
   const [tagDragId, setTagDragId] = useState<number | null>(null);
@@ -318,6 +322,11 @@ export default function Sidebar({
             onSubmit: (v) =>
               guard(api.renameFeed(f.id, v), t("sidebar.toastRenamed")),
           }),
+      },
+      {
+        icon: "link",
+        label: t("sidebar.editMenu"),
+        onClick: () => setEditFeed(f),
       },
       ...(moves.length ? [{ separator: true } as MenuEntry, ...moves] : []),
       { separator: true },
@@ -882,6 +891,13 @@ export default function Sidebar({
           placeholder={prompt.placeholder}
           onSubmit={prompt.onSubmit}
           onClose={() => setPrompt(null)}
+        />
+      )}
+      {editFeed && (
+        <EditFeedDialog
+          feed={editFeed}
+          onToast={onToast}
+          onClose={() => setEditFeed(null)}
         />
       )}
     </div>

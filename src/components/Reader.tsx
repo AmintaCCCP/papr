@@ -602,6 +602,12 @@ export default function Reader({ onToast }: Props) {
   const cachedValid = !!a?.translatedHtml && a.translatedLang === targetLang;
   const translatedBody =
     jobForTarget?.html || (cachedValid ? a?.translatedHtml ?? "" : "");
+  // The title rides the same translation as the body (same language), so it
+  // is only shown when the body translation is actually displayed. Rows cached
+  // before title translation have no title — the original stays.
+  const translatedTitle = showTranslation
+    ? jobForTarget?.title || (cachedValid ? a?.translatedTitle ?? "" : "")
+    : "";
   const hasTranslation = !!translatedBody;
   const showToggle = hasTranslation || translating;
   const body = showTranslation
@@ -1114,7 +1120,9 @@ export default function Reader({ onToast }: Props) {
             )}
             {a.feedTitle}
           </button>
-          {!isXPost && <h1 className="article-title">{a.title}</h1>}
+          {!isXPost && (
+            <h1 className="article-title">{translatedTitle || a.title}</h1>
+          )}
           {/* An X post's date lives in the card head, so the generic meta line
               would print it twice — it only surfaces here while a full-text
               extraction is in flight. */}

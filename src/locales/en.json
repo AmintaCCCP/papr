@@ -77,6 +77,16 @@
     "discoverFromPage": "Found on this page",
     "discoverAdd": "Add"
   },
+  "editFeed": {
+    "title": "Edit feed",
+    "urlLabel": "Feed URL",
+    "urlHint": "Changing the address re-validates it and fetches the new feed's articles. Folders, articles and per-feed settings are kept.",
+    "urlHintLocked": "This feed's address is managed by its source type and can't be changed.",
+    "autoTranslate": "Auto-translate",
+    "openMode": "Open articles",
+    "saving": "Saving…",
+    "toastSaved": "Feed settings saved"
+  },
   "explore": {
     "title": "Explore feeds",
     "subtitle": "Browse a curated directory of well-known feeds.",
@@ -716,6 +726,7 @@
     "moveOutOfFolder": "Move out of folder",
     "markAllRead": "Mark all as read",
     "renameMenu": "Rename…",
+    "editMenu": "Edit feed…",
     "renameFeedTitle": "Rename feed",
     "renameFolderTitle": "Rename folder",
     "feedNamePlaceholder": "Feed name",
@@ -809,7 +820,8 @@
     "rsshubEnvInvalid": "Environment variable names may only contain letters, digits and underscores (starting with a letter or underscore).",
     "rsshubEngineArchiveInvalid": "That file is not a valid engine archive (.tar.gz / .zip).",
     "rsshubEngineChecksum": "The downloaded engine archive failed the sha256 check.",
-    "rsshubEngineEnvTooLarge": "The merged route environment variables are too large for a process environment — remove or shorten some route variables in the marketplace."
+    "rsshubEngineEnvTooLarge": "The merged route environment variables are too large for a process environment — remove or shorten some route variables in the marketplace.",
+    "editUrlUnsupported": "This subscription's address can't be edited — unsubscribe and re-add it with the new source"
   },
   "highlights": {
     "toolbarLabel": "Highlight color",

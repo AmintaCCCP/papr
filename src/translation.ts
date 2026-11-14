@@ -18,6 +18,8 @@ export interface TranslationJob {
   total: number;
   /** Accumulated translated HTML, grown as batches arrive. */
   html: string;
+  /** Translated article title, set once before the body batches. */
+  title: string;
   /** The target language code this job was started for. */
   lang: string;
   /** The engine this job was started with (`llm` / `google` / `deepl` / `bing`). */
@@ -60,7 +62,7 @@ export const useTranslationJobs = create<TranslationState>((set, get) => {
       set((s) => ({
         jobs: {
           ...s.jobs,
-          [articleId]: { status: "translating", done: 0, total: 0, html: "", lang, engine },
+          [articleId]: { status: "translating", done: 0, total: 0, html: "", title: "", lang, engine },
         },
       }));
 
@@ -68,6 +70,8 @@ export const useTranslationJobs = create<TranslationState>((set, get) => {
         .aiTranslate(articleId, lang, engine, (e) => {
           if (e.type === "start") {
             patch(articleId, (j) => ({ ...j, total: e.data.total }));
+          } else if (e.type === "title") {
+            patch(articleId, (j) => ({ ...j, title: e.data.title }));
           } else if (e.type === "batch") {
             patch(articleId, (j) => ({
               ...j,

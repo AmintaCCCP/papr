@@ -162,6 +162,10 @@ pub struct ArticleDetail {
     pub translated_html: Option<String>,
     /// The target language code the cached translation was produced for.
     pub translated_lang: Option<String>,
+    /// Cached translated title, produced by the same translation run as
+    /// `translated_html`. `None` on rows cached before title translation —
+    /// the reader then keeps the original title.
+    pub translated_title: Option<String>,
     pub enclosures: Vec<Enclosure>,
     /// Tags currently attached to this article.
     pub tags: Vec<Tag>,

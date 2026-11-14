@@ -221,6 +221,9 @@ export interface ArticleDetail {
   translatedHtml: string | null;
   /** The target language code the cached translation was produced for. */
   translatedLang: string | null;
+  /** Cached translated title, produced by the same translation run as
+   *  `translatedHtml`. `null` on rows cached before title translation. */
+  translatedTitle: string | null;
   enclosures: Enclosure[];
   tags: Tag[];
 }
@@ -262,6 +265,7 @@ export type AiEvent =
 /** Batch-level translation progress (mirrors commands::TranslateEvent). */
 export type TranslateEvent =
   | { type: "start"; data: { total: number } }
+  | { type: "title"; data: { title: string } }
   | { type: "batch"; data: { html: string; done: number } }
   | { type: "done"; data: { html: string } };
 
