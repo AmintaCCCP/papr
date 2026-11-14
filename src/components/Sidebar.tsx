@@ -19,6 +19,9 @@ interface Props {
   onExplore: () => void;
   onOpenSettings: (section?: string) => void;
   onSearchClick: () => void;
+  /** Opens the feed-edit dialog (URL + per-feed settings) for one feed.
+   *  Owned by the App so the dialog joins the modalOpen mirror. */
+  onEditFeed: (feed: Feed) => void;
   /** Refresh feeds. With no scope refreshes everything (the toolbar button);
    *  pass `{ feedId }` or `{ folderId }` for the per-source context menus. */
   onRefresh: (scope?: { feedId?: number; folderId?: number }) => void;
@@ -98,6 +101,7 @@ export default function Sidebar({
   onExplore,
   onOpenSettings,
   onSearchClick,
+  onEditFeed,
   onRefresh,
   refreshing,
   onToast,
@@ -318,6 +322,11 @@ export default function Sidebar({
             onSubmit: (v) =>
               guard(api.renameFeed(f.id, v), t("sidebar.toastRenamed")),
           }),
+      },
+      {
+        icon: "link",
+        label: t("sidebar.editMenu"),
+        onClick: () => onEditFeed(f),
       },
       ...(moves.length ? [{ separator: true } as MenuEntry, ...moves] : []),
       { separator: true },

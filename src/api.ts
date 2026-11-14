@@ -72,6 +72,11 @@ export const moveFeed = (id: number, folderId: number | null) =>
   invoke<void>("move_feed", { id, folderId });
 export const renameFeed = (id: number, title: string) =>
   invoke<void>("rename_feed", { id, title });
+/** Re-point a subscription at a new feed URL (the edit-feed dialog). The
+ *  backend validates the new address (fetch + parse, like adding a feed)
+ *  before writing; the feed keeps its id, articles and per-feed settings. */
+export const editFeedUrl = (id: number, url: string) =>
+  invoke<Feed>("edit_feed_url", { id, url });
 /** Set a feed's refresh interval (minutes). `null` follows the global
  *  setting; `525600` opts the feed out of automatic refresh. */
 export const setFeedRefreshInterval = (id: number, minutes: number | null) =>

@@ -322,6 +322,11 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             );
             "#,
         ),
+        // v23 — cached translated article title, produced alongside the body
+        // translation (`translated_html` / `translated_lang`). Same language
+        // key as the body: one `ai_translate` run fills both, so `NULL` simply
+        // means the row predates title translation (the original title shows).
+        M::up("ALTER TABLE articles ADD COLUMN translated_title TEXT;"),
     ])
 });
 
@@ -546,35 +551,63 @@ pub fn refine_feed_source_type(
     Ok(())
 }
 
+/// The feed columns every feed-row query reads, in `map_feed_row` order —
+/// shared by the whole-library list and the single-feed lookup so the two can
+/// never drift.
+const FEED_COLUMNS: &str = "\
+    SELECT f.id, f.feed_url, f.site_url, f.title, f.description, f.favicon_url, \
+           f.folder_id, f.source_type, f.last_fetched_at, f.fetch_error, \
+           (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0), \
+           f.refresh_interval_min, f.auto_translate, f.open_mode \
+    FROM feeds f";
+
 pub fn list_feeds(conn: &Connection) -> AppResult<Vec<Feed>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.feed_url, f.site_url, f.title, f.description, f.favicon_url,
-                f.folder_id, f.source_type, f.last_fetched_at, f.fetch_error,
-                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0),
-                f.refresh_interval_min, f.auto_translate, f.open_mode
-         FROM feeds f ORDER BY f.title COLLATE NOCASE",
-    )?;
+    let mut stmt =
+        conn.prepare(&format!("{FEED_COLUMNS} ORDER BY f.title COLLATE NOCASE"))?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(Feed {
-                id: r.get(0)?,
-                feed_url: r.get(1)?,
-                site_url: r.get(2)?,
-                title: r.get(3)?,
-                description: r.get(4)?,
-                favicon_url: r.get(5)?,
-                folder_id: r.get(6)?,
-                source_type: r.get(7)?,
-                last_fetched_at: r.get(8)?,
-                fetch_error: r.get(9)?,
-                unread_count: r.get(10)?,
-                refresh_interval_min: r.get(11)?,
-                auto_translate: r.get::<_, i64>(12)? != 0,
-                open_mode: r.get(13)?,
-            })
-        })?
+        .query_map([], map_feed_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// One feed by id, or `None` when the id is unknown (deleted concurrently).
+pub fn feed_by_id(conn: &Connection, id: i64) -> AppResult<Option<Feed>> {
+    let mut stmt = conn.prepare(&format!("{FEED_COLUMNS} WHERE f.id = ?1"))?;
+    stmt.query_row(params![id], map_feed_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+/// A feed's current `feed_url`. The refresh-completion guard reads this under
+/// the same write lock it would apply its outcome through: a feed re-pointed
+/// mid-refresh (the edit-feed dialog) must not receive the old URL's result.
+pub fn feed_url_by_id(conn: &Connection, id: i64) -> AppResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT feed_url FROM feeds WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn map_feed_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Feed> {
+    Ok(Feed {
+        id: r.get(0)?,
+        feed_url: r.get(1)?,
+        site_url: r.get(2)?,
+        title: r.get(3)?,
+        description: r.get(4)?,
+        favicon_url: r.get(5)?,
+        folder_id: r.get(6)?,
+        source_type: r.get(7)?,
+        last_fetched_at: r.get(8)?,
+        fetch_error: r.get(9)?,
+        unread_count: r.get(10)?,
+        refresh_interval_min: r.get(11)?,
+        auto_translate: r.get::<_, i64>(12)? != 0,
+        open_mode: r.get(13)?,
+    })
 }
 
 /// A feed the scheduler should fetch: `(id, feed_url, etag, last_modified)` —
@@ -861,6 +894,31 @@ pub fn rename_feed(conn: &Connection, id: i64, title: &str) -> AppResult<()> {
     conn.execute(
         "UPDATE feeds SET title = ?2, custom_title = 1 WHERE id = ?1",
         params![id, title],
+    )?;
+    Ok(())
+}
+
+/// Point an existing subscription at a new feed document. The feed row keeps
+/// its id — folders, articles, read state and every per-feed setting survive
+/// the move — while the metadata follows the new document: the source type is
+/// re-classified from the new URL + parsed feed, and a feed the user has not
+/// renamed takes the new document's title. The stored conditional-GET
+/// revalidators are dropped: the old ETag belongs to the old URL's content,
+/// so the next poll must be a full GET.
+pub fn edit_feed_url(
+    conn: &Connection,
+    id: i64,
+    url: &str,
+    source_type: crate::models::SourceType,
+    title: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE feeds SET feed_url = ?2, source_type = ?3,
+                          title = CASE WHEN custom_title = 1 THEN title
+                                       ELSE COALESCE(NULLIF(?4, ''), title) END,
+                          etag = NULL, last_modified = NULL
+         WHERE id = ?1",
+        params![id, url, source_type.as_str(), title],
     )?;
     Ok(())
 }
@@ -1448,6 +1506,31 @@ pub fn upsert_article(
     dedup: bool,
     rules: &[Rule],
 ) -> AppResult<bool> {
+    let Some((start_read, start_starred)) = article_precheck(conn, feed_id, a, dedup, rules)?
+    else {
+        return Ok(false);
+    };
+    // The article row, its FTS index entry, and its enclosures must land
+    // together — a partial insert leaves an unsearchable or enclosure-less
+    // article. Wrap them in a transaction so a mid-loop failure rolls back.
+    let tx = conn.unchecked_transaction()?;
+    let inserted = insert_article_row(&tx, feed_id, a, start_read, start_starred)?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// The decision half of [`upsert_article`]: dedup, retention tombstones and
+/// filter rules, all pure reads. `None` = skip the article outright (a `skip`
+/// rule, a tombstoned or deduplicated guid); `Some((read, starred))` carries
+/// the rule-tinted start state for the insert half. Callers that already hold
+/// a transaction run this first, then [`insert_article_row`] inside it.
+pub fn article_precheck(
+    conn: &Connection,
+    feed_id: i64,
+    a: &NewArticle,
+    dedup: bool,
+    rules: &[Rule],
+) -> AppResult<Option<(bool, bool)>> {
     if dedup {
         if let Some(url) = a.url.as_deref().filter(|u| !u.is_empty()) {
             let exists: bool = conn.query_row(
@@ -1456,7 +1539,7 @@ pub fn upsert_article(
                 |r| r.get(0),
             )?;
             if exists {
-                return Ok(false);
+                return Ok(None);
             }
         }
     }
@@ -1472,7 +1555,7 @@ pub fn upsert_article(
         |r| r.get(0),
     )?;
     if tombstoned {
-        return Ok(false);
+        return Ok(None);
     }
     // Apply filter rules: skip wins outright; read / star tint the new row.
     let (mut start_read, mut start_starred) = (false, false);
@@ -1481,16 +1564,26 @@ pub fn upsert_article(
             continue;
         }
         match rule.action.as_str() {
-            "skip" => return Ok(false),
+            "skip" => return Ok(None),
             "read" => start_read = true,
             "star" => start_starred = true,
             _ => {}
         }
     }
-    // The article row, its FTS index entry, and its enclosures must land
-    // together — a partial insert leaves an unsearchable or enclosure-less
-    // article. Wrap them in a transaction so a mid-loop failure rolls back.
-    let tx = conn.unchecked_transaction()?;
+    Ok(Some((start_read, start_starred)))
+}
+
+/// The write half of [`upsert_article`]: the article row, its FTS index entry
+/// and its enclosures. Must run inside a caller-owned transaction (rusqlite
+/// has no nested BEGIN, so this never opens one of its own) — `upsert_article`
+/// is the standalone, transaction-wrapping entry point.
+pub fn insert_article_row(
+    tx: &Connection,
+    feed_id: i64,
+    a: &NewArticle,
+    start_read: bool,
+    start_starred: bool,
+) -> AppResult<bool> {
     let n = tx.execute(
         "INSERT INTO articles
             (feed_id, guid, url, title, author, summary, content_html, body_text,
@@ -1526,7 +1619,6 @@ pub fn upsert_article(
             params![id, e.url, e.mime_type, e.length],
         )?;
     }
-    tx.commit()?;
     // A row inserted but pre-marked read by a `read` rule is not "new" from
     // the user's point of view — report it as not-inserted so it is excluded
     // from new-article tallies.
@@ -1807,7 +1899,7 @@ pub fn get_article(conn: &Connection, id: i64) -> AppResult<ArticleDetail> {
         "SELECT a.id, a.feed_id, f.title, f.source_type, a.title, a.author, a.url,
                 a.content_html, a.extracted_html, a.image_url, a.published_at,
                 a.is_read, a.is_starred, a.read_later, a.ai_summary,
-                a.translated_html, a.translated_lang
+                a.translated_html, a.translated_lang, a.translated_title
          FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE a.id = ?1",
         params![id],
         |r| {
@@ -1829,6 +1921,7 @@ pub fn get_article(conn: &Connection, id: i64) -> AppResult<ArticleDetail> {
                 ai_summary: r.get(14)?,
                 translated_html: r.get(15)?,
                 translated_lang: r.get(16)?,
+                translated_title: r.get(17)?,
                 enclosures: Vec::new(),
                 tags: Vec::new(),
             })
@@ -1974,10 +2067,21 @@ pub fn set_preview_translation(
     Ok(())
 }
 
-pub fn set_translation(conn: &Connection, id: i64, html: &str, lang: &str) -> AppResult<()> {
+/// Cache an article's translated body (and title, when one was produced) for
+/// the target language. `title` is `None` when the article had no title to
+/// translate or the row predates title translation — the reader then keeps
+/// showing the original title instead of a blank one.
+pub fn set_translation(
+    conn: &Connection,
+    id: i64,
+    html: &str,
+    lang: &str,
+    title: Option<&str>,
+) -> AppResult<()> {
     conn.execute(
-        "UPDATE articles SET translated_html = ?2, translated_lang = ?3 WHERE id = ?1",
-        params![id, html, lang],
+        "UPDATE articles SET translated_html = ?2, translated_lang = ?3,
+                              translated_title = ?4 WHERE id = ?1",
+        params![id, html, lang, title],
     )?;
     Ok(())
 }
@@ -2950,7 +3054,7 @@ mod tests {
 
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22, 23] {
+        for version in [0, 19, 20, 21, 22, 23, 24] {
             let path = std::env::temp_dir().join(format!(
                 "papr-migrations-{}-{}-{}.db",
                 std::process::id(),
@@ -2961,7 +3065,7 @@ mod tests {
                     .as_nanos()
             ));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(22)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(23)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
@@ -2973,27 +3077,27 @@ mod tests {
             if version >= 21 {
                 conn.execute("UPDATE feeds SET position=42", []).unwrap();
             }
-            if version == 23 {
+            if version == 24 {
                 // A database from a *future* build (higher schema version than
                 // this binary knows) must be refused, not silently migrated.
-                conn.pragma_update(None, "user_version", 23).unwrap();
+                conn.pragma_update(None, "user_version", 24).unwrap();
             }
             drop(conn);
             let result = open(&path);
-            if version == 23 {
+            if version == 24 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    23
+                    24
                 );
             } else {
                 let conn = result.unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    22
+                    23
                 );
                 if version > 0 {
                     let values: (String, i64, i64) = conn
@@ -3220,22 +3324,28 @@ mod tests {
         let before = get_article(&conn, id).unwrap();
         assert_eq!(before.translated_html, None);
         assert_eq!(before.translated_lang, None);
+        assert_eq!(before.translated_title, None);
 
-        set_translation(&conn, id, "<p>译文</p>", "zh").unwrap();
+        set_translation(&conn, id, "<p>译文</p>", "zh", Some("译文标题")).unwrap();
 
         let after = get_article(&conn, id).unwrap();
         assert_eq!(after.translated_html.as_deref(), Some("<p>译文</p>"));
         assert_eq!(after.translated_lang.as_deref(), Some("zh"));
+        assert_eq!(after.translated_title.as_deref(), Some("译文标题"));
     }
 
     #[test]
     fn set_translation_overwrites_a_previous_language() {
         let (conn, id) = test_db();
-        set_translation(&conn, id, "<p>译文</p>", "zh").unwrap();
-        set_translation(&conn, id, "<p>translation</p>", "en").unwrap();
+        set_translation(&conn, id, "<p>译文</p>", "zh", Some("标题")).unwrap();
+        // A re-translation into another language carries its own title; a
+        // `None` (no title produced) must clear the stale one, never leave a
+        // title from the previous language behind.
+        set_translation(&conn, id, "<p>translation</p>", "en", None).unwrap();
         let after = get_article(&conn, id).unwrap();
         assert_eq!(after.translated_html.as_deref(), Some("<p>translation</p>"));
         assert_eq!(after.translated_lang.as_deref(), Some("en"));
+        assert_eq!(after.translated_title, None);
     }
 
     #[test]

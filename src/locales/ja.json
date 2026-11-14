@@ -77,6 +77,16 @@
     "discoverFromPage": "このページで見つかったフィード",
     "discoverAdd": "追加"
   },
+  "editFeed": {
+    "title": "フィードを編集",
+    "urlLabel": "フィード URL",
+    "urlHint": "アドレスを変更すると再検証のうえ新しいフィードの記事を取得します。フォルダ・記事・フィードごとの設定は保持されます。",
+    "urlHintLocked": "このフィードのアドレスはソース種別で管理されているため変更できません。",
+    "autoTranslate": "自動翻訳",
+    "openMode": "記事の開き方",
+    "saving": "保存中…",
+    "toastSaved": "フィードの設定を保存しました"
+  },
   "explore": {
     "title": "フィードを見つける",
     "subtitle": "厳選された有名フィードのディレクトリを閲覧します。",
@@ -714,6 +724,7 @@
     "moveOutOfFolder": "フォルダから移動",
     "markAllRead": "すべて既読にする",
     "renameMenu": "名前を変更…",
+    "editMenu": "フィードを編集…",
     "renameFeedTitle": "フィードの名前を変更",
     "renameFolderTitle": "フォルダの名前を変更",
     "feedNamePlaceholder": "フィード名",
@@ -807,7 +818,9 @@
     "rsshubEnvInvalid": "環境変数名には英字・数字・アンダースコアのみ使用できます（先頭は英字またはアンダースコア）。",
     "rsshubEngineArchiveInvalid": "そのファイルは有効なエンジンアーカイブ（.tar.gz / .zip）ではありません。",
     "rsshubEngineChecksum": "ダウンロードしたエンジンアーカイブが sha256 チェックに失敗しました。",
-    "rsshubEngineEnvTooLarge": "マージされたルート環境変数がプロセス環境の上限を超えています —— マーケットプレイスで一部のルート変数を削除または短くしてください。"
+    "rsshubEngineEnvTooLarge": "マージされたルート環境変数がプロセス環境の上限を超えています —— マーケットプレイスで一部のルート変数を削除または短くしてください。",
+    "editUrlUnsupported": "この購読のアドレスは編集できません — 購読解除して新しいソースで再追加してください",
+    "feedUrlChanged": "このフィードは別のウィンドウで編集されました — ダイアログを開き直してから変更してください"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

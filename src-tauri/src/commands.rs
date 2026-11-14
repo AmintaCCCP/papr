@@ -806,6 +806,133 @@ pub async fn rename_feed(state: State<'_, AppState>, id: i64, title: String) -> 
     db::rename_feed(&conn, id, &title)
 }
 
+/// Re-point a subscription at a new feed URL (the "edit feed" dialog). The
+/// feed keeps its id — folders, articles, read state and per-feed settings
+/// survive — while the document at the new URL is validated (fetched, parsed,
+/// auto-discovered on an HTML page, exactly like `add_feed`) before anything
+/// is written. Only plain-RSS subscriptions can be re-pointed: parser-served
+/// (X), engine-routed (RSSHub) and newsletter feeds have URLs produced by
+/// their own flows, not something a user can substitute by hand.
+///
+/// An unchanged URL short-circuits to the stored feed — saving the dialog
+/// without touching the address must not cost a network round-trip.
+#[tauri::command]
+pub async fn edit_feed_url(state: State<'_, AppState>, id: i64, url: String) -> AppResult<Feed> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err(AppError::code("noFeedFound"));
+    }
+
+    let current = {
+        let conn = state.read().await;
+        db::feed_by_id(&conn, id)?.ok_or_else(|| AppError::code("noFeedFound"))?
+    };
+    if current.source_type != "rss" {
+        return Err(AppError::code("editUrlUnsupported"));
+    }
+    if current.feed_url == url {
+        return Ok(current);
+    }
+
+    // A different feed already on that URL would silently merge two
+    // subscriptions into one row — refuse like `add_feed` does.
+    {
+        let conn = state.read().await;
+        if db::find_feed_by_url(&conn, &url)?.is_some_and(|other| other != id) {
+            return Err(AppError::code("alreadySubscribed"));
+        }
+    }
+
+    // Validate the new address before writing: fetch, auto-discover on an
+    // HTML page, parse. Any failure leaves the feed untouched on the old URL.
+    let client = state.http();
+    let (bytes, ct, final_url) = fetch::get(&client, &url).await?;
+    let (feed_url, feed_bytes) = if parse::looks_like_feed(&bytes) {
+        (final_url, bytes)
+    } else {
+        let html = fetch::decode_html(&bytes, ct.as_deref());
+        let candidate = parse::discover_feeds(&html, &final_url)
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::code("noFeedFound"))?;
+        let (fb, _, _) = fetch::get(&client, &candidate).await?;
+        (candidate, fb)
+    };
+    let parsed = parse::parse_feed(&feed_bytes, &feed_url)?;
+    let source_type =
+        parse::refine_source_type(parse::detect_source_type(&feed_url), &parsed, &feed_url);
+    let title = parsed
+        .title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| feed_url.clone());
+
+    // Adopt the new document's articles at once, so the sidebar's unread
+    // counts are correct before the next scheduled refresh.
+    {
+        let conn = state.db.lock().await;
+        if db::find_feed_by_url(&conn, &feed_url)?.is_some_and(|other| other != id) {
+            return Err(AppError::code("alreadySubscribed"));
+        }
+        // Two edits can race through the network validation above (edit to A,
+        // save, edit to B, save — A's slow fetch lands after B's commit). The
+        // duplicate check can't catch that, so compare the address under the
+        // write lock against the one this command saw when it started, and
+        // refuse to let a stale edit overwrite a newer one. Same lock held
+        // through the transaction below, so nothing can slip in between.
+        let now_url = db::feed_url_by_id(&conn, id)?
+            .ok_or_else(|| AppError::code("noFeedFound"))?;
+        if now_url != current.feed_url {
+            return Err(AppError::code("feedUrlChanged"));
+        }
+        // One transaction: the URL swap, metadata adoption and article import
+        // land together or not at all — a mid-import failure must not leave
+        // the feed pointing at the new document with only some of its
+        // articles. The write half runs via `insert_article_row` because
+        // `upsert_article` opens its own transaction and rusqlite has no
+        // nested BEGIN. Scoped so the non-Send connection guard never crosses
+        // the await below.
+        let tx = conn.unchecked_transaction()?;
+        db::edit_feed_url(&tx, id, &feed_url, source_type, &title)?;
+        let dedup = db::setting_flag(&tx, "dedup_enabled", false);
+        let rules = db::active_rules(&tx).unwrap_or_default();
+        for article in &parsed.articles {
+            if let Some((start_read, start_starred)) =
+                db::article_precheck(&tx, id, article, dedup, &rules)?
+            {
+                db::insert_article_row(&tx, id, article, start_read, start_starred)?;
+            }
+        }
+        // The document was fetched here, so record it — otherwise the feed
+        // reads as "never refreshed" and the scheduler polls it again right
+        // away.
+        let _ = db::touch_feed(&tx, id);
+        // Adopt the new document's metadata (site URL, description, favicon)
+        // now instead of waiting for the next refresh to fill them in.
+        // `custom_title` already guarded the title inside `edit_feed_url`.
+        let favicon = parsed.icon.clone().or_else(|| {
+            parsed
+                .site_url
+                .as_deref()
+                .and_then(|s| Url::parse(s).ok())
+                .and_then(|u| u.host_str().map(String::from))
+                .map(|h| format!("https://www.google.com/s2/favicons?domain={h}&sz=64"))
+        });
+        db::update_feed_meta(
+            &tx,
+            id,
+            None,
+            parsed.site_url.as_deref(),
+            parsed.description.as_deref(),
+            favicon.as_deref(),
+        )?;
+        tx.commit()?;
+    }
+
+    let conn = state.read().await;
+    db::feed_by_id(&conn, id)?.ok_or_else(|| AppError::code("noFeedFound"))
+}
+
 /// Refresh every feed, streaming progress to the frontend over `on_progress`.
 #[tauri::command]
 pub async fn refresh_feeds(
@@ -1535,6 +1662,10 @@ pub async fn ai_digest(state: State<'_, AppState>, on_token: Channel<AiEvent>) -
 pub enum TranslateEvent {
     /// The number of batches the body was split into, sent before any batch.
     Start { total: usize },
+    /// The translated article title, sent before the body batches so the
+    /// reader heading updates while the (usually longer) body is still
+    /// streaming in.
+    Title { title: String },
     /// One freshly translated, sanitized batch of HTML, plus how many batches
     /// have completed so far.
     Batch { html: String, done: usize },
@@ -1685,7 +1816,7 @@ pub async fn ai_translate(
     engine: String,
     on_event: Channel<TranslateEvent>,
 ) -> AppResult<()> {
-    let (source_html, sel, target) = {
+    let (source_html, article_title, sel, target) = {
         let conn = state.read().await;
         let detail = db::get_article(&conn, article_id)?;
         // Translate the richest body available: the extracted full text when the
@@ -1702,7 +1833,7 @@ pub async fn ai_translate(
         } else {
             lang
         };
-        (source, build_translate_selection(&conn, &engine)?, target)
+        (source, detail.title, build_translate_selection(&conn, &engine)?, target)
     };
     if source_html.trim().is_empty() {
         return Err(AppError::code("noArticleBody"));
@@ -1732,6 +1863,37 @@ pub async fn ai_translate(
     let _ = on_event.send(TranslateEvent::Start { total });
 
     let system = translate::translate_system_prompt(translate::language_name(&target));
+
+    // Translate the title alongside the body: a one-line `<h1>` fragment goes
+    // through the same engine, prompt and sanitizer as the preview
+    // translation, then the heading text is pulled back out of the sanitized
+    // fragment. Done first so the reader heading is already translated while
+    // the body batches stream in. Skipped for tweet cards — the reader renders
+    // those without a heading, so the extra request buys nothing. A failed
+    // title request must not sink the body translation either: the reader
+    // keeps the original title and the body still translates.
+    let translated_title = if is_card || article_title.trim().is_empty() {
+        None
+    } else {
+        let title_source = format!("<h1>{}</h1>", escape_preview_text(article_title.trim()));
+        match backend
+            .translate_batch(&http, &system, &title_source, &target)
+            .await
+        {
+            Ok(raw) => {
+                let clean = sanitize::sanitize(raw.trim(), None);
+                let text = text_for_selector(&clean, "h1");
+                (!text.trim().is_empty()).then_some(text)
+            }
+            Err(e) => {
+                log::warn!("article title translation skipped: {e}");
+                None
+            }
+        }
+    };
+    if let Some(title) = &translated_title {
+        let _ = on_event.send(TranslateEvent::Title { title: title.clone() });
+    }
     let mut full = String::new();
     // Translated tweet bodies, in document order, for the splice below.
     let mut bodies: Vec<String> = Vec::new();
@@ -1777,7 +1939,13 @@ pub async fn ai_translate(
     };
     if !final_html.is_empty() {
         let conn = state.db.lock().await;
-        db::set_translation(&conn, article_id, &final_html, &target)?;
+        db::set_translation(
+            &conn,
+            article_id,
+            &final_html,
+            &target,
+            translated_title.as_deref(),
+        )?;
     }
     let _ = on_event.send(TranslateEvent::Done { html: final_html });
     Ok(())

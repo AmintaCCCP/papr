@@ -90,6 +90,11 @@ enum Outcome {
     NotModified,
     Updated {
         parsed: parse::ParsedFeed,
+        /// Where the document actually came from — the challenge/redirect
+        /// chain's final URL, which is the base its relative links resolve
+        /// against (not necessarily the `feeds.feed_url` it was requested
+        /// with).
+        doc_url: String,
         etag: Option<String>,
         last_modified: Option<String>,
     },
@@ -106,11 +111,13 @@ async fn fetch_one(
         Ok(fetch::Fetched::NotModified) => Outcome::NotModified,
         Ok(fetch::Fetched::Body {
             bytes,
+            doc_url,
             etag,
             last_modified,
-        }) => match parse::parse_feed(&bytes, url) {
+        }) => match parse::parse_feed(&bytes, &doc_url) {
             Ok(parsed) => Outcome::Updated {
                 parsed,
+                doc_url,
                 etag,
                 last_modified,
             },
@@ -229,6 +236,28 @@ pub async fn refresh_core(
         let Ok((feed_id, feed_url, outcome)) = joined else {
             continue;
         };
+        // Edit-guard: a feed re-pointed while this fetch was in flight (the
+        // edit-feed dialog) must not receive the old URL's outcome — every
+        // write below keys on `feed_id` alone, so a stale result would
+        // overwrite the new address's articles, metadata and revalidators
+        // with the old document's. Re-read the address under the same write
+        // lock the outcome is applied through; a mismatch (or a row that has
+        // since been deleted) drops the result as if the feed never answered.
+        let stale = {
+            let conn = db.lock().await;
+            db::feed_url_by_id(&conn, feed_id)
+                .ok()
+                .flatten()
+                .is_none_or(|current| current != feed_url)
+        };
+        if stale {
+            on_event(RefreshProgress::FeedDone {
+                feed_id,
+                new_articles: 0,
+                error: None,
+            });
+            continue;
+        }
         let mut new_here = 0usize;
         let mut error: Option<String> = None;
 
@@ -244,6 +273,7 @@ pub async fn refresh_core(
             }
             Outcome::Updated {
                 parsed,
+                doc_url,
                 etag,
                 last_modified,
             } => {
@@ -267,8 +297,11 @@ pub async fn refresh_core(
                 );
                 // Promote a still-generic `'rss'` feed to its real kind now that
                 // the parsed document reveals it (audio enclosures → podcast,
-                // `/@user.rss` → mastodon). A no-op for an already classified feed.
-                let refined = parse::refine_source_type(SourceType::Rss, &parsed, &feed_url);
+                // `/@user.rss` → mastodon). Classified against the document's
+                // final address — the URL redirects and challenge hops landed
+                // at — not the address the fetch was launched from. A no-op for
+                // an already classified feed.
+                let refined = parse::refine_source_type(SourceType::Rss, &parsed, &doc_url);
                 let _ = db::refine_feed_source_type(&conn, feed_id, refined);
             }
         }
@@ -638,11 +671,13 @@ async fn poll_rsshub(
                 Ok(fetch::Fetched::NotModified) => Outcome::NotModified,
                 Ok(fetch::Fetched::Body {
                     bytes,
+                    doc_url,
                     etag,
                     last_modified,
-                }) => match parse::parse_feed(&bytes, &target) {
+                }) => match parse::parse_feed(&bytes, &doc_url) {
                     Ok(parsed) => Outcome::Updated {
                         parsed,
+                        doc_url,
                         etag,
                         last_modified,
                     },
@@ -672,6 +707,7 @@ async fn poll_rsshub(
             }
             Outcome::Updated {
                 parsed,
+                doc_url: _,
                 etag,
                 last_modified,
             } => {

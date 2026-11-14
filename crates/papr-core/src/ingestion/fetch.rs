@@ -47,6 +47,7 @@ pub fn build_client(timeout_secs: u64, proxy: &str) -> Client {
 fn build_client_inner(timeout_secs: u64, proxy: &str) -> Client {
     let mut builder = Client::builder()
         .user_agent(USER_AGENT)
+        .cookie_store(true)
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10));
 
@@ -93,9 +94,186 @@ pub enum Fetched {
     /// Fresh content, along with revalidation headers to store.
     Body {
         bytes: Vec<u8>,
+        /// The URL the document actually came from — after HTTP redirects and
+        /// an anti-bot challenge hop this can differ from the request URL,
+        /// and it (not the request URL) is the base relative links inside the
+        /// document resolve against.
+        doc_url: String,
         etag: Option<String>,
         last_modified: Option<String>,
     },
+}
+
+/// Detect a JavaScript-redirect anti-bot challenge in a fetched body and
+/// return the URL it points at.
+///
+/// Some hosts (openresty-style WAFs) answer automated clients with a tiny HTML
+/// page whose only content is `location.replace("/path?token=…")` — a browser
+/// follows it (with the cookie the response set) and gets the real document.
+/// A plain HTTP client stops there and reports "could not parse the feed" on
+/// what is actually a block page.
+///
+/// The recognisable shape is deliberately narrow, on two axes: the document
+/// must be small (challenges are a few hundred bytes; a real feed or article
+/// is kilobytes), and the `location.replace` call must live inside a
+/// `<script>` element on a page that carries no visible story beyond it
+/// (empty body, at most a short title). The DOM-level checks keep page
+/// content from impersonating a challenge — a feed-discovery page that quotes
+/// the call in a `<pre>` code sample keeps its prose visible and is rejected,
+/// so following it never fetches the quoted example URL.
+///
+/// Returns the `location.replace` argument with JSON escapes (`\/`) decoded,
+/// resolved against `base_url` when it is relative. `None` for anything else.
+pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
+    // A challenge page is minimal HTML — anything large is real content.
+    if bytes.len() > 2048 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    // Byte-sliced prefix checks (`get`, so a multibyte lead can't panic): a
+    // doctype or `<html>` opener, any case.
+    let head = text.trim_start();
+    let looks_like_html = head
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("<!doctype"))
+        || head.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("<html"));
+    if !looks_like_html {
+        return None;
+    }
+    let dom = scraper::Html::parse_fragment(&text);
+    let mut script_call: Option<String> = None;
+    let mut visible_chars = 0usize;
+    for node in dom.tree.nodes() {
+        let scraper::Node::Text(t) = node.value() else {
+            continue;
+        };
+        let in_script = node
+            .ancestors()
+            .any(|a| a.value().as_element().is_some_and(|e| e.name() == "script"));
+        if in_script {
+            if script_call.is_none() {
+                // Only a call the browser would actually run counts: a
+                // `location.replace` mentioned inside a JS string literal or
+                // comment is sample content, not a redirect. Scan forward
+                // through the candidates, skipping the ones the tiny lexer
+                // below puts inside a string or comment.
+                let mut from = 0;
+                while let Some(rel) = t[from..].find("location.replace(") {
+                    let idx = from + rel;
+                    if !inside_js_string_or_comment(t, idx) {
+                        script_call = Some(t[idx..].to_string());
+                        break;
+                    }
+                    from = idx + "location.replace(".len();
+                }
+            }
+        } else {
+            visible_chars += t.trim().chars().count();
+        }
+    }
+    // Visible text beyond the script means page content, not a challenge.
+    if visible_chars > 32 {
+        return None;
+    }
+    let call = script_call?;
+    let rest = call["location.replace(".len()..].trim_start();
+    // The argument is a single- or double-quoted string; take up to the
+    // matching quote (the pages we target never nest quotes inside).
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let arg = &rest[1..];
+    let end = arg.find(quote)?;
+    let raw = &arg[..end];
+    if raw.is_empty() {
+        return None;
+    }
+    // The challenge pages embed the path in a JS string literal, so `/` comes
+    // back escaped as `\/`.
+    let path = raw.replace("\\/", "/");
+    let base = reqwest::Url::parse(base_url).ok()?;
+    base.join(&path).ok().map(|u| u.into())
+}
+
+/// Is `idx` — the byte offset of a `location.replace(` candidate inside the
+/// script source `script` — inside a JS string literal or comment? A tiny
+/// lexer tracks line/block comments and the three quote styles (with `\`
+/// escapes, backticks included) from the start of the script: a call
+/// mentioned inside `"…"` or `// …` is sample content, not a redirect the
+/// browser would run. JS regex literals are not modelled — at worst a regex
+/// containing `//` hides a real call, which fails safe (the parse errors as
+/// it did before the challenge handling existed). An unterminated string or
+/// comment also fails safe the same way.
+fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
+    #[derive(PartialEq)]
+    enum Js {
+        Code,
+        LineComment,
+        BlockComment,
+        Str(u8),
+    }
+    let bytes = script.as_bytes();
+    let mut state = Js::Code;
+    let mut i = 0;
+    while i < idx && i < bytes.len() {
+        let c = bytes[i];
+        match state {
+            Js::Code => {
+                if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                    state = Js::LineComment;
+                    i += 2;
+                    continue;
+                }
+                if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    state = Js::BlockComment;
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' || c == b'\'' || c == b'`' {
+                    state = Js::Str(c);
+                }
+                i += 1;
+            }
+            Js::LineComment => {
+                if c == b'\n' {
+                    state = Js::Code;
+                }
+                i += 1;
+            }
+            Js::BlockComment => {
+                if c == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    state = Js::Code;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            Js::Str(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    state = Js::Code;
+                }
+                i += 1;
+            }
+        }
+    }
+    state != Js::Code
+}
+
+/// Follow one anti-bot challenge redirect: re-GET the target URL with the
+/// same client (its cookie jar carries whatever the challenge response set)
+/// and return the second response untouched. One hop only — if the target is
+/// itself a challenge page it is returned as-is rather than looping.
+async fn follow_challenge(
+    client: &Client,
+    target: &str,
+) -> AppResult<reqwest::Response> {
+    let resp = client.get(target).send().await?;
+    Ok(resp.error_for_status()?)
 }
 
 /// Conditional GET. Sends `If-None-Match`/`If-Modified-Since` when we have them.
@@ -118,6 +296,11 @@ pub async fn conditional_get(
         return Ok(Fetched::NotModified);
     }
     let resp = resp.error_for_status()?;
+    // Resolve the challenge target against the *final* URL, not the request
+    // URL — the feed host may have HTTP-redirected along the way, and a
+    // relative `location.replace('?token=…')` only means what a browser
+    // thinks it means at the document's own address.
+    let final_url = resp.url().to_string();
     let header = |name: reqwest::header::HeaderName| {
         resp.headers()
             .get(&name)
@@ -127,8 +310,30 @@ pub async fn conditional_get(
     let etag = header(ETAG);
     let last_modified = header(LAST_MODIFIED);
     let bytes = read_capped(resp).await?;
+    // An anti-bot challenge in place of the feed document: follow its JS
+    // redirect once and serve whatever comes back (with the second response's
+    // revalidation headers).
+    if let Some(target) = js_redirect_target(&bytes, &final_url) {
+        let resp = follow_challenge(client, &target).await?;
+        let doc_url = resp.url().to_string();
+        let read_header = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(&name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+        let etag = read_header(ETAG);
+        let last_modified = read_header(LAST_MODIFIED);
+        return Ok(Fetched::Body {
+            bytes: read_capped(resp).await?,
+            doc_url,
+            etag,
+            last_modified,
+        });
+    }
     Ok(Fetched::Body {
         bytes,
+        doc_url: final_url,
         etag,
         last_modified,
     })
@@ -228,12 +433,117 @@ pub async fn get(client: &Client, url: &str) -> AppResult<(Vec<u8>, Option<Strin
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let bytes = read_capped(resp).await?;
+    // An anti-bot challenge in place of the document: follow its JS redirect
+    // once and surface the second response's body, type and final URL.
+    if let Some(target) = js_redirect_target(&bytes, &final_url) {
+        let resp = follow_challenge(client, &target).await?;
+        let final_url = resp.url().to_string();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        return Ok((read_capped(resp).await?, content_type, final_url));
+    }
     Ok((bytes, content_type, final_url))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{charset_from_content_type, charset_from_html, decode_html};
+    use super::{charset_from_content_type, charset_from_html, decode_html, js_redirect_target};
+
+    #[test]
+    fn challenge_redirect_target_extracted_from_js_page() {
+        // The exact shape the freedidi.com WAF serves: JSON-escaped slashes,
+        // no <html> wrapper beyond the minimal document.
+        let page = b"<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta name=\"robots\" content=\"noindex,nofollow\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<script>location.replace(\"\\/feed?_hgk=j9eff67319cf33ad0.1794633424.GVaSebtYlv\")\
+</script></head><body></body></html>";
+        assert_eq!(
+            js_redirect_target(page, "https://www.freedidi.com/feed").as_deref(),
+            Some("https://www.freedidi.com/feed?_hgk=j9eff67319cf33ad0.1794633424.GVaSebtYlv")
+        );
+    }
+
+    #[test]
+    fn challenge_redirect_absolute_target_and_single_quotes() {
+        let page = b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
+        assert_eq!(
+            js_redirect_target(page, "https://example.com/").as_deref(),
+            Some("https://example.com/feed?x=1")
+        );
+    }
+
+    #[test]
+    fn regular_content_is_never_mistaken_for_a_challenge() {
+        // A real RSS document: large, not HTML.
+        let feed = b"<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title>\
+</channel></rss>";
+        assert_eq!(js_redirect_target(feed, "https://example.com/feed"), None);
+        // A real article page: HTML but far over the challenge size.
+        let mut article = b"<!doctype html><html><body>".to_vec();
+        article.extend(vec![b'x'; 4096]);
+        article.extend_from_slice(b"location.replace('/x')</body></html>");
+        assert_eq!(js_redirect_target(&article, "https://example.com/"), None);
+        // HTML with a redirect but not via location.replace.
+        let meta = b"<!doctype html><html><head><meta http-equiv=\"refresh\" content=\"0;url=/a\">\
+</head></html>";
+        assert_eq!(js_redirect_target(meta, "https://example.com/"), None);
+        // No redirect at all.
+        let plain = b"<!doctype html><html><body>hello</body></html>";
+        assert_eq!(js_redirect_target(plain, "https://example.com/"), None);
+    }
+
+    #[test]
+    fn quoted_call_in_page_content_is_not_a_challenge() {
+        // A feed-discovery page quoting the call in a `<pre>` sample: the
+        // redirect lives in visible page text, not in a script, so following
+        // it would fetch the quoted example URL instead of a feed.
+        let quoted = b"<!doctype html><html><head><title>Site - subscribe</title>\
+<link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed\"></head>\
+<body><pre>location.replace('/missing')</pre></body></html>";
+        assert_eq!(js_redirect_target(quoted, "https://example.com/"), None);
+        // A commented-out call is content too.
+        let commented = b"<html><body><!-- location.replace('/nope') --></body></html>";
+        assert_eq!(js_redirect_target(commented, "https://example.com/"), None);
+    }
+
+    #[test]
+    fn quoted_call_in_script_string_or_comment_is_not_a_challenge() {
+        // The call assigned to a variable inside a script never runs — it is
+        // a string literal, and must not redirect the fetch.
+        let in_string = b"<html><script>const example = \"location.replace('/missing')\";\
+</script></html>";
+        assert_eq!(js_redirect_target(in_string, "https://example.com/"), None);
+        // Same for a commented-out call (line and block forms).
+        let line_comment =
+            b"<html><script>// location.replace('/missing')\n</script></html>";
+        assert_eq!(js_redirect_target(line_comment, "https://example.com/"), None);
+        let block_comment =
+            b"<html><script>/* location.replace('/missing') */</script></html>";
+        assert_eq!(js_redirect_target(block_comment, "https://example.com/"), None);
+        // A real call after a quoted sample in the same script still wins.
+        let mixed = b"<html><script>const s = \"location.replace('/sample')\";\
+location.replace('/real?a=1')</script></html>";
+        assert_eq!(
+            js_redirect_target(mixed, "https://example.com/x").as_deref(),
+            Some("https://example.com/real?a=1")
+        );
+    }
+
+    #[test]
+    fn redirect_only_page_with_a_title_is_a_challenge() {
+        // Empty body + script + a short title: the shape many challenge pages
+        // carry. Visible text stays within the contentless budget.
+        let titled = b"<html><head><title>Redirecting...</title></head><body>\
+<script>location.replace('/next?a=1')</script></body></html>";
+        assert_eq!(
+            js_redirect_target(titled, "https://example.com/x").as_deref(),
+            Some("https://example.com/next?a=1")
+        );
+    }
 
     #[test]
     fn charset_parsed_from_content_type_header() {

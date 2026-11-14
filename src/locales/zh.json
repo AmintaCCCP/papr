@@ -77,6 +77,16 @@
     "discoverFromPage": "在此页面发现",
     "discoverAdd": "添加"
   },
+  "editFeed": {
+    "title": "编辑订阅源",
+    "urlLabel": "订阅地址",
+    "urlHint": "修改地址后会重新验证并拉取新订阅源的文章；分组、文章与订阅源设置都会保留。",
+    "urlHintLocked": "该订阅源的地址由其来源类型管理，无法修改。",
+    "autoTranslate": "自动翻译",
+    "openMode": "文章打开方式",
+    "saving": "保存中…",
+    "toastSaved": "订阅源设置已保存"
+  },
   "explore": {
     "title": "发现订阅源",
     "subtitle": "浏览精选的知名订阅源目录。",
@@ -716,6 +726,7 @@
     "moveOutOfFolder": "移出文件夹",
     "markAllRead": "全部标为已读",
     "renameMenu": "重命名…",
+    "editMenu": "编辑订阅源…",
     "renameFeedTitle": "重命名订阅源",
     "renameFolderTitle": "重命名文件夹",
     "feedNamePlaceholder": "订阅源名称",
@@ -809,7 +820,9 @@
     "rsshubEnvInvalid": "环境变量名只能包含字母、数字和下划线，且以字母或下划线开头。",
     "rsshubEngineArchiveInvalid": "该文件不是有效的引擎包（.tar.gz / .zip）。",
     "rsshubEngineChecksum": "下载的引擎包未通过 sha256 校验。",
-    "rsshubEngineEnvTooLarge": "合并后的路由环境变量超出进程环境大小上限 —— 请在市场里移除或缩短部分路由变量。"
+    "rsshubEngineEnvTooLarge": "合并后的路由环境变量超出进程环境大小上限 —— 请在市场里移除或缩短部分路由变量。",
+    "editUrlUnsupported": "该订阅源的地址不支持编辑 — 请退订后按新来源重新添加",
+    "feedUrlChanged": "该订阅源已在其他窗口被编辑 — 请重新打开对话框后再修改"
   },
   "highlights": {
     "toolbarLabel": "高亮颜色",

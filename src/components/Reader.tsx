@@ -602,6 +602,21 @@ export default function Reader({ onToast }: Props) {
   const cachedValid = !!a?.translatedHtml && a.translatedLang === targetLang;
   const translatedBody =
     jobForTarget?.html || (cachedValid ? a?.translatedHtml ?? "" : "");
+  // The title must come from the same translation run as the body on screen:
+  // a fresh job's title paired with a still-cached body (or the reverse) would
+  // show two different translations at once. So when the displayed body comes
+  // from the job (streaming or finished) take the job's title — the original
+  // heading stays until the job's own title event lands — and when the body
+  // comes from the DB cache take the cached title. Rows cached before title
+  // translation have neither — the original title shows.
+  const bodyFromJob = !!jobForTarget && (!!jobForTarget.html || translating);
+  const translatedTitle = !showTranslation
+    ? ""
+    : bodyFromJob
+      ? jobForTarget.title
+      : cachedValid
+        ? a?.translatedTitle ?? ""
+        : "";
   const hasTranslation = !!translatedBody;
   const showToggle = hasTranslation || translating;
   const body = showTranslation
@@ -1114,7 +1129,9 @@ export default function Reader({ onToast }: Props) {
             )}
             {a.feedTitle}
           </button>
-          {!isXPost && <h1 className="article-title">{a.title}</h1>}
+          {!isXPost && (
+            <h1 className="article-title">{translatedTitle || a.title}</h1>
+          )}
           {/* An X post's date lives in the card head, so the generic meta line
               would print it twice — it only surfaces here while a full-text
               extraction is in flight. */}
