@@ -22,6 +22,7 @@ import {
 } from "../lib/rsshub";
 import type { RsshubRouteRow } from "../types";
 import ConfirmDialog from "./ConfirmDialog";
+import { useBackdropClose } from "../hooks/useBackdropClose";
 import Icon from "./Icon";
 
 interface Props {
@@ -75,7 +76,7 @@ export default function RsshubMarketplaceDialog({
   }, [onClose]);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="modal modal-explore"
         ref={dialogRef}
@@ -733,7 +734,7 @@ function EnvEditorModal({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="modal"
         ref={dialogRef}

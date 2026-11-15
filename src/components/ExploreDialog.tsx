@@ -6,6 +6,7 @@ import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { reportError } from "../toast";
 import { isComposingKey } from "../lib/ime";
+import { useBackdropClose } from "../hooks/useBackdropClose";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import FeedAvatar from "./FeedAvatar";
 import Icon from "./Icon";
@@ -116,7 +117,7 @@ export default function ExploreDialog({ onClose, onToast }: Props) {
   }, [onClose]);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="modal modal-explore"
         ref={dialogRef}

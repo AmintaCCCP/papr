@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { useBackdropClose } from "../hooks/useBackdropClose";
 import { isComposingKey } from "../lib/ime";
 
 interface Props {
@@ -52,7 +53,7 @@ export default function ConfirmDialog({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="modal"
         ref={dialogRef}

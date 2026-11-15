@@ -11,6 +11,7 @@ import type { ArticleSummary, Feed } from "../types";
 import Icon, { type IconName } from "./Icon";
 import FeedAvatar from "./FeedAvatar";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import { useBackdropClose } from "../hooks/useBackdropClose";
 
 export type CommandAction =
   | "mark-all-read"
@@ -264,7 +265,7 @@ export default function CommandPalette({
   };
 
   return (
-    <div className="cp-backdrop" onClick={onClose}>
+    <div className="cp-backdrop" {...useBackdropClose(onClose)}>
       <div className="cp" ref={cpRef} onClick={(e) => e.stopPropagation()}>
         <div className="cp-input">
           <Icon name="search" size={16} />
