@@ -928,6 +928,23 @@ fn is_link_only_text(text: &str, entities: &[TextEntity]) -> bool {
     text[byte_pos..].trim().is_empty()
 }
 
+/// The X "Article" title when the tweet is a bare article payload: no words
+/// of its own (an empty text, or nothing beyond its URL entities). Prose
+/// attached to the link is commentary and keeps the text; the full title
+/// card would need a per-tweet detail round-trip and stays out of scope.
+fn article_title_of<'a>(
+    tweet_obj: &'a serde_json::Value,
+    full_text: &str,
+    entities: &[TextEntity],
+) -> Option<&'a str> {
+    tweet_obj
+        .pointer("/article/article_results/result/title")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|_| full_text.trim().is_empty() || is_link_only_text(full_text, entities))
+}
+
 /// UTC date (`2026-09-13`) for a card's permalink label. UTC on purpose: the
 /// card is stored at ingest time, so a locally-rendered date would freeze one
 /// machine's time zone into the article forever (and make tests depend on the
@@ -1035,7 +1052,8 @@ fn nested_tweet(result: &serde_json::Value) -> Option<XNestedTweet> {
     let legacy = tweet_obj.get("legacy")?;
     let id = tweet_obj.get("rest_id").and_then(|v| v.as_str())?;
     let (full_text, entities, media) = text_source(tweet_obj, legacy);
-    if full_text.is_empty() {
+    let article_title = article_title_of(tweet_obj, &full_text, &entities);
+    if full_text.is_empty() && article_title.is_none() {
         return None;
     }
     let (author_name, handle) = result_author(tweet_obj);
@@ -1050,12 +1068,28 @@ fn nested_tweet(result: &serde_json::Value) -> Option<XNestedTweet> {
         // omits the author still links to the right tweet.
         None => format!("https://x.com/i/status/{id}"),
     };
+    // The nested card follows the same rendering rules as a top-level tweet:
+    // a bare article payload renders its linked title, prose attached to the
+    // link stays prose, everything else renders the text source's content.
+    let mut text = tweet_plain_text(&full_text, &entities);
+    if let Some(title) = article_title {
+        text = title.to_string();
+    }
+    let content_html = if let Some(title) = article_title {
+        format!(
+            r#"<a href="{}">{}</a>"#,
+            escape_html_text(&url),
+            escape_html_text(title)
+        )
+    } else {
+        render_tweet_html(&full_text, &entities, &media)
+    };
     Some(XNestedTweet {
         id: id.to_string(),
         handle,
         author_name,
-        content_html: render_tweet_html(&full_text, &entities, &media),
-        text: tweet_plain_text(&full_text, &entities),
+        content_html,
+        text,
         url,
         published_at,
         image_url: media.iter().find_map(|m| m.image_url.clone()),
@@ -1081,13 +1115,11 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
         .unwrap_or_else(|| entry_id.trim_start_matches("tweet-").to_string());
 
     let (full_text, text_entities, media) = text_source(tweet_obj, legacy);
-    // No text and no article: the entry is a stub the card cannot render
-    // (promoted shells and the like) — drop it as the tombstones above.
-    let has_article = tweet_obj
-        .pointer("/article/article_results/result/title")
-        .and_then(|t| t.as_str())
-        .is_some_and(|s| !s.trim().is_empty());
-    if full_text.is_empty() && !has_article {
+    // An empty text with no article behind it is a stub the card cannot
+    // render (promoted shells and the like) — drop it as the tombstones
+    // above; a bare article payload is kept for its title card.
+    let article_title = article_title_of(tweet_obj, &full_text, &text_entities);
+    if full_text.is_empty() && article_title.is_none() {
         return None;
     }
 
@@ -1105,16 +1137,6 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
         Some(r) => r.text.clone(),
         None => tweet_plain_text(&full_text, &text_entities),
     };
-
-    // An X "Article" tweet (long-form publishing) ships no inline text of its
-    // own — the payload is the title plus a cover; everything beyond that
-    // would need a per-tweet detail round-trip. The card is the title, linked.
-    let article_title = tweet_obj
-        .pointer("/article/article_results/result/title")
-        .and_then(|t| t.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter(|_| is_link_only_text(&full_text, &text_entities));
 
     if let Some(title) = article_title {
         text = title.to_string();
@@ -2182,6 +2204,83 @@ mod tests {
         let tweets = parse_user_tweets_json(&body, "jack").unwrap();
         assert_eq!(tweets.len(), 1);
         assert!(tweets[0].text.contains("note body"));
+    }
+
+    #[test]
+    fn retweeting_an_article_renders_the_linked_title_in_the_nested_card() {
+        // The nested article tweet follows the top-level rules: bare
+        // permalink + article title renders the linked title card, and the
+        // retweet snippet reads the title instead of a bare t.co link.
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-907", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "rest_id": "907",
+                        "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Display Name"}, "legacy": {"screen_name": "jack"}}}},
+                        "legacy": {
+                            "full_text": "RT @orig: https://t.co/art",
+                            "created_at": "Sun Sep 13 08:10:00 +0000 2026",
+                            "entities": {},
+                            "retweeted_status_result": {"result": {
+                                "rest_id": "900",
+                                "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Orig Name"}, "legacy": {"screen_name": "origauthor"}}}},
+                                "article": {"article_results": {"result": {"__typename": "TweetArticle", "title": "原文标题"}}},
+                                "legacy": {
+                                    "full_text": "https://t.co/art",
+                                    "created_at": "Sat Sep 12 10:00:00 +0000 2026",
+                                    "entities": {"urls": [{"url": "https://t.co/art", "expanded_url": "https://x.com/origauthor/status/900", "indices": [0, 16]}]}
+                                }
+                            }}}
+                        },
+                    }}}}
+                ]}
+            ]}}}}}}
+        )
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        assert_eq!(tweets.len(), 1);
+        let t = &tweets[0];
+        let nested = t.retweeted.as_ref().unwrap();
+        assert_eq!(nested.id, "900");
+        assert!(nested
+            .content_html
+            .contains("<a href=\"https://x.com/origauthor/status/900\">原文标题</a>"));
+        assert!(!nested.content_html.contains("t.co/art"));
+        assert_eq!(t.text, "原文标题");
+    }
+
+    #[test]
+    fn article_with_empty_text_still_renders_the_title_card() {
+        // An article payload with no text at all: the entry is kept (the
+        // article is the content) and the title card renders — the empty
+        // text must not blank the card down to author and date.
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-908", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "rest_id": "908",
+                        "article": {"article_results": {"result": {"__typename": "TweetArticle", "title": "空正文标题"}}},
+                        "legacy": {
+                            "full_text": "",
+                            "created_at": "Sun Sep 13 08:20:00 +0000 2026",
+                            "entities": {}
+                        }
+                    }}}}
+                    }
+                ]}
+            ]}}}}}}
+        )
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        println!("DEBUG empty-article tweets: {:?}", tweets.len());
+        assert_eq!(tweets.len(), 1);
+        let t = &tweets[0];
+        assert_eq!(t.text, "空正文标题");
+        assert!(t
+            .content_html
+            .contains("<a href=\"https://x.com/jack/status/908\">空正文标题</a>"));
     }
 
     #[test]

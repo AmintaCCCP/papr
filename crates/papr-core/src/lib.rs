@@ -9,6 +9,7 @@
 //! lives in the desktop app and is composed from the building blocks in
 //! [`ingestion`].
 
+#![recursion_limit = "512"]
 pub mod ai;
 pub mod db;
 pub mod error;
