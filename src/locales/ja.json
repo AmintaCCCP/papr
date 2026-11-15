@@ -392,7 +392,7 @@
     },
     "filters": {
       "title": "フィルタールール",
-      "intro": "ルールは新着記事が届くたびに実行され、保存時には一致する既存の記事にも適用されます。ノイズになるキーワードを除外したり、関心のある記事を自動で既読 / スター付きにできます。",
+      "intro": "ルールは新着記事が届くたびに実行されます。条件は「かつ / または」で組み合わせられ、一致した記事を除外・既読化・スター・文字列置換できます。保存時には一致する既存の記事にも同じ処理が適用されます。",
       "newRule": "新しいルール",
       "empty": "ルールがまだありません。",
       "untitled": "名称未設定のルール",
@@ -402,10 +402,7 @@
       "confirmSkipTitle": "既存の記事を削除しますか？",
       "confirmSkipMessage": "この「除外」ルールは保存済みの記事 {{count}} 件に一致します。保存するとそれらは完全に削除され、取り消せません。今後の新着記事は引き続きフィルタリングされます。",
       "confirmSkipConfirm": "削除して保存",
-      "needQuery": "キーワードを1つ以上入力してください",
       "namePlaceholder": "ルール名（任意）",
-      "queryPlaceholder": "キーワード（カンマ区切り）",
-      "matchIn": "対象",
       "thenLabel": "アクション",
       "scopeLabel": "適用先",
       "allFeeds": "すべてのフィード",
@@ -413,16 +410,40 @@
         "title": "タイトル",
         "author": "著者",
         "content": "本文",
-        "any": "すべて"
+        "any": "すべて",
+        "url": "URL"
       },
       "action": {
         "skip": "除外",
         "read": "既読にする",
-        "star": "スター"
+        "star": "スター",
+        "rewrite": "テキスト置換"
       },
       "preview": {
         "checking": "確認中…",
-        "count": "既存の記事 {{count}} 件に一致"
+        "count": "既存の記事 {{count}} 件に一致",
+        "invalid": "条件を評価できません（正規表現などの入力を確認してください）"
+      },
+      "whenLabel": "記事が次を満たすとき",
+      "and": "かつ",
+      "or": "または",
+      "addCondition": "条件を追加",
+      "addGroup": "条件グループを追加",
+      "valuePlaceholder": "値",
+      "regexPlaceholder": "正規表現（例: (?i)rust\\d）",
+      "rewritesTitle": "置換（完全一致・大文字小文字を区別）",
+      "rewriteFrom": "検索",
+      "rewriteTo": "置換後",
+      "addRewrite": "置換を追加",
+      "rewritesHint": "置換はタイトル・概要・本文に適用されます。保存時に一致する既存の記事も書き換えられます。",
+      "needCondition": "完成した条件を 1 つ以上入力してください",
+      "needRewrite": "各置換の検索テキストを入力してください",
+      "operator": {
+        "contains": "を含む",
+        "not_contains": "を含まない",
+        "eq": "が一致",
+        "not_eq": "が一致しない",
+        "regex": "正規表現に一致"
       }
     },
     "sync": {
@@ -818,7 +839,6 @@
     "emptyFolderName": "フォルダー名を空にはできません",
     "tagNameExists": "同じ名前のタグがすでに存在します",
     "folderNameExists": "同じ名前のフォルダーがすでに存在します",
-    "emptyRuleQuery": "ルールにキーワードを1つ以上入力してください",
     "noFeedFound": "その URL ではフィードが見つかりませんでした",
     "responseTooLarge": "サーバーの応答が大きすぎます",
     "alreadySubscribed": "このフィードはすでに購読済みです",
@@ -876,7 +896,14 @@
     "feedUrlChanged": "このフィードは別のウィンドウで編集されました — ダイアログを開き直してから変更してください",
     "foloInvalidRef": "Folo リストの参照ではありません — app.folo.is/share/lists/… 形式の共有リンクか、数字のみの ID を貼り付けてください",
     "foloListNotFound": "Folo にそのリストは存在しません — リンクが間違っているか、リストが削除された可能性があります",
-    "foloTokenRejected": "Folo がトークンを拒否しました — 設定 → 購読 で確認して再試行してください"
+    "foloTokenRejected": "Folo がトークンを拒否しました — 設定 → 購読 で確認して再試行してください",
+    "emptyRuleCondition": "ルールに完成した条件を 1 つ以上入力してください",
+    "badRuleCondition": "ルールの条件が無効です：不明なフィールド / 演算子、空の値、またはコンパイルできない正規表現",
+    "badRuleAction": "不明なルールアクション",
+    "needRuleRewrite": "置換ルールには少なくとも 1 組の置換ペアが必要です",
+    "emptyRuleRewrite": "置換ペアの検索テキストは空にできません",
+    "tooManyRuleConditions": "条件の数が上限を超えています",
+    "tooManyRuleRewrites": "置換ペアの数が上限を超えています"
   },
   "highlights": {
     "toolbarLabel": "ハイライトの色",

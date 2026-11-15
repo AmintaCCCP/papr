@@ -111,7 +111,32 @@ pub struct Tag {
     pub article_count: i64,
 }
 
-/// A keyword filter applied to incoming articles at ingestion time.
+/// One matching condition inside a rule's When-document: `value` tested
+/// against one article `field` with one `operator` (see [`RULE_FIELDS`] /
+/// [`RULE_OPERATORS`]). Stored as JSON — strings, not enums, so a hand-edited
+/// database row with an unknown value degrades to "never matches" instead of
+/// failing to load; writes are validated against the constants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCondition {
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+}
+
+/// A literal `from` → `to` replacement applied to an article's text by a rule
+/// with the `rewrite` action. Deliberately *literal* (no regex): the Rust
+/// ingestion path and the SQL backfill path must replace identically, and
+/// SQLite's `REPLACE()` is literal — regex replacement would need two
+/// implementations kept in lockstep for no real gain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleRewrite {
+    pub from: String,
+    pub to: String,
+}
+
+/// A user-defined filter applied to incoming articles at ingestion time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -120,13 +145,127 @@ pub struct Rule {
     pub enabled: bool,
     /// `None` applies the rule to every feed; otherwise scoped to one feed.
     pub feed_id: Option<i64>,
-    /// Which text to match: `title` | `author` | `content` | `any`.
-    pub field: String,
-    /// Comma-separated keywords; the rule fires if any one is a substring.
-    pub query: String,
-    /// What to do on a match: `skip` | `read` | `star`.
+    /// The When-document: groups of [`RuleCondition`]s, ANDed within a group,
+    /// ORed across groups — the rule fires when *every* condition of *any one*
+    /// group matches. Legacy rules (v≤23) had no stored document; `row_to_rule`
+    /// synthesises one from their `field`/`query` keyword columns.
+    pub conditions: Vec<Vec<RuleCondition>>,
+    /// What to do on a match: `skip` | `read` | `star` | `rewrite`.
     pub action: String,
+    /// Literal from→to replacements applied when `action` is `rewrite`.
+    pub rewrites: Vec<RuleRewrite>,
     pub position: i64,
+}
+
+/// The article fields a [`RuleCondition`] can test.
+pub const RULE_FIELDS: &[&str] = &["title", "author", "content", "any", "url"];
+
+/// The operators a [`RuleCondition`] can use. `contains` / `eq` /
+/// `not_contains` / `not_eq` fold case (Unicode-aware, like ingestion's
+/// `to_lowercase()`); `regex` matches the raw text — case-insensitivity is the
+/// pattern's own `(?i)` flag, since lowercasing a pattern would rewrite
+/// classes like `\D`.
+pub const RULE_OPERATORS: &[&str] =
+    &["contains", "not_contains", "eq", "not_eq", "regex"];
+
+/// What a rule can do when it fires.
+pub const RULE_ACTIONS: &[&str] = &["skip", "read", "star", "rewrite"];
+
+impl RuleCondition {
+    /// True when the condition is well-formed enough to save: a known field
+    /// and operator, a non-empty value (an empty needle would either match
+    /// everything — `contains` — or be meaningless), and, for `regex`, a
+    /// pattern that compiles.
+    pub fn is_valid(&self) -> bool {
+        if !RULE_FIELDS.contains(&self.field.as_str())
+            || !RULE_OPERATORS.contains(&self.operator.as_str())
+            || self.value.trim().is_empty()
+        {
+            return false;
+        }
+        if self.operator == "regex" {
+            return RuleCondition::compile(&self.value).is_some();
+        }
+        true
+    }
+
+    /// Compile `pattern`, memoised — the same patterns are re-tested for every
+    /// incoming article, and the SQL `regexp()` helper shares this cache so
+    /// both sides of the match see identical semantics.
+    pub fn compile(pattern: &str) -> Option<regex::Regex> {
+        use std::collections::HashMap;
+        use std::sync::{LazyLock, Mutex};
+        static CACHE: LazyLock<Mutex<HashMap<String, Option<regex::Regex>>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        // The cache is keyed by raw pattern; rules carry a handful at most.
+        // Preview typing can flood it with one-off patterns, so the cache is
+        // capped — the cap is generous (1024) because a clear costs one
+        // recompile per live rule pattern, and entries are tiny.
+        if cache.len() > 1024 {
+            cache.clear();
+        }
+        cache
+            .entry(pattern.to_string())
+            .or_insert_with(|| regex::Regex::new(pattern).ok())
+            .clone()
+    }
+}
+
+impl RuleRewrite {
+    /// True when the replacement is saveable: a non-empty `from` (an empty
+    /// needle would rewrite every character boundary).
+    pub fn is_valid(&self) -> bool {
+        !self.from.trim().is_empty()
+    }
+}
+
+/// Validate a draft rule's When-document. Returns the first problem found as a
+/// stable error code the frontend localises.
+pub fn validate_conditions(
+    conditions: &[Vec<RuleCondition>],
+) -> Result<(), &'static str> {
+    // At least one condition somewhere, and no group left empty: an empty
+    // group is vacuously true to `all()`, so `[[valid], []]` would otherwise
+    // match *everything* at ingestion while the SQL side (which skips empty
+    // groups) previews a far smaller set.
+    if conditions.iter().any(|g| g.is_empty()) || conditions.is_empty() {
+        return Err("emptyRuleCondition");
+    }
+    if conditions.len() > 32 || conditions.iter().any(|g| g.len() > 32) {
+        return Err("tooManyRuleConditions");
+    }
+    for group in conditions {
+        for c in group {
+            if !c.is_valid() {
+                return Err("badRuleCondition");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a draft rule's full Then-parts (action + rewrites) on top of its
+/// When-document.
+pub fn validate_rule_parts(
+    conditions: &[Vec<RuleCondition>],
+    action: &str,
+    rewrites: &[RuleRewrite],
+) -> Result<(), &'static str> {
+    validate_conditions(conditions)?;
+    if !RULE_ACTIONS.contains(&action) {
+        return Err("badRuleAction");
+    }
+    if action == "rewrite" && rewrites.is_empty() {
+        return Err("needRuleRewrite");
+    }
+    if rewrites.len() > 32 {
+        return Err("tooManyRuleRewrites");
+    }
+    if rewrites.iter().any(|r| !r.is_valid()) {
+        return Err("emptyRuleRewrite");
+    }
+    Ok(())
 }
 
 /// A row in the article list pane. Keeps the payload small (no full HTML body).

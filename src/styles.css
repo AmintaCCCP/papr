@@ -3099,6 +3099,81 @@ button { font-family: inherit; }
 }
 .rule-card-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
+/* When/Then rule editor: condition groups (AND within, OR across). */
+.rule-when {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rule-when-title,
+.rule-rewrites .rule-when-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted-2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.rule-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px dashed var(--hair-strong);
+  border-radius: 8px;
+}
+.rule-group-op,
+.rule-cond-op {
+  align-self: flex-start;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--hover);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.rule-cond-row {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) minmax(110px, auto) 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.rule-cond-row .rule-cond-value { width: 100%; box-sizing: border-box; }
+.rule-add {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 5px;
+}
+.rule-add:hover { color: var(--ink-2); background: var(--hover); }
+.rule-rewrites {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rule-rewrite-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.rule-rewrite-arrow { color: var(--muted); font-size: 13px; }
+.rule-rewrites-hint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin: 0;
+}
+
 /* Integration cards + custom-integration editor (integrations section) */
 .integ-card { margin-bottom: 10px; }
 .integ-card .s-service { margin-bottom: 0; }

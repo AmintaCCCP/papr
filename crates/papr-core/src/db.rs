@@ -327,6 +327,19 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
         // key as the body: one `ai_translate` run fills both, so `NULL` simply
         // means the row predates title translation (the original title shows).
         M::up("ALTER TABLE articles ADD COLUMN translated_title TEXT;"),
+        // v24 — advanced rules. Each rule gains a stored When-document
+        // (`conditions`: JSON groups of ANDed conditions, ORed across groups)
+        // and a `rewrite_rules` list for the `rewrite` action (literal
+        // from→to replacements). The legacy keyword columns stay: rows with a
+        // NULL document synthesise one from `field` + `query` at read time,
+        // and writes keep those columns filled as a flat, human-readable
+        // summary for `sqlite3` inspection (values comma-joined, so a value
+        // containing a comma is ambiguous there — informational only). The
+        // JSON document is the single source of truth for matching.
+        M::up(
+            "ALTER TABLE rules ADD COLUMN conditions TEXT;
+             ALTER TABLE rules ADD COLUMN rewrite_rules TEXT;",
+        ),
     ])
 });
 
@@ -350,6 +363,29 @@ fn register_functions(conn: &Connection) -> AppResult<()> {
             // staying total here keeps the function safe to use bare.
             let value: Option<String> = ctx.get(0)?;
             Ok(value.map(|s| s.to_lowercase()))
+        },
+    )?;
+    // `regexp(pattern, text)` backs the rules' `regex` operator on the SQL
+    // side (`preview_rule` / `apply_rule_to_existing`). Compilation goes
+    // through the same memoised `RuleCondition::compile` the ingestion matcher
+    // uses, so a pattern means exactly the same thing in both places; an
+    // invalid pattern yields false (never matches) rather than an error — the
+    // matcher treats it the same way, and save-time validation rejects it.
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            // NULL in → false out, both for the pattern and the text: an
+            // unusable input "never matches", mirroring how an invalid
+            // pattern behaves below.
+            let pattern: Option<String> = ctx.get(0)?;
+            let text: Option<String> = ctx.get(1)?;
+            let (Some(pattern), Some(text)) = (pattern, text) else {
+                return Ok(false);
+            };
+            Ok(RuleCondition::compile(&pattern)
+                .is_some_and(|re| re.is_match(&text)))
         },
     )?;
     Ok(())
@@ -1522,33 +1558,102 @@ pub struct NewArticle {
 }
 
 /// True if `rule` (scoped to `feed_id`) matches the incoming article `a`.
-/// The query is a comma-separated keyword list; any substring hit fires it.
+///
+/// The When-document is a group list: every condition of **any one** group
+/// must match (AND within, OR across). An empty or unparsable document matches
+/// nothing — such rows can't be saved through the API, so only hand-edited
+/// databases can hold them, and staying inert beats matching everything.
 fn rule_matches(rule: &Rule, feed_id: i64, a: &NewArticle) -> bool {
     if rule.feed_id.is_some_and(|fid| fid != feed_id) {
         return false;
     }
+    if rule.conditions.is_empty() {
+        return false;
+    }
+    // An empty group doesn't participate — `all()` over no conditions is
+    // vacuously true, which would turn a stray empty group (only reachable
+    // via a hand-edited row; save-time validation rejects it) into "matches
+    // everything". Same policy as `rule_match_where`, which skips empty
+    // groups, so preview / backfill counts stay identical to ingestion.
+    rule.conditions
+        .iter()
+        .filter(|group| !group.is_empty())
+        .any(|group| group.iter().all(|c| condition_matches(c, a)))
+}
+
+/// True if one condition holds for article `a`. Each field checks each of its
+/// text sources *independently* — a needle must lie wholly within one of them.
+/// Concatenating the sources would let a needle straddle a boundary (a title
+/// ending in "machine" + a body starting with "learning" matching "machine
+/// learning"), so live ingestion would act on articles the SQL preview never
+/// counted. Case handling mirrors `condition_where`: the four substring /
+/// equality operators fold case (Unicode-aware `to_lowercase()`, matching the
+/// SQL side's `unicode_lower()`), while `regex` sees the raw text.
+fn condition_matches(c: &RuleCondition, a: &NewArticle) -> bool {
+    // A whitespace-only needle matches nothing, exactly like the SQL side's
+    // `condition_where` (which emits a literal `0` for one). Save-time
+    // validation rejects such values; this keeps hand-edited rows symmetric.
+    if c.value.trim().is_empty() {
+        return false;
+    }
     let author = a.author.as_deref().unwrap_or("");
-    // The fields the rule searches. `any` checks each field *independently*
-    // (mirroring `preview_rule`'s per-column LIKE): a keyword must lie wholly
-    // within one field. Concatenating the fields would let a keyword straddle
-    // a field boundary (e.g. a title ending in "machine" + a body starting
-    // with "learning" matching "machine learning"), so live ingestion would
-    // act on articles the rule preview never counted.
-    let fields: Vec<String> = match rule.field.as_str() {
-        "author" => vec![author.to_lowercase()],
-        "content" => vec![a.body_text.to_lowercase()],
-        "any" => vec![
-            a.title.to_lowercase(),
-            author.to_lowercase(),
-            a.body_text.to_lowercase(),
-        ],
-        _ => vec![a.title.to_lowercase()],
+    let url = a.url.as_deref().unwrap_or("");
+    let sources: &[&str] = match c.field.as_str() {
+        "title" => &[a.title.as_str()],
+        "author" => &[author],
+        "content" => &[a.body_text.as_str()],
+        "url" => &[url],
+        "any" => &[a.title.as_str(), author, a.body_text.as_str()],
+        // Unknown field (hand-edited row): never matches.
+        _ => return false,
     };
-    rule.query
-        .split(',')
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| !t.is_empty())
-        .any(|term| fields.iter().any(|h| h.contains(&term)))
+    match c.operator.as_str() {
+        "contains" => {
+            let needle = c.value.to_lowercase();
+            // A needle with an embedded NUL stays inert: SQLite's LIKE treats
+            // its pattern as NUL-terminated, so the SQL twin could silently
+            // widen `%x\0y%` into `%` (match everything). Rust's `contains`
+            // keeps NULs literal — inert on both sides is the only way they
+            // can agree.
+            !needle.is_empty()
+                && !needle.contains('\0')
+                && sources.iter().any(|h| h.to_lowercase().contains(&needle))
+        }
+        // Negations quantify over *all* sources: "no source contains" /
+        // "no source equals", not "some source doesn't".
+        "not_contains" => {
+            let needle = c.value.to_lowercase();
+            !needle.is_empty()
+                && !needle.contains('\0')
+                && sources.iter().all(|h| !h.to_lowercase().contains(&needle))
+        }
+        "eq" => {
+            let needle = c.value.to_lowercase();
+            sources.iter().any(|h| h.to_lowercase() == needle)
+        }
+        "not_eq" => {
+            let needle = c.value.to_lowercase();
+            sources.iter().all(|h| h.to_lowercase() != needle)
+        }
+        // Regex runs on the raw text — lowercasing the haystack would break
+        // patterns like `[A-Z]`, and lowercasing the pattern would rewrite
+        // classes like `\D`. Case-insensitivity is the pattern's `(?i)` flag.
+        "regex" => RuleCondition::compile(&c.value)
+            .is_some_and(|re| sources.iter().any(|h| re.is_match(h))),
+        // Unknown operator (hand-edited row): never matches.
+        _ => false,
+    }
+}
+
+/// The rule effects [`article_precheck`] collects for one article: the read /
+/// starred state the insert should start with, and the literal replacements
+/// (from every matching `rewrite` rule, applied in rule order) to run on the
+/// article before it lands.
+#[derive(Debug, Default, Clone)]
+pub struct RuleEffects {
+    pub read: bool,
+    pub starred: bool,
+    pub rewrites: Vec<RuleRewrite>,
 }
 
 /// Insert an article if it is new (by feed_id + guid). Returns `true` only when
@@ -1564,7 +1669,10 @@ fn rule_matches(rule: &Rule, feed_id: i64, a: &NewArticle) -> bool {
 /// When `dedup` is on, an article whose URL already exists (in any feed) is
 /// skipped — collapsing the same story pushed by multiple feeds. Enabled
 /// `rules` are evaluated first: a `skip` match drops the article entirely,
-/// while `read` / `star` matches pre-set the article's state on insert.
+/// `read` / `star` matches pre-set the article's state on insert, and matching
+/// `rewrite` rules replace literal text in the article before it lands (rules
+/// match the *original* text — rewrites compose in rule order and never
+/// influence which rules fire).
 pub fn upsert_article(
     conn: &Connection,
     feed_id: i64,
@@ -1572,31 +1680,65 @@ pub fn upsert_article(
     dedup: bool,
     rules: &[Rule],
 ) -> AppResult<bool> {
-    let Some((start_read, start_starred)) = article_precheck(conn, feed_id, a, dedup, rules)?
-    else {
+    let Some(effects) = article_precheck(conn, feed_id, a, dedup, rules)? else {
         return Ok(false);
     };
     // The article row, its FTS index entry, and its enclosures must land
     // together — a partial insert leaves an unsearchable or enclosure-less
     // article. Wrap them in a transaction so a mid-loop failure rolls back.
     let tx = conn.unchecked_transaction()?;
-    let inserted = insert_article_row(&tx, feed_id, a, start_read, start_starred)?;
+    let inserted = if effects.rewrites.is_empty() {
+        insert_article_row(&tx, feed_id, a, effects.read, effects.starred)?
+    } else {
+        let mut rewritten = a.clone();
+        apply_rewrites(&mut rewritten, &effects.rewrites);
+        insert_article_row(&tx, feed_id, &rewritten, effects.read, effects.starred)?
+    };
     tx.commit()?;
     Ok(inserted)
 }
 
+/// Apply literal from→to replacements to an article's user-visible text:
+/// title, summary, HTML body and plain-text body. Only the text is touched —
+/// URLs and guids stay stable so dedup / tombstones keep working. Case-
+/// sensitive on purpose: it matches SQLite's `REPLACE()` used by the
+/// existing-article backfill, so a rewrite means the same thing in both paths.
+pub fn apply_rewrites(a: &mut NewArticle, rewrites: &[RuleRewrite]) {
+    for rw in rewrites {
+        if rw.from.is_empty() {
+            // Rejected at save time; a hand-edited empty `from` must not
+            // sprinkle `to` between every character (`str::replace` would).
+            continue;
+        }
+        if rw.from == rw.to {
+            // A no-op pair: skipping it here keeps the ingestion path in
+            // lockstep with the backfill, where a no-op pair must not count
+            // a row as changed or invalidate its derivative caches.
+            continue;
+        }
+        a.title = a.title.replace(&rw.from, &rw.to);
+        a.summary = a.summary.take().map(|s| s.replace(&rw.from, &rw.to));
+        a.content_html = a
+            .content_html
+            .take()
+            .map(|s| s.replace(&rw.from, &rw.to));
+        a.body_text = a.body_text.replace(&rw.from, &rw.to);
+    }
+}
+
 /// The decision half of [`upsert_article`]: dedup, retention tombstones and
 /// filter rules, all pure reads. `None` = skip the article outright (a `skip`
-/// rule, a tombstoned or deduplicated guid); `Some((read, starred))` carries
-/// the rule-tinted start state for the insert half. Callers that already hold
-/// a transaction run this first, then [`insert_article_row`] inside it.
+/// rule, a tombstoned or deduplicated guid); `Some(RuleEffects)` carries the
+/// rule-tinted start state and the rewrites for the insert half. Callers that
+/// already hold a transaction run this first, then [`insert_article_row`]
+/// inside it.
 pub fn article_precheck(
     conn: &Connection,
     feed_id: i64,
     a: &NewArticle,
     dedup: bool,
     rules: &[Rule],
-) -> AppResult<Option<(bool, bool)>> {
+) -> AppResult<Option<RuleEffects>> {
     if dedup {
         if let Some(url) = a.url.as_deref().filter(|u| !u.is_empty()) {
             let exists: bool = conn.query_row(
@@ -1623,20 +1765,22 @@ pub fn article_precheck(
     if tombstoned {
         return Ok(None);
     }
-    // Apply filter rules: skip wins outright; read / star tint the new row.
-    let (mut start_read, mut start_starred) = (false, false);
+    // Apply filter rules: skip wins outright; read / star tint the new row;
+    // every matching rewrite rule contributes its replacements.
+    let mut effects = RuleEffects::default();
     for rule in rules {
         if !rule_matches(rule, feed_id, a) {
             continue;
         }
         match rule.action.as_str() {
             "skip" => return Ok(None),
-            "read" => start_read = true,
-            "star" => start_starred = true,
+            "read" => effects.read = true,
+            "star" => effects.starred = true,
+            "rewrite" => effects.rewrites.extend(rule.rewrites.iter().cloned()),
             _ => {}
         }
     }
-    Ok(Some((start_read, start_starred)))
+    Ok(Some(effects))
 }
 
 /// The write half of [`upsert_article`]: the article row, its FTS index entry
@@ -2393,19 +2537,82 @@ pub fn tags_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<Tag
 // ─────────────────────────── filter rules ───────────────────────────
 
 fn row_to_rule(r: &rusqlite::Row) -> rusqlite::Result<Rule> {
+    let field: String = r.get(4)?;
+    let query: String = r.get(5)?;
+    // A SQL NULL document means a pre-v24 keyword rule; a non-NULL value that
+    // fails to parse means the document was corrupted (hand-edited, partial
+    // write) and must NOT be resurrected from the `field`/`query` summary —
+    // those columns are derived from the document, so rebuilding from them
+    // would silently change what the rule matches (a corrupted "title
+    // contains rust AND author eq bob" whose summary is `any / rust,bob`
+    // would start skipping every Rust article again). Corrupt → inert until
+    // the rule is re-saved; matching treats an empty document as no-match.
+    let conditions = match r.get::<_, Option<String>>(8)? {
+        None => query
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|term| {
+                vec![RuleCondition {
+                    field: field.clone(),
+                    operator: "contains".to_string(),
+                    value: term.to_string(),
+                }]
+            })
+            .collect(),
+        Some(doc) => serde_json::from_str(&doc).unwrap_or_else(|e| {
+            log::warn!(
+                "rule {}: conditions JSON is corrupt ({e}); the rule matches nothing until it is re-saved",
+                r.get::<_, i64>(0).unwrap_or_default()
+            );
+            Vec::new()
+        }),
+    };
+    let rewrites = parse_rewrites(r.get(9)?);
     Ok(Rule {
         id: r.get(0)?,
         name: r.get(1)?,
         enabled: r.get(2)?,
         feed_id: r.get(3)?,
-        field: r.get(4)?,
-        query: r.get(5)?,
+        conditions,
         action: r.get(6)?,
+        rewrites,
         position: r.get(7)?,
     })
 }
 
-const RULE_COLS: &str = "id, name, enabled, feed_id, field, query, action, position";
+/// Parse a stored rewrite list (JSON `Vec<RuleRewrite>`); anything malformed
+/// degrades to "no rewrites" like a corrupt conditions document.
+fn parse_rewrites(json: Option<String>) -> Vec<RuleRewrite> {
+    json.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+const RULE_COLS: &str =
+    "id, name, enabled, feed_id, field, query, action, position, conditions, rewrite_rules";
+
+/// Flatten a When-document into the legacy `field`/`query` summary columns:
+/// the first condition's field (or `any` when fields are mixed) and every
+/// condition value comma-joined. Purely informational — matching only reads
+/// the JSON document, and a value containing a comma is ambiguous here —
+/// but it keeps `sqlite3` inspection of the `rules` table readable.
+fn keyword_summary(conditions: &[Vec<RuleCondition>]) -> (String, String) {
+    let flat: Vec<&RuleCondition> = conditions.iter().flatten().collect();
+    let Some(first) = flat.first() else {
+        return ("title".to_string(), String::new());
+    };
+    let field = if flat.iter().all(|c| c.field == first.field) {
+        first.field.clone()
+    } else {
+        "any".to_string()
+    };
+    let query = flat
+        .iter()
+        .map(|c| c.value.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    (field, query)
+}
 
 /// Every rule, enabled or not, ordered for the settings list.
 pub fn list_rules(conn: &Connection) -> AppResult<Vec<Rule>> {
@@ -2433,9 +2640,9 @@ pub fn create_rule(
     conn: &Connection,
     name: &str,
     feed_id: Option<i64>,
-    field: &str,
-    query: &str,
+    conditions: &[Vec<RuleCondition>],
     action: &str,
+    rewrites: &[RuleRewrite],
 ) -> AppResult<i64> {
     // Position the new rule at the end. `MAX(position)+1` — not `COUNT(*)` —
     // is required: deleting a rule from the middle leaves a gap, so a fresh
@@ -2449,10 +2656,20 @@ pub fn create_rule(
         [],
         |r| r.get(0),
     )?;
+    let (field, query) = keyword_summary(conditions);
     conn.execute(
-        "INSERT INTO rules(name, feed_id, field, query, action, position)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![name, feed_id, field, query, action, next],
+        "INSERT INTO rules(name, feed_id, field, query, action, position, conditions, rewrite_rules)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            name,
+            feed_id,
+            field,
+            query,
+            action,
+            next,
+            serde_json::to_string(conditions).unwrap_or_default(),
+            serde_json::to_string(rewrites).unwrap_or_default(),
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -2464,15 +2681,27 @@ pub fn update_rule(
     name: &str,
     enabled: bool,
     feed_id: Option<i64>,
-    field: &str,
-    query: &str,
+    conditions: &[Vec<RuleCondition>],
     action: &str,
+    rewrites: &[RuleRewrite],
 ) -> AppResult<()> {
+    let (field, query) = keyword_summary(conditions);
     conn.execute(
         "UPDATE rules SET name = ?2, enabled = ?3, feed_id = ?4,
-                          field = ?5, query = ?6, action = ?7
+                          field = ?5, query = ?6, action = ?7,
+                          conditions = ?8, rewrite_rules = ?9
          WHERE id = ?1",
-        params![id, name, enabled, feed_id, field, query, action],
+        params![
+            id,
+            name,
+            enabled,
+            feed_id,
+            field,
+            query,
+            action,
+            serde_json::to_string(conditions).unwrap_or_default(),
+            serde_json::to_string(rewrites).unwrap_or_default(),
+        ],
     )?;
     Ok(())
 }
@@ -2482,55 +2711,42 @@ pub fn delete_rule(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// Build the `WHERE` fragment (and its bind values) that selects the articles a
-/// rule matches: one `unicode_lower(col) LIKE ?` per (keyword × searched
-/// column), OR-joined, optionally scoped to one feed. Columns are *unaliased*
-/// so the fragment slots straight into a bare `SELECT … FROM articles`,
-/// `UPDATE articles` or `DELETE FROM articles`. Returns `None` when the query
-/// holds no usable keywords (a no-op rule), so callers can short-circuit.
+/// Build the `WHERE` fragment (and its bind values) that selects the articles
+/// a rule's When-document matches, optionally scoped to one feed. Columns are
+/// *unaliased* so the fragment slots straight into a bare `SELECT … FROM
+/// articles`, `UPDATE articles` or `DELETE FROM articles`. Returns `None` when
+/// the document holds no usable group (a no-op rule), so callers can
+/// short-circuit.
 ///
 /// `preview_rule` (count + samples) and `apply_rule_to_existing` (act) share
 /// this builder so the number the preview shows is exactly the set the apply
-/// touches. LIKE wildcards in a keyword are escaped so a literal `%` / `_`
-/// can't widen the match; the column side is folded with `unicode_lower` (not
-/// SQLite's ASCII-only `LOWER`) so it matches the Unicode-aware
-/// `to_lowercase()` `rule_matches` applies at ingestion — otherwise a keyword
-/// like `café` would be counted here but its `CAFÉ` articles missed, diverging
-/// the preview/apply from live ingestion.
+/// touches. Semantics mirror `condition_matches` line for line: `unicode_lower`
+/// (not SQLite's ASCII-only `LOWER`) reproduces the Unicode-aware
+/// `to_lowercase()` the ingestion matcher folds with — otherwise a needle like
+/// `café` would be counted here but its `CAFÉ` articles missed, diverging the
+/// preview/apply from live ingestion; `regexp(?, col)` shares the memoised
+/// compiler, and negations AND their NOT-tests across all of a field's
+/// columns exactly as the matcher quantifies over all sources.
 fn rule_match_where(
-    field: &str,
-    query: &str,
+    conditions: &[Vec<RuleCondition>],
     feed_id: Option<i64>,
 ) -> Option<(String, Vec<Value>)> {
-    let terms: Vec<String> = query
-        .split(',')
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| !t.is_empty())
+    let mut binds: Vec<Value> = Vec::new();
+    let groups: Vec<String> = conditions
+        .iter()
+        .filter(|g| !g.is_empty())
+        .map(|group| {
+            let parts: Vec<String> = group
+                .iter()
+                .map(|c| condition_where(c, &mut binds))
+                .collect();
+            format!("({})", parts.join(" AND "))
+        })
         .collect();
-    if terms.is_empty() {
+    if groups.is_empty() {
         return None;
     }
-    let cols: &[&str] = match field {
-        "author" => &["author"],
-        "content" => &["body_text"],
-        "any" => &["title", "author", "body_text"],
-        _ => &["title"],
-    };
-    let mut ors: Vec<String> = Vec::new();
-    let mut binds: Vec<Value> = Vec::new();
-    for term in &terms {
-        let escaped = term
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        for col in cols {
-            ors.push(format!(
-                "unicode_lower(COALESCE({col},'')) LIKE ? ESCAPE '\\'"
-            ));
-            binds.push(Value::Text(format!("%{escaped}%")));
-        }
-    }
-    let mut where_sql = format!("({})", ors.join(" OR "));
+    let mut where_sql = format!("({})", groups.join(" OR "));
     if let Some(fid) = feed_id {
         where_sql.push_str(" AND feed_id = ?");
         binds.push(Value::Integer(fid));
@@ -2538,16 +2754,84 @@ fn rule_match_where(
     Some((where_sql, binds))
 }
 
+/// The SQL for one condition, pushing its bind values onto `binds`. Unknown
+/// fields/operators and empty needles produce a literal `0` — the SQL twin of
+/// `condition_matches` returning false, keeping hand-edited rows inert on both
+/// sides. Within one condition the field's columns combine by the operator's
+/// quantifier: positive operators (`contains`, `eq`, `regex`) OR across them
+/// ("some column matches"), negations (`not_contains`, `not_eq`) AND across
+/// them ("no column matches").
+fn condition_where(c: &RuleCondition, binds: &mut Vec<Value>) -> String {
+    if c.value.trim().is_empty() {
+        return "0".to_string();
+    }
+    let cols: &[&str] = match c.field.as_str() {
+        "title" => &["title"],
+        "author" => &["author"],
+        "content" => &["body_text"],
+        "url" => &["url"],
+        "any" => &["title", "author", "body_text"],
+        _ => return "0".to_string(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    match c.operator.as_str() {
+        "contains" | "not_contains" => {
+            // SQLite may truncate a LIKE pattern at an embedded NUL, which
+            // would silently widen the match; keep such needles inert here
+            // exactly as `condition_matches` does (eq / not_eq / regex don't
+            // use LIKE and are unaffected).
+            if c.value.contains('\0') {
+                return "0".to_string();
+            }
+            let escaped = c.value.to_lowercase();
+            let escaped = escaped
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            for col in cols {
+                binds.push(Value::Text(format!("%{escaped}%")));
+                let neg = if c.operator == "not_contains" { "NOT " } else { "" };
+                parts.push(format!(
+                    "unicode_lower(COALESCE({col},'')) {neg}LIKE ? ESCAPE '\\'"
+                ));
+            }
+        }
+        "eq" | "not_eq" => {
+            for col in cols {
+                binds.push(Value::Text(c.value.to_lowercase()));
+                let neg = if c.operator == "not_eq" { "!=" } else { "=" };
+                parts.push(format!("unicode_lower(COALESCE({col},'')) {neg} ?"));
+            }
+        }
+        "regex" => {
+            for col in cols {
+                binds.push(Value::Text(c.value.clone()));
+                parts.push(format!("regexp(?, COALESCE({col},''))"));
+            }
+        }
+        _ => return "0".to_string(),
+    }
+    let joiner = if c.operator.starts_with("not_") {
+        " AND "
+    } else {
+        " OR "
+    };
+    if parts.len() == 1 {
+        parts.pop().unwrap()
+    } else {
+        format!("({})", parts.join(joiner))
+    }
+}
+
 /// Preview how a draft rule would behave: the number of *already-stored*
-/// articles its keywords match, plus a handful of recent sample titles.
+/// articles its When-document matches, plus a handful of recent sample titles.
 /// Lets the user sanity-check a rule before saving it.
 pub fn preview_rule(
     conn: &Connection,
     feed_id: Option<i64>,
-    field: &str,
-    query: &str,
+    conditions: &[Vec<RuleCondition>],
 ) -> AppResult<(i64, Vec<String>)> {
-    let Some((where_sql, binds)) = rule_match_where(field, query, feed_id) else {
+    let Some((where_sql, binds)) = rule_match_where(conditions, feed_id) else {
         return Ok((0, Vec::new()));
     };
     let count: i64 = conn.query_row(
@@ -2576,28 +2860,152 @@ pub fn preview_rule(
 /// and the `articles_fts_ad` trigger keep dependent rows and the FTS index in
 /// sync, the same path retention cleanup relies on. `read` / `star` set the
 /// matching flag and skip rows that already carry it, so the returned count is
-/// the number of rows actually changed.
+/// the number of rows actually changed — and so does `rewrite`, whose
+/// changed-row set is tracked explicitly (`INSTR` containment, the same
+/// literal containment `REPLACE()` applies). `rewrite` replaces literal from→to
+/// pairs in the matched articles' text (title / summary / HTML body / plain
+/// body), the stored twin of [`apply_rewrites`] at ingestion; no UPDATE
+/// trigger keeps `articles_fts` fresh, so the matched rows' FTS entries are
+/// rebuilt from the updated columns afterwards.
 pub fn apply_rule_to_existing(
     conn: &Connection,
     feed_id: Option<i64>,
-    field: &str,
-    query: &str,
+    conditions: &[Vec<RuleCondition>],
     action: &str,
+    rewrites: &[RuleRewrite],
 ) -> AppResult<usize> {
-    let Some((where_sql, binds)) = rule_match_where(field, query, feed_id) else {
+    let Some((where_sql, binds)) = rule_match_where(conditions, feed_id) else {
         return Ok(0);
     };
-    let sql = match action {
-        "skip" => format!("DELETE FROM articles WHERE {where_sql}"),
-        "read" => {
-            format!("UPDATE articles SET is_read = 1 WHERE ({where_sql}) AND is_read = 0")
+    match action {
+        "skip" => {
+            let sql = format!("DELETE FROM articles WHERE {where_sql}");
+            Ok(conn.execute(&sql, params_from_iter(binds))?)
         }
-        "star" => {
-            format!("UPDATE articles SET is_starred = 1 WHERE ({where_sql}) AND is_starred = 0")
+        "read" | "star" => {
+            let flag = if action == "read" { "is_read" } else { "is_starred" };
+            let sql = format!(
+                "UPDATE articles SET {flag} = 1 WHERE ({where_sql}) AND {flag} = 0"
+            );
+            Ok(conn.execute(&sql, params_from_iter(binds))?)
         }
-        _ => return Ok(0),
-    };
-    Ok(conn.execute(&sql, params_from_iter(binds))?)
+        "rewrite" => {
+            // Snapshot the matching ids first: the UPDATE statements below
+            // re-evaluate their WHERE per statement, and an earlier rewrite
+            // pair could add or remove a later pair's needle from a row —
+            // each pair must act on exactly the set the rule matched (the
+            // stored twin of ingestion, which matches once and then applies
+            // every rewrite). Temp tables hold the snapshot and the subset
+            // actually changed; everything commits or rolls back together.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TEMP TABLE rule_hits (id INTEGER PRIMARY KEY);
+                 CREATE TEMP TABLE rule_changed (id INTEGER PRIMARY KEY);",
+            )?;
+            tx.execute(
+                &format!("INSERT INTO rule_hits(id) SELECT id FROM articles WHERE {where_sql}"),
+                params_from_iter(binds.iter().cloned()),
+            )?;
+            // The literal-containment predicate for one rewrite needle,
+            // evaluated against an `articles` row bound to the alias `a`.
+            let needle_hit = "INSTR(a.title, ?1) > 0 \
+                        OR INSTR(COALESCE(a.summary, ''), ?1) > 0 \
+                        OR INSTR(COALESCE(a.content_html, ''), ?1) > 0 \
+                        OR INSTR(COALESCE(a.body_text, ''), ?1) > 0";
+            for rw in rewrites {
+                if rw.from.is_empty() {
+                    continue;
+                }
+                if rw.from == rw.to {
+                    // A no-op pair: skipping it keeps the backfill in
+                    // lockstep with the ingestion path and keeps a
+                    // needle-hit on a from==to pair from counting a row as
+                    // changed or invalidating its caches.
+                    continue;
+                }
+                // Record which rows this pair will actually change — `INSTR`
+                // is the same literal, case-sensitive containment `REPLACE()`
+                // applies — so derived caches are only rebuilt where the
+                // original text really changed and the returned count means
+                // "rows changed", like the read / star branches.
+                tx.execute(
+                    // Explicitly joined/qualified: bare column names would
+                    // resolve against `rule_hits`, which holds only ids.
+                    &format!(
+                        "INSERT OR IGNORE INTO rule_changed(id)
+                         SELECT h.id FROM rule_hits h
+                         JOIN articles a ON a.id = h.id
+                         WHERE {needle_hit}"
+                    ),
+                    params![rw.from],
+                )?;
+                // Literal replacement on the same four text fields
+                // `apply_rewrites` touches at ingestion. SQLite's `REPLACE()`
+                // is byte-literal and case-sensitive — never a regex — which
+                // is exactly why rewrite pairs are literal by design.
+                // `REPLACE(NULL, …)` yields NULL, so nullable text columns
+                // keep their NULL when the row is untouched by the needle —
+                // the stored twin of `apply_rewrites`, where `None` stays
+                // `None`. The containment guard keeps untouched rows from
+                // being updated at all — an UPDATE that lists title /
+                // body_text fires the v17 preview-translation trigger for
+                // every row it touches, changed or not.
+                tx.execute(
+                    &format!(
+                        "UPDATE articles SET
+                            title        = REPLACE(title, ?1, ?2),
+                            summary      = REPLACE(summary, ?1, ?2),
+                            content_html = REPLACE(content_html, ?1, ?2),
+                            body_text    = REPLACE(body_text, ?1, ?2)
+                         WHERE id IN (SELECT id FROM rule_hits)
+                           AND id IN (SELECT a.id FROM rule_hits h
+                                      JOIN articles a ON a.id = h.id
+                                      WHERE {needle_hit})"
+                    ),
+                    params![rw.from, rw.to],
+                )?;
+            }
+            // No UPDATE trigger maintains articles_fts, so the changed rows'
+            // entries need rebuilding — but the body column only where the
+            // indexed body *is* the feed text: rows with `extracted_html`
+            // were indexed from the extracted full text (`set_extracted_html`
+            // writes `html_to_text(extracted_html)`), which rewrites never
+            // touch, so their indexed body must survive the title rewrite.
+            tx.execute(
+                "UPDATE articles_fts SET
+                    title = (SELECT title     FROM articles WHERE id = articles_fts.rowid),
+                    body  = (SELECT body_text FROM articles WHERE id = articles_fts.rowid)
+                 WHERE rowid IN (SELECT id FROM rule_changed)
+                   AND rowid IN (SELECT id FROM articles WHERE extracted_html IS NULL)",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE articles_fts SET
+                    title = (SELECT title FROM articles WHERE id = articles_fts.rowid)
+                 WHERE rowid IN (SELECT id FROM rule_changed)
+                   AND rowid IN (SELECT id FROM articles WHERE extracted_html IS NOT NULL)",
+                [],
+            )?;
+            // The cached translation and AI summary are derivatives of the
+            // original text: drop them so the reader never shows a rewritten
+            // original beside a pre-rewrite rendering. (The v17
+            // `article_preview_translations_au` trigger already cleared the
+            // list-preview cache when title / body_text were updated above.)
+            tx.execute(
+                "UPDATE articles SET
+                    translated_html = NULL, translated_lang = NULL,
+                    translated_title = NULL, ai_summary = NULL
+                 WHERE id IN (SELECT id FROM rule_changed)",
+                [],
+            )?;
+            let changed: i64 =
+                tx.query_row("SELECT COUNT(*) FROM rule_changed", [], |r| r.get(0))?;
+            tx.execute_batch("DROP TABLE rule_changed; DROP TABLE rule_hits;")?;
+            tx.commit()?;
+            Ok(changed as usize)
+        }
+        _ => Ok(0),
+    }
 }
 
 /// (total unread, starred, read-later) counts for the sidebar smart folders.
@@ -3120,7 +3528,7 @@ mod tests {
 
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22, 23, 24] {
+        for version in [0, 19, 20, 21, 22, 23, 24, 25] {
             let path = std::env::temp_dir().join(format!(
                 "papr-migrations-{}-{}-{}.db",
                 std::process::id(),
@@ -3131,7 +3539,7 @@ mod tests {
                     .as_nanos()
             ));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(23)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(24)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
@@ -3143,27 +3551,27 @@ mod tests {
             if version >= 21 {
                 conn.execute("UPDATE feeds SET position=42", []).unwrap();
             }
-            if version == 24 {
+            if version == 25 {
                 // A database from a *future* build (higher schema version than
                 // this binary knows) must be refused, not silently migrated.
-                conn.pragma_update(None, "user_version", 24).unwrap();
+                conn.pragma_update(None, "user_version", 25).unwrap();
             }
             drop(conn);
             let result = open(&path);
-            if version == 24 {
+            if version == 25 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    24
+                    25
                 );
             } else {
                 let conn = result.unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    23
+                    24
                 );
                 if version > 0 {
                     let values: (String, i64, i64) = conn
@@ -4092,6 +4500,33 @@ mod tests {
         assert!(order.iter().position(|&x| x == a) < order.iter().position(|&x| x == zoo),);
     }
 
+    // ── rule test helpers ─────────────────────────────────────────────
+
+    /// One condition.
+    fn cond(field: &str, operator: &str, value: &str) -> RuleCondition {
+        RuleCondition {
+            field: field.into(),
+            operator: operator.into(),
+            value: value.into(),
+        }
+    }
+
+    /// A When-document with a single condition — the common shape.
+    fn one(field: &str, operator: &str, value: &str) -> Vec<Vec<RuleCondition>> {
+        vec![vec![cond(field, operator, value)]]
+    }
+
+    /// Legacy keyword semantics as a When-document: each comma-separated
+    /// keyword becomes its own single-condition group (any keyword fires).
+    fn kw(field: &str, query: &str) -> Vec<Vec<RuleCondition>> {
+        query
+            .split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|term| vec![cond(field, "contains", term)])
+            .collect()
+    }
+
     #[test]
     fn create_rule_after_middle_delete_sorts_last() {
         // Same `COUNT(*)`-vs-`MAX(position)` hazard as tags: deleting a rule
@@ -4100,16 +4535,16 @@ mod tests {
         // sorts last. Rule order is load-bearing for ingestion evaluation.
         let (conn, _aid) = test_db();
         // Five rules, positions {0,1,2,3,4}.
-        let _a = create_rule(&conn, "alpha", None, "title", "x", "skip").unwrap();
-        let b = create_rule(&conn, "beta", None, "title", "y", "skip").unwrap();
-        let c = create_rule(&conn, "gamma", None, "title", "z", "skip").unwrap();
-        let _d = create_rule(&conn, "delta", None, "title", "w", "skip").unwrap();
-        let _e = create_rule(&conn, "epsilon", None, "title", "u", "skip").unwrap();
+        let _a = create_rule(&conn, "alpha", None, &kw("title", "x"), "skip", &[]).unwrap();
+        let b = create_rule(&conn, "beta", None, &kw("title", "y"), "skip", &[]).unwrap();
+        let c = create_rule(&conn, "gamma", None, &kw("title", "z"), "skip", &[]).unwrap();
+        let _d = create_rule(&conn, "delta", None, &kw("title", "w"), "skip", &[]).unwrap();
+        let _e = create_rule(&conn, "epsilon", None, &kw("title", "u"), "skip", &[]).unwrap();
         // Delete two from the middle, leaving positions {0,3,4} — wide enough
         // that a `COUNT(*)` value (3) collides with a non-last rule.
         delete_rule(&conn, b).unwrap();
         delete_rule(&conn, c).unwrap();
-        let zoo = create_rule(&conn, "zeta", None, "title", "v", "skip").unwrap();
+        let zoo = create_rule(&conn, "zeta", None, &kw("title", "v"), "skip", &[]).unwrap();
 
         let order: Vec<i64> = list_rules(&conn).unwrap().iter().map(|r| r.id).collect();
         assert_eq!(
@@ -4134,7 +4569,7 @@ mod tests {
         assert_eq!(count_feed_unread(&conn, feed_id).unwrap(), 1);
 
         // A rule that pre-marks anything titled "Sponsored" as read.
-        create_rule(&conn, "ads", None, "title", "Sponsored", "read").unwrap();
+        create_rule(&conn, "ads", None, &kw("title", "Sponsored"), "read", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
 
         let read_by_rule = NewArticle {
@@ -4197,7 +4632,7 @@ mod tests {
         let feed_id: i64 = conn
             .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
             .unwrap();
-        create_rule(&conn, "ads", None, "title", "Sponsored", "read").unwrap();
+        create_rule(&conn, "ads", None, &kw("title", "Sponsored"), "read", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
 
         let mk = |guid: &str, title: &str| NewArticle {
@@ -4238,7 +4673,7 @@ mod tests {
             .unwrap();
 
         // A `skip` rule keyed on the two-word phrase "rust weekly".
-        create_rule(&conn, "rw", None, "any", "rust weekly", "skip").unwrap();
+        create_rule(&conn, "rw", None, &kw("any", "rust weekly"), "skip", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
 
         // Title ends in "rust", author starts with "weekly": the old code
@@ -4310,7 +4745,7 @@ mod tests {
 
         // Lower-case non-ASCII keywords must still count the article.
         for keyword in ["café", "zürich"] {
-            let (count, samples) = preview_rule(&conn, None, "title", keyword).unwrap();
+            let (count, samples) = preview_rule(&conn, None, &kw("title", keyword)).unwrap();
             assert_eq!(
                 count, 1,
                 "keyword `{keyword}` should match the CAFÉ article"
@@ -4320,7 +4755,7 @@ mod tests {
 
         // And the rule that the preview describes must agree at ingest time:
         // a `skip` rule on `café` drops a fresh `CAFÉ`-titled article.
-        create_rule(&conn, "no-cafe", None, "title", "café", "skip").unwrap();
+        create_rule(&conn, "no-cafe", None, &kw("title", "café"), "skip", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
         let fresh = NewArticle {
             guid: "g-cafe-2".into(),
@@ -4372,7 +4807,7 @@ mod tests {
         seed(&conn, feed_id, "j2", "JavaScript tips");
         seed(&conn, feed_id, "p1", "Rust ownership");
 
-        let n = apply_rule_to_existing(&conn, None, "title", "java", "star").unwrap();
+        let n = apply_rule_to_existing(&conn, None, &kw("title", "java"), "star", &[]).unwrap();
         assert_eq!(n, 2, "both Java/JavaScript titles get starred");
         let starred: i64 = conn
             .query_row(
@@ -4385,7 +4820,7 @@ mod tests {
 
         // Re-running counts only rows it actually changes — already-starred rows
         // are excluded, so a second save reports 0.
-        let again = apply_rule_to_existing(&conn, None, "title", "java", "star").unwrap();
+        let again = apply_rule_to_existing(&conn, None, &kw("title", "java"), "star", &[]).unwrap();
         assert_eq!(again, 0);
     }
 
@@ -4401,9 +4836,9 @@ mod tests {
 
         // The preview count is exactly the set the skip apply deletes — they
         // share `rule_match_where`, so the user is never surprised.
-        let (preview, _) = preview_rule(&conn, None, "title", "sponsored").unwrap();
+        let (preview, _) = preview_rule(&conn, None, &kw("title", "sponsored")).unwrap();
         assert_eq!(preview, 2);
-        let n = apply_rule_to_existing(&conn, None, "title", "sponsored", "skip").unwrap();
+        let n = apply_rule_to_existing(&conn, None, &kw("title", "sponsored"), "skip", &[]).unwrap();
         assert_eq!(n, 2);
 
         let remaining: i64 = conn
@@ -4449,7 +4884,7 @@ mod tests {
         seed(&conn, feed_b, "x2", "Deals galore");
 
         // Scoped to feed B only: feed A's match is left untouched.
-        let n = apply_rule_to_existing(&conn, Some(feed_b), "title", "deals", "star").unwrap();
+        let n = apply_rule_to_existing(&conn, Some(feed_b), &kw("title", "deals"), "star", &[]).unwrap();
         assert_eq!(n, 1);
         let starred_in_a: i64 = conn
             .query_row(
@@ -4462,6 +4897,885 @@ mod tests {
             starred_in_a, 0,
             "a feed-scoped rule must not touch other feeds"
         );
+    }
+
+
+    // ── advanced rules (conditions document + rewrite) ───────────────
+
+    #[test]
+    fn legacy_keyword_row_still_matches_via_synthesised_conditions() {
+        // A pre-v24 row has only the `field`/`query` keyword columns. It must
+        // keep working: `row_to_rule` synthesises a one-condition-per-keyword
+        // document with the original OR semantics.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position)
+             VALUES ('legacy', NULL, 'title', 'sponsored, junk', 'skip', 0)",
+            [],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+        assert_eq!(rules.len(), 1);
+        // Two keywords → two OR groups, both contains-on-title.
+        assert_eq!(rules[0].conditions.len(), 2);
+        assert_eq!(rules[0].conditions[0][0].value, "sponsored");
+        assert_eq!(rules[0].conditions[1][0].operator, "contains");
+
+        let mk = |guid: &str, title: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(
+            !upsert_article(&conn, feed_id, &mk("l1", "A SPONSORED post"), false, &rules).unwrap(),
+            "legacy keyword rule must still skip at ingestion"
+        );
+        assert!(upsert_article(&conn, feed_id, &mk("l2", "Clean story"), false, &rules).unwrap());
+    }
+
+    #[test]
+    fn rule_groups_are_and_within_and_or_across() {
+        // (title contains rust AND author eq bob) OR (title contains spam)
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let conditions = vec![
+            vec![cond("title", "contains", "rust"), cond("author", "eq", "bob")],
+            vec![cond("title", "contains", "spam")],
+        ];
+        let mk = |guid: &str, title: &str, author: Option<&str>| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: author.map(Into::into),
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        // Seed the backlog *before* the skip rule exists, so the preview counts
+        // rows that are actually stored (a skip rule never stores its hits).
+        upsert_article(&conn, feed_id, &mk("c1", "rust news", Some("Bob")), false, &[]).unwrap();
+        upsert_article(&conn, feed_id, &mk("c2", "spam alert", None), false, &[]).unwrap();
+        upsert_article(&conn, feed_id, &mk("c3", "rust news", Some("Alice")), false, &[]).unwrap();
+        // The SQL preview must count exactly the same two shapes ingestion
+        // would act on.
+        let (n, _) = preview_rule(&conn, None, &conditions).unwrap();
+        assert_eq!(n, 2, "preview must agree with ingestion on group semantics");
+
+        create_rule(&conn, "combo", None, &conditions, "skip", &[]).unwrap();
+        let rules = active_rules(&conn).unwrap();
+        // AND-group hit: rust + Bob → skipped.
+        assert!(!upsert_article(&conn, feed_id, &mk("c4", "rust news", Some("Bob")), false, &rules)
+            .unwrap());
+        // OR-group hit: spam alone → skipped.
+        assert!(!upsert_article(&conn, feed_id, &mk("c5", "spam alert", None), false, &rules)
+            .unwrap());
+        // Only half of the AND group → no match, article inserts.
+        assert!(
+            upsert_article(&conn, feed_id, &mk("c6", "rust news", Some("Alice")), false, &rules)
+                .unwrap(),
+            "one matching condition of an AND group must not fire the rule"
+        );
+    }
+
+    #[test]
+    fn rule_operators_cover_negations_and_url() {
+        // eq is exact (case-folded), not_contains excludes, and the url field
+        // is addressable. Matcher and SQL builder must agree throughout.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        // Title must be exactly "digest" (folded) and contain no "sponsored".
+        let conditions = vec![vec![
+            cond("title", "eq", "Digest"),
+            cond("title", "not_contains", "sponsored"),
+            cond("url", "contains", "digest.example"),
+        ]];
+        let mk = |guid: &str, title: &str, url: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(url.into()),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        // Seed the backlog first so the preview sees stored rows.
+        upsert_article(
+            &conn,
+            feed_id,
+            &mk("o1", "DIGEST", "https://digest.example/feed"),
+            false,
+            &[],
+        )
+        .unwrap();
+        upsert_article(
+            &conn,
+            feed_id,
+            &mk("o2", "the digest", "https://digest.example/x"),
+            false,
+            &[],
+        )
+        .unwrap();
+        upsert_article(
+            &conn,
+            feed_id,
+            &mk("o3", "DIGEST", "https://other.example/feed"),
+            false,
+            &[],
+        )
+        .unwrap();
+        // SQL side agrees with the matcher: exactly one row holds all three.
+        let (n, _) = preview_rule(&conn, None, &conditions).unwrap();
+        assert_eq!(n, 1);
+
+        create_rule(&conn, "ops", None, &conditions, "skip", &[]).unwrap();
+        let rules = active_rules(&conn).unwrap();
+        // All three hold (case folded on title, needle inside the URL).
+        assert!(
+            !upsert_article(
+                &conn,
+                feed_id,
+                &mk("o4", "DIGEST", "https://digest.example/feed"),
+                false,
+                &rules
+            )
+            .unwrap(),
+            "eq + not_contains + url-contains must all fire together"
+        );
+        // Title too long for eq.
+        assert!(
+            upsert_article(
+                &conn,
+                feed_id,
+                &mk("o5", "the digest", "https://digest.example/x"),
+                false,
+                &rules
+            )
+            .unwrap(),
+            "eq is exact-match, not substring"
+        );
+        // URL doesn't carry the needle.
+        assert!(
+            upsert_article(
+                &conn,
+                feed_id,
+                &mk("o6", "DIGEST", "https://other.example/feed"),
+                false,
+                &rules
+            )
+            .unwrap(),
+            "the url condition must not match a foreign URL"
+        );
+    }
+
+    #[test]
+    fn regex_operator_uses_pattern_flags_and_invalid_never_matches() {
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        // (?i) makes the pattern case-insensitive; the matcher must NOT
+        // lowercase the pattern itself (that would rewrite `\D` into `\d`).
+        let ci = one("title", "regex", r"(?i)rust\d");
+        create_rule(&conn, "re", None, &ci, "skip", &[]).unwrap();
+        let rules = active_rules(&conn).unwrap();
+
+        let mk = |guid: &str, title: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(!upsert_article(&conn, feed_id, &mk("r1", "RUST2024"), false, &rules).unwrap());
+        assert!(
+            upsert_article(&conn, feed_id, &mk("r2", "rust d"), false, &rules).unwrap(),
+            "digits are required by the pattern"
+        );
+
+        // An invalid pattern can only arrive in a hand-edited row: it must
+        // never match (ingestion) and never error (SQL preview).
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+             VALUES ('badre', NULL, 'title', '', 'skip', 1, ?1)",
+            [serde_json::to_string(&one("title", "regex", "([")).unwrap()],
+        )
+        .unwrap();
+        let all = active_rules(&conn).unwrap();
+        assert!(
+            upsert_article(&conn, feed_id, &mk("r3", "anything ([ at all"), false, &all).unwrap(),
+            "an invalid regex row must be inert, not fatal"
+        );
+        let (n, _) = preview_rule(&conn, None, &one("title", "regex", "([")).unwrap();
+        assert_eq!(n, 0, "the SQL regexp() helper treats an invalid pattern as no-match");
+    }
+
+    #[test]
+    fn unknown_condition_field_or_operator_is_inert() {
+        // Hand-edited rows may carry garbage; both the matcher and the SQL
+        // builder must treat unknown values as "never matches", not fall back
+        // to a default field.
+        let (conn, _aid) = test_db();
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+             VALUES ('garbage', NULL, 'title', '', 'skip', 0, ?1)",
+            [serde_json::to_string(&vec![
+                vec![cond("bogus_field", "contains", "x")],
+                vec![cond("title", "bogus_op", "x")],
+            ])
+            .unwrap()],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let a = NewArticle {
+            guid: "g-garbage".into(),
+            url: Some("https://example.com/g".into()),
+            title: "x marks the spot".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "x".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(
+            upsert_article(&conn, feed_id, &a, false, &rules).unwrap(),
+            "unknown field/operator must never match"
+        );
+        let (n, _) = preview_rule(&conn, None, &rules[0].conditions).unwrap();
+        assert_eq!(n, 0, "SQL side must stay inert for the same row");
+    }
+
+    #[test]
+    fn empty_condition_group_is_inert_on_both_sides() {
+        // Regression: `all()` over an empty group is vacuously true, so a
+        // hand-edited `[[valid], []]` row would have matched *every* article
+        // at ingestion while the SQL side (which skips empty groups) previewed
+        // a far smaller set. Both sides must treat the empty group as
+        // non-participating; save-time validation rejects it outright.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let doc = vec![
+            vec![cond("title", "contains", "zzz_nomatch")],
+            Vec::new(),
+        ];
+        assert_eq!(
+            crate::models::validate_conditions(&doc),
+            Err("emptyRuleCondition"),
+            "validation must reject an empty group"
+        );
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+             VALUES ('empty-group', NULL, 'title', '', 'skip', 0, ?1)",
+            [serde_json::to_string(&doc).unwrap()],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+
+        let mk = |guid: &str, title: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(
+            upsert_article(&conn, feed_id, &mk("e1", "a normal story"), false, &rules).unwrap(),
+            "an empty group must not turn the rule into match-everything"
+        );
+        let (n, _) = preview_rule(&conn, None, &doc).unwrap();
+        assert_eq!(n, 0, "SQL side agrees: no article carries the needle");
+        // The real group still participates: an article carrying the needle
+        // is skipped, exactly as the SQL preview implies.
+        assert!(
+            !upsert_article(&conn, feed_id, &mk("e2", "zzz_nomatch here"), false, &rules).unwrap(),
+            "the non-empty group must keep firing normally"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_needle_is_inert_on_both_sides() {
+        // Regression: the matcher used a non-trimmed emptiness check, so a
+        // `"  "` needle matched articles containing two spaces while the SQL
+        // side (trim check) previewed nothing. Whitespace-only values are
+        // never-match everywhere.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let doc = vec![vec![cond("title", "contains", "  ")]];
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+             VALUES ('spaces', NULL, 'title', '', 'skip', 0, ?1)",
+            [serde_json::to_string(&doc).unwrap()],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+        let a = NewArticle {
+            guid: "g-sp".into(),
+            url: Some("https://example.com/sp".into()),
+            title: "two  spaces inside".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(
+            upsert_article(&conn, feed_id, &a, false, &rules).unwrap(),
+            "a whitespace-only needle must never match at ingestion"
+        );
+        let (n, _) = preview_rule(&conn, None, &doc).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn corrupt_conditions_document_is_inert_not_resurrected_from_summary() {
+        // A corrupt (hand-edited) conditions JSON must not fall back to the
+        // `field`/`query` summary: those columns are derived from the
+        // document, so rebuilding from them would silently change what the
+        // rule matches. The rule goes inert until re-saved instead.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+             VALUES ('corrupt', NULL, 'any', 'sponsored', 'skip', 0, '{\"not\": \"a document\"}')",
+            [],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+        assert!(
+            rules[0].conditions.is_empty(),
+            "a corrupt document must load as inert, not as the keyword summary"
+        );
+        let a = NewArticle {
+            guid: "g-corrupt".into(),
+            url: Some("https://example.com/corrupt".into()),
+            title: "SPONSORED post".into(),
+            author: Some("ads".into()),
+            summary: None,
+            content_html: None,
+            body_text: "sponsored".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(
+            upsert_article(&conn, feed_id, &a, false, &rules).unwrap(),
+            "the corrupt rule must not skip articles the summary would match"
+        );
+    }
+
+    #[test]
+    fn rewrite_backfill_preserves_extracted_fts_and_invalidates_derivatives() {
+        // - A row with `extracted_html` has its FTS body indexed from the
+        //   extracted full text (`set_extracted_html`), which rewrites never
+        //   touch: the title rewrite must not clobber that index with the
+        //   shorter feed body.
+        // - Rows whose original text actually changed lose their cached
+        //   translation and AI summary; matched-but-unchanged rows keep
+        //   theirs. The returned count is rows *changed*, not rows matched.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "x1", "Rust Weekly #1");
+        seed(&conn, feed_id, "x2", "A plain story");
+        // Rule matches x1 by title OR x2 by author; only x1's text carries
+        // the needle, so only x1 changes.
+        let doc = vec![
+            vec![cond("title", "contains", "Rust Weekly")],
+            vec![cond("author", "eq", "bob")],
+        ];
+        let rewrites = vec![RuleRewrite {
+            from: "Rust Weekly".into(),
+            to: "Rust Letter".into(),
+        }];
+
+        let x1: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'x1'", [], |r| r.get(0))
+            .unwrap();
+        let x2: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'x2'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute("UPDATE articles SET author = 'bob' WHERE id = ?1", [x2]).unwrap();
+        // x1: extracted full text (its FTS body is that text) + cached derivatives.
+        set_extracted_html(&conn, x1, "<p>quasar deep text</p>", None).unwrap();
+        set_translation(&conn, x1, "<p>old body</p>", "zh", Some("old title")).unwrap();
+        set_ai_summary(&conn, x1, "old summary").unwrap();
+        // x2: matched but unchanged — derivatives stay valid.
+        set_translation(&conn, x2, "<p>old body</p>", "zh", Some("old title")).unwrap();
+        set_ai_summary(&conn, x2, "old summary").unwrap();
+
+        let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
+        assert_eq!(changed, 1, "only x1's text actually contains the needle");
+
+        // The extracted-derived FTS body survives; both titles are rebuilt.
+        let quasar: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'quasar'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quasar, 1, "the extracted body index must not be clobbered");
+        let letter: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'letter'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(letter, 1, "the rewritten title is searchable");
+        // x1's derivatives are dropped; x2's stay.
+        let (t1, s1): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT translated_html, ai_summary FROM articles WHERE id = ?1",
+                [x1],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((t1, s1), (None, None), "changed rows lose stale derivatives");
+        let (t2, s2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT translated_html, ai_summary FROM articles WHERE id = ?1",
+                [x2],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (t2.as_deref(), s2.as_deref()),
+            (Some("<p>old body</p>"), Some("old summary")),
+            "matched-but-unchanged rows keep their derivatives"
+        );
+        // The rewritten title landed too.
+        let title: String = conn
+            .query_row("SELECT title FROM articles WHERE id = ?1", [x1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "Rust Letter #1");
+    }
+
+    #[test]
+    fn nul_bearing_needles_are_inert_on_both_sides() {
+        // SQLite's LIKE treats its pattern as NUL-terminated: a needle like
+        // `x\0y` bound into `LIKE '%x\0y%'` can silently become `%` on the
+        // SQL side — matching *everything* — while Rust's `contains` keeps
+        // the NUL literal. `contains` / `not_contains` needles with embedded
+        // NULs are therefore inert on both sides, the same policy as
+        // whitespace-only values.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let contains_doc = vec![vec![cond("title", "contains", "a\0b")]];
+        let not_contains_doc = vec![vec![cond("title", "not_contains", "a\0b")]];
+        for (name, doc) in [("nul-c", &contains_doc), ("nul-nc", &not_contains_doc)] {
+            conn.execute(
+                "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+                 VALUES (?1, NULL, 'title', '', 'skip', 0, ?2)",
+                params![name, serde_json::to_string(doc).unwrap()],
+            )
+            .unwrap();
+        }
+        let rules = active_rules(&conn).unwrap();
+
+        let mk = |guid: &str, title: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        // A title that literally carries the needle still inserts — the
+        // contains rule is inert, not widened.
+        assert!(
+            upsert_article(&conn, feed_id, &mk("z1", "a\0b headline"), false, &rules).unwrap(),
+            "a NUL-bearing contains needle must never fire"
+        );
+        // An ordinary title would be matched by a (truncated) SQL pattern —
+        // inertness keeps it safe; and the not_contains rule must not turn
+        // into match-everything either.
+        assert!(
+            upsert_article(&conn, feed_id, &mk("z2", "ordinary headline"), false, &rules).unwrap(),
+            "a NUL-bearing not_contains needle must never fire"
+        );
+        // The SQL side agrees on both documents.
+        let (n1, _) = preview_rule(&conn, None, &contains_doc).unwrap();
+        let (n2, _) = preview_rule(&conn, None, &not_contains_doc).unwrap();
+        assert_eq!(n1, 0, "SQL contains stays inert for NUL needles");
+        assert_eq!(n2, 0, "SQL not_contains stays inert for NUL needles");
+    }
+
+    #[test]
+    fn rewrite_backfill_leaves_matched_but_untouched_rows_alone() {
+        // A matched row whose text the needle never touches must not be
+        // updated at all: SQLite's UPDATE OF trigger (v17,
+        // `article_preview_translations_au`) fires for every row an UPDATE
+        // touches, changed or not, so a blanket update would drop
+        // still-valid preview translations on untouched rows.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "n1", "Weekly roundup");
+        seed(&conn, feed_id, "n2", "Weekly recap");
+        let rewrites = vec![RuleRewrite {
+            from: "roundup".into(),
+            to: "meeting".into(),
+        }];
+        let doc = vec![vec![cond("title", "contains", "Weekly")]];
+        let ids: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, guid FROM articles WHERE guid IN ('n1','n2')")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for (id, guid) in &ids {
+            set_translation(&conn, *id, "<p>old</p>", "zh", Some("old")).unwrap();
+            set_ai_summary(&conn, *id, "old summary").unwrap();
+            set_preview_translation(&conn, *id, "old title", "old snippet", "zh", "test")
+                .unwrap();
+            let _ = guid;
+        }
+        let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
+        assert_eq!(changed, 1, "only n1 carries the needle");
+
+        for (id, guid) in &ids {
+            let (title, th, ai, pt): (String, Option<String>, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT title, translated_html, ai_summary,
+                            (SELECT COUNT(*) FROM article_preview_translations
+                              WHERE article_id = articles.id)
+                     FROM articles WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            if guid == "n1" {
+                assert_eq!(title, "Weekly meeting");
+                assert_eq!((th, ai, pt), (None, None, 0), "changed row: derivatives dropped");
+            } else {
+                assert_eq!(title, "Weekly recap");
+                assert_eq!(
+                    (th.as_deref(), ai.as_deref(), pt),
+                    (Some("<p>old</p>"), Some("old summary"), 1),
+                    "untouched row: all caches survive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_backfill_treats_from_equal_to_pairs_as_noops() {
+        // A from==to pair can never change text (REPLACE with an identical
+        // replacement is a no-op): a needle hit on one must not count the
+        // row as changed or invalidate its derivative caches.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "p1", "Weekly roundup");
+        let id: i64 = conn
+            .query_row("SELECT id FROM articles WHERE guid = 'p1'", [], |r| r.get(0))
+            .unwrap();
+        set_translation(&conn, id, "<p>old</p>", "zh", Some("old")).unwrap();
+        set_ai_summary(&conn, id, "old summary").unwrap();
+        set_preview_translation(&conn, id, "old title", "old snippet", "zh", "test").unwrap();
+
+        let doc = vec![vec![cond("title", "contains", "Weekly")]];
+        let rewrites = vec![RuleRewrite {
+            from: "Weekly".into(),
+            to: "Weekly".into(),
+        }];
+        let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
+        assert_eq!(changed, 0, "a no-op pair changes nothing");
+
+        let (title, th, ai, pt): (String, Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT title, translated_html, ai_summary,
+                        (SELECT COUNT(*) FROM article_preview_translations
+                          WHERE article_id = articles.id)
+                 FROM articles WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Weekly roundup");
+        assert_eq!(
+            (th.as_deref(), ai.as_deref(), pt),
+            (Some("<p>old</p>"), Some("old summary"), 1),
+            "no caches may be invalidated by a no-op pair"
+        );
+    }
+
+    #[test]
+    fn rewrite_rule_rewrites_text_at_ingestion_matching_the_original() {
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let rewrites = vec![RuleRewrite {
+            from: "Sponsored: ".into(),
+            to: String::new(),
+        }];
+        create_rule(&conn, "fix", None, &one("title", "contains", "Sponsored"), "rewrite", &rewrites)
+            .unwrap();
+        let rules = active_rules(&conn).unwrap();
+
+        let a = NewArticle {
+            guid: "g-rewrite".into(),
+            url: Some("https://example.com/rw".into()),
+            title: "Sponsored: A great deal".into(),
+            author: Some("Ads Inc".into()),
+            summary: Some("Sponsored: summary".into()),
+            content_html: Some("<p>Sponsored: hello</p>".into()),
+            body_text: "Sponsored: hello".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        // A rewrite insert still counts as new (it is unread — not pre-read).
+        assert!(upsert_article(&conn, feed_id, &a, false, &rules).unwrap());
+        let (title, summary, html, body): (String, Option<String>, Option<String>, String) = conn
+            .query_row(
+                "SELECT title, summary, content_html, body_text FROM articles WHERE guid = 'g-rewrite'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "A great deal");
+        assert_eq!(summary.as_deref(), Some("summary"));
+        assert_eq!(html.as_deref(), Some("<p>hello</p>"));
+        assert_eq!(body, "hello");
+        // The FTS row was built from the rewritten text (insert path).
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'deal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 1);
+    }
+
+    #[test]
+    fn rewrite_rules_compose_in_rule_order() {
+        // Two matching rewrite rules apply sequentially: the second sees the
+        // first's output. Both match the ORIGINAL text (matching happens
+        // before any rewrite).
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        create_rule(
+            &conn,
+            "one",
+            None,
+            &one("title", "contains", "alpha"),
+            "rewrite",
+            &[RuleRewrite { from: "alpha".into(), to: "beta".into() }],
+        )
+        .unwrap();
+        create_rule(
+            &conn,
+            "two",
+            None,
+            &one("title", "contains", "alpha"),
+            "rewrite",
+            &[RuleRewrite { from: "beta".into(), to: "gamma".into() }],
+        )
+        .unwrap();
+        let rules = active_rules(&conn).unwrap();
+        let a = NewArticle {
+            guid: "g-compose".into(),
+            url: Some("https://example.com/comp".into()),
+            title: "alpha".into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: String::new(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        upsert_article(&conn, feed_id, &a, false, &rules).unwrap();
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM articles WHERE guid = 'g-compose'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "gamma", "rewrite pairs chain across matching rules");
+    }
+
+    #[test]
+    fn apply_rule_to_existing_rewrite_updates_text_and_fts() {
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "w1", "Rust Weekly #1");
+        seed(&conn, feed_id, "w2", "Rust Weekly #2");
+        seed(&conn, feed_id, "w3", "Go Letter");
+
+        let rewrites = vec![RuleRewrite {
+            from: "Rust Weekly".into(),
+            to: "Rust Newsletter".into(),
+        }];
+        let (n, _) = preview_rule(&conn, None, &kw("title", "Rust Weekly")).unwrap();
+        assert_eq!(n, 2);
+        let changed =
+            apply_rule_to_existing(&conn, None, &kw("title", "Rust Weekly"), "rewrite", &rewrites)
+                .unwrap();
+        assert_eq!(changed, 2);
+
+        let titles: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT title FROM articles WHERE guid LIKE 'w%' ORDER BY guid")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(titles, vec!["Rust Newsletter #1", "Rust Newsletter #2", "Go Letter"]);
+
+        // No UPDATE trigger keeps FTS fresh, so the backfill rebuilt the
+        // matched rows: the new text is searchable, the old text is gone.
+        let fts_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'newsletter'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fts_old: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM articles_fts WHERE articles_fts MATCH 'weekly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_new, 2, "rewritten titles are searchable");
+        assert_eq!(fts_old, 0, "stale FTS entries must be rebuilt");
+    }
+
+    #[test]
+    fn rewrite_backfill_matches_once_even_when_pairs_rewrite_the_needle() {
+        // Pair 1 removes the very keyword the rule matched on; pair 2 rewrites
+        // what pair 1 produced. The snapshot must be taken once — both pairs
+        // act on the same row set — mirroring ingestion, which matches the
+        // original article and then applies every rewrite.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        seed(&conn, feed_id, "s1", "advert quiet launch");
+
+        let rewrites = vec![
+            RuleRewrite { from: "advert".into(), to: String::new() },
+            RuleRewrite { from: "quiet".into(), to: "loud".into() },
+        ];
+        let changed = apply_rule_to_existing(
+            &conn,
+            None,
+            &kw("title", "advert"),
+            "rewrite",
+            &rewrites,
+        )
+        .unwrap();
+        assert_eq!(changed, 1);
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM articles WHERE guid = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // The second pair still applied even though the first already removed
+        // "advert" from the title (SQLite would otherwise re-evaluate the
+        // WHERE per statement and drop the row from later pairs).
+        assert_eq!(title.trim(), "loud launch");
+    }
+
+    #[test]
+    fn create_rule_writes_flattened_keyword_summary() {
+        // The legacy `field`/`query` columns stay as an informational summary:
+        // one field when the document uses a single field, `any` when mixed.
+        let (conn, _aid) = test_db();
+        let conditions = vec![
+            vec![cond("title", "contains", "rust"), cond("author", "eq", "bob")],
+            vec![cond("title", "contains", "spam")],
+        ];
+        let id = create_rule(&conn, "mix", None, &conditions, "skip", &[]).unwrap();
+        let (field, query): (String, String) = conn
+            .query_row(
+                "SELECT field, query FROM rules WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(field, "any", "mixed fields summarise to `any`");
+        assert_eq!(query, "rust,bob,spam");
+
+        let id2 = create_rule(&conn, "single", None, &one("url", "eq", "x"), "read", &[]).unwrap();
+        let (field, query): (String, String) = conn
+            .query_row(
+                "SELECT field, query FROM rules WHERE id = ?1",
+                [id2],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(field, "url");
+        assert_eq!(query, "x");
     }
 
     // ── mark_all_read sync queueing ──────────────────────────────────

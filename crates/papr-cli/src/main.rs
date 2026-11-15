@@ -12,7 +12,7 @@ mod toon;
 use clap::{Parser, Subcommand};
 use papr_core::db;
 use papr_core::ingestion::{fetch, parse, refresh};
-use papr_core::models::ArticleQuery;
+use papr_core::models::{ArticleQuery, RuleCondition, RuleRewrite};
 use papr_core::sync;
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -320,14 +320,20 @@ enum RuleCmd {
         /// Comma-separated keywords (a match fires if any one is a substring).
         query: String,
         /// Which text to match.
-        #[arg(long, default_value = "title", value_parser = ["title", "author", "content", "any"])]
+        #[arg(long, default_value = "title", value_parser = ["title", "author", "content", "any", "url"])]
         field: String,
         /// What to do on a match.
-        #[arg(long, default_value = "skip", value_parser = ["skip", "read", "star"])]
+        #[arg(long, default_value = "skip", value_parser = ["skip", "read", "star", "rewrite"])]
         action: String,
         /// Scope the rule to one feed (default: all feeds).
         #[arg(long, value_name = "ID")]
         feed: Option<i64>,
+        /// For `--action rewrite`: a literal `from::to` replacement to apply to
+        /// a matched article's text. Repeatable; pairs apply in the order
+        /// given. The FIRST `::` splits the pair, so the replacement text may
+        /// itself contain `::` (the find text may not).
+        #[arg(long = "rewrite", value_name = "FROM::TO")]
+        rewrites: Vec<String>,
     },
     /// Delete a rule.
     Delete {
@@ -1326,6 +1332,51 @@ fn cmd_tag(path: &Path, cmd: TagCmd) -> Result<String, AxiError> {
 
 // ─────────────────────────────── rules ───────────────────────────────
 
+/// Compact When-document summary for one rule, e.g.
+/// `title~a && author=b || content~c`.
+fn rule_when_summary(r: &papr_core::models::Rule) -> String {
+    rule_when_summary_conditions(&r.conditions)
+}
+
+fn rule_when_summary_conditions(conditions: &[Vec<RuleCondition>]) -> String {
+    conditions
+        .iter()
+        .filter(|g| !g.is_empty())
+        .map(|group| {
+            group
+                .iter()
+                .map(|c| {
+                    let op = match c.operator.as_str() {
+                        "contains" => "~",
+                        "not_contains" => "!~",
+                        "eq" => "=",
+                        "not_eq" => "!=",
+                        _ => "re",
+                    };
+                    format!("{}{}{}", c.field, op, c.value)
+                })
+                .collect::<Vec<_>>()
+                .join(" && ")
+        })
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+/// Parse `--rewrite FROM::TO` arguments into rewrite pairs.
+fn parse_rewrites(args: &[String]) -> Result<Vec<RuleRewrite>, String> {
+    args.iter()
+        .map(|a| {
+            let (from, to) = a
+                .split_once("::")
+                .ok_or_else(|| format!("--rewrite expects FROM::TO, got `{a}`"))?;
+            Ok(RuleRewrite {
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn cmd_rules(path: &Path) -> Result<String, AxiError> {
     let conn = open_ro(path)?;
     let rules = db::list_rules(&conn).map_err(db_err)?;
@@ -1336,8 +1387,7 @@ fn cmd_rules(path: &Path) -> Result<String, AxiError> {
                 "id": r.id,
                 "name": r.name,
                 "enabled": r.enabled,
-                "field": r.field,
-                "query": r.query,
+                "when": rule_when_summary(r),
                 "action": r.action,
                 "feed": r.feed_id.map(|f| f.to_string()).unwrap_or_else(|| "all".into()),
             })
@@ -1362,10 +1412,32 @@ fn cmd_rule(path: &Path, cmd: RuleCmd) -> Result<String, AxiError> {
             field,
             action,
             feed,
+            rewrites,
         } => {
-            let id =
-                db::create_rule(&conn, &name, feed, &field, &query, &action).map_err(db_err)?;
-            ok_line(format!("rule: #{id} {name} ({field} ~ {query} → {action})"))
+            // Keyword mode: each comma-separated keyword becomes its own
+            // single-condition group — same "any keyword fires" OR semantics
+            // the GUI's legacy rules had, now expressed in the When-document.
+            let conditions: Vec<Vec<RuleCondition>> = query
+                .split(',')
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .map(|term| {
+                    vec![RuleCondition {
+                        field: field.clone(),
+                        operator: "contains".into(),
+                        value: term.into(),
+                    }]
+                })
+                .collect();
+            let pairs = parse_rewrites(&rewrites).map_err(AxiError::runtime)?;
+            papr_core::models::validate_rule_parts(&conditions, &action, &pairs)
+                .map_err(AxiError::runtime)?;
+            let id = db::create_rule(&conn, &name, feed, &conditions, &action, &pairs)
+                .map_err(db_err)?;
+            ok_line(format!(
+                "rule: #{id} {name} ({} → {action})",
+                rule_when_summary_conditions(&conditions)
+            ))
         }
         RuleCmd::Delete { id, yes } => {
             require_yes(yes, "rule delete", &format!("papr rule delete {id}"))?;
@@ -1389,7 +1461,14 @@ fn set_rule_enabled(conn: &Connection, id: i64, on: bool) -> Result<String, AxiE
         ));
     }
     db::update_rule(
-        conn, id, &r.name, on, r.feed_id, &r.field, &r.query, &r.action,
+        conn,
+        id,
+        &r.name,
+        on,
+        r.feed_id,
+        &r.conditions,
+        &r.action,
+        &r.rewrites,
     )
     .map_err(db_err)?;
     ok_line(format!(

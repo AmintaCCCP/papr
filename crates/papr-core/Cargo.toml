@@ -31,6 +31,10 @@ rand.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 
+# Rule conditions: the `regex` operator compiles user patterns (memoised in
+# `models::RuleCondition::compile`, shared with the SQL `regexp()` function).
+regex = "1"
+
 # RSSHub route marketplace: engine archive install/extract/integrity.
 # tar+flate2 for .tar.gz, zip for .zip, sha2 for the optional checksum the
 # marketplace verifies a downloaded archive against. Small, maintained crates

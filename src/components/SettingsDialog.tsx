@@ -47,7 +47,17 @@ import { checkForUpdates } from "../lib/updater";
 import { saveTextFile } from "../lib/save";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import { errorText } from "../lib/errors";
-import type { Feed, Rule, RuleAction, RuleField, RulePreview } from "../types";
+import type {
+  Feed,
+  Rule,
+  RuleAction,
+  RuleCondition,
+  RuleField,
+  RuleOperator,
+  RulePreview,
+  RuleRewrite,
+} from "../types";
+import { RULE_ACTIONS, RULE_FIELDS, RULE_OPERATORS } from "../types";
 import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
 import FeedAvatar from "./FeedAvatar";
@@ -3119,7 +3129,15 @@ function FiltersSection({
 
   const toggle = (r: Rule) =>
     api
-      .updateRule(r.id, r.name, !r.enabled, r.feedId, r.field, r.query, r.action)
+      .updateRule(
+        r.id,
+        r.name,
+        !r.enabled,
+        r.feedId,
+        r.conditions,
+        r.action,
+        r.rewrites,
+      )
       .then(refresh)
       .catch((e) => reportError(e));
 
@@ -3132,12 +3150,24 @@ function FiltersSection({
       })
       .catch((e) => reportError(e));
 
+  // "标题 包含 … 且 作者 等于 … 或 标题 包含 …" — AND joins a group,
+  // OR joins groups, mirroring the When-document's evaluation order.
   const summary = (r: Rule) =>
     [
       t(`settings.filters.action.${r.action}`),
       "·",
-      t(`settings.filters.field.${r.field}`),
-      `“${r.query}”`,
+      r.conditions
+        .map((g) =>
+          g
+            .map(
+              (c) =>
+                `${t(`settings.filters.field.${c.field}`)} ${t(
+                  `settings.filters.operator.${c.operator}`,
+                )} “${c.value}”`,
+            )
+            .join(` ${t("settings.filters.and")} `),
+        )
+        .join(` ${t("settings.filters.or")} `),
       "·",
       feedName(r.feedId),
     ].join(" ");
@@ -3234,22 +3264,75 @@ function RuleEditor({
 }) {
   const { t } = useTranslation();
   const [name, setName] = useState(rule?.name ?? "");
-  const [query, setQuery] = useState(rule?.query ?? "");
-  const [field, setField] = useState<RuleField>(rule?.field ?? "title");
+  // The When-document. A new rule starts with one empty condition; editing
+  // keeps the stored groups (cloned so cancelling can't mutate the query cache).
+  const [groups, setGroups] = useState<RuleCondition[][]>(
+    rule?.conditions.length
+      ? rule.conditions.map((g) => g.map((c) => ({ ...c })))
+      : [[{ field: "title", operator: "contains", value: "" }]],
+  );
   const [action, setAction] = useState<RuleAction>(rule?.action ?? "skip");
+  const [rewrites, setRewrites] = useState<RuleRewrite[]>(
+    rule?.action === "rewrite" && rule.rewrites.length
+      ? rule.rewrites.map((r) => ({ ...r }))
+      : [{ from: "", to: "" }],
+  );
   const [scope, setScope] = useState(rule?.feedId == null ? "" : String(rule.feedId));
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<RulePreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
+  // Set when the dry-run fails server-side (typically an uncompilable regex
+  // — validation is authoritative on the backend, since JS `RegExp` and Rust
+  // `regex` disagree on inline flags). Shown as its own state, not as a
+  // "matches 0" that would read as a clean count.
+  const [previewInvalid, setPreviewInvalid] = useState(false);
   // When a `skip` rule would delete existing matches, hold that count here to
   // pop a confirmation before the destructive backfill runs.
   const [pendingDelete, setPendingDelete] = useState<number | null>(null);
 
+  const newCondition = (): RuleCondition => ({
+    field: "title",
+    operator: "contains",
+    value: "",
+  });
+  const patchCond = (gi: number, ci: number, patch: Partial<RuleCondition>) =>
+    setGroups((gs) =>
+      gs.map((g, i) =>
+        i !== gi ? g : g.map((c, j) => (j !== ci ? c : { ...c, ...patch })),
+      ),
+    );
+  const addCond = (gi: number) =>
+    setGroups((gs) => gs.map((g, i) => (i !== gi ? g : [...g, newCondition()])));
+  const removeCond = (gi: number, ci: number) =>
+    setGroups((gs) => {
+      const next = gs
+        .map((g, i) => (i !== gi ? g : g.filter((_, j) => j !== ci)))
+        .filter((g) => g.length > 0);
+      // Never render an empty When-document.
+      return next.length > 0 ? next : [[newCondition()]];
+    });
+  const addGroup = () => setGroups((gs) => [...gs, [newCondition()]]);
+  const patchRewrite = (i: number, patch: Partial<RuleRewrite>) =>
+    setRewrites((rs) => rs.map((r, j) => (j !== i ? r : { ...r, ...patch })));
+
+  // The draft is sent as-typed — trimming would change what the rule means
+  // (a regex pattern `"foo "` must not become `"foo"`: that starts matching
+  // "foobar"). A draft is complete when every condition carries a non-blank
+  // value (whitespace-only needles are rejected server-side); regex syntax
+  // is validated server-side too — JS `RegExp` and Rust `regex` disagree on
+  // inline flags like `(?i)`, so a client check would false-red valid
+  // patterns.
+  const draft: RuleCondition[][] = groups;
+  const draftComplete =
+    draft.flat().length > 0 && draft.flat().every((c) => c.value.trim() !== "");
+  const rewritesComplete =
+    action !== "rewrite" || rewrites.every((r) => r.from.trim() !== "");
+
   // Debounced dry-run: count matching stored articles as the draft changes.
   useEffect(() => {
-    const q = query.trim();
-    if (!q) {
+    if (!draftComplete) {
       setPreview(null);
+      setPreviewInvalid(false);
       return;
     }
     setPreviewing(true);
@@ -3260,16 +3343,27 @@ function RuleEditor({
     let cancelled = false;
     const handle = window.setTimeout(() => {
       api
-        .previewRule(feedId, field, q)
-        .then((r) => !cancelled && setPreview(r))
-        .catch(() => !cancelled && setPreview(null))
+        .previewRule(feedId, draft)
+        .then((r) => {
+          if (cancelled) return;
+          setPreview(r);
+          setPreviewInvalid(false);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setPreview(null);
+          setPreviewInvalid(true);
+        })
         .finally(() => !cancelled && setPreviewing(false));
     }, 400);
     return () => {
       cancelled = true;
       window.clearTimeout(handle);
     };
-  }, [query, field, scope]);
+    // `draft` is re-created on every keystroke — exactly when the preview
+    // should re-run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftComplete, JSON.stringify(draft), scope]);
 
   // A rule backfills the existing backlog only when it's active: new rules
   // start enabled, and an existing rule keeps its current enabled state (the
@@ -3281,15 +3375,23 @@ function RuleEditor({
   const persist = async () => {
     setBusy(true);
     const feedId = scope === "" ? null : Number(scope);
-    const q = query.trim();
+    const pairs = action === "rewrite" ? rewrites : [];
     try {
       if (rule) {
-        await api.updateRule(rule.id, name, rule.enabled, feedId, field, q, action);
+        await api.updateRule(
+          rule.id,
+          name,
+          rule.enabled,
+          feedId,
+          draft,
+          action,
+          pairs,
+        );
       } else {
-        await api.createRule(name, feedId, field, q, action);
+        await api.createRule(name, feedId, draft, action, pairs);
       }
       const applied = willApply
-        ? await api.applyRuleToExisting(feedId, field, q, action)
+        ? await api.applyRuleToExisting(feedId, draft, action, pairs)
         : 0;
       onToast(
         applied > 0
@@ -3304,9 +3406,12 @@ function RuleEditor({
   };
 
   const save = async () => {
-    const q = query.trim();
-    if (!q) {
-      onToast(t("settings.filters.needQuery"));
+    if (!draftComplete) {
+      onToast(t("settings.filters.needCondition"));
+      return;
+    }
+    if (!rewritesComplete) {
+      onToast(t("settings.filters.needRewrite"));
       return;
     }
     // `skip` deletes the existing articles it matches — confirm first, showing
@@ -3315,7 +3420,7 @@ function RuleEditor({
       setBusy(true);
       const feedId = scope === "" ? null : Number(scope);
       try {
-        const p = await api.previewRule(feedId, field, q);
+        const p = await api.previewRule(feedId, draft);
         if (p.count > 0) {
           setPendingDelete(p.count);
           return;
@@ -3341,37 +3446,87 @@ function RuleEditor({
         onChange={(e) => setName(e.target.value)}
         placeholder={t("settings.filters.namePlaceholder")}
       />
-      <input
-        className="rule-input"
-        {...NO_AUTOCORRECT}
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        placeholder={t("settings.filters.queryPlaceholder")}
-      />
+      <div className="rule-when">
+        <div className="rule-when-title">{t("settings.filters.whenLabel")}</div>
+        {groups.map((group, gi) => (
+          <div key={gi}>
+            {gi > 0 && (
+              <div className="rule-group-op">{t("settings.filters.or")}</div>
+            )}
+            <div className="rule-group">
+              {group.map((c, ci) => (
+                <div key={`${gi}-${ci}`}>
+                  {ci > 0 && (
+                    <div className="rule-cond-op">
+                      {t("settings.filters.and")}
+                    </div>
+                  )}
+                  <div className="rule-cond-row">
+                    <Select
+                      value={c.field}
+                      onChange={(v) => patchCond(gi, ci, { field: v as RuleField })}
+                      options={RULE_FIELDS.map((f) => ({
+                        value: f,
+                        label: t(`settings.filters.field.${f}`),
+                      }))}
+                    />
+                    <Select
+                      value={c.operator}
+                      onChange={(v) =>
+                        patchCond(gi, ci, { operator: v as RuleOperator })
+                      }
+                      options={RULE_OPERATORS.map((o) => ({
+                        value: o,
+                        label: t(`settings.filters.operator.${o}`),
+                      }))}
+                    />
+                    <input
+                      className="rule-input rule-cond-value"
+                      {...NO_AUTOCORRECT}
+                      value={c.value}
+                      onChange={(e) =>
+                        patchCond(gi, ci, { value: e.target.value })
+                      }
+                      placeholder={
+                        c.operator === "regex"
+                          ? t("settings.filters.regexPlaceholder")
+                          : t("settings.filters.valuePlaceholder")
+                      }
+                    />
+                    <button
+                      className="icon-btn"
+                      title={t("common.delete")}
+                      disabled={groups.length === 1 && group.length === 1}
+                      onClick={() => removeCond(gi, ci)}
+                    >
+                      <Icon name="trash" size={13} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <button
+                className="rule-add"
+                onClick={() => addCond(gi)}
+              >
+                <Icon name="plus" size={11} /> {t("settings.filters.addCondition")}
+              </button>
+            </div>
+          </div>
+        ))}
+        <button className="rule-add" onClick={addGroup}>
+          <Icon name="plus" size={11} /> {t("settings.filters.addGroup")}
+        </button>
+      </div>
       <div className="rule-fields">
-        <label>
-          {t("settings.filters.matchIn")}
-          <Select
-            value={field}
-            onChange={(v) => setField(v as RuleField)}
-            options={[
-              { value: "title", label: t("settings.filters.field.title") },
-              { value: "author", label: t("settings.filters.field.author") },
-              { value: "content", label: t("settings.filters.field.content") },
-              { value: "any", label: t("settings.filters.field.any") },
-            ]}
-          />
-        </label>
         <label>
           {t("settings.filters.thenLabel")}
           <Select
             value={action}
             onChange={(v) => setAction(v as RuleAction)}
-            options={[
-              { value: "skip", label: t("settings.filters.action.skip") },
-              { value: "read", label: t("settings.filters.action.read") },
-              { value: "star", label: t("settings.filters.action.star") },
-            ]}
+            options={RULE_ACTIONS.map((a) => ({
+              value: a,
+              label: t(`settings.filters.action.${a}`),
+            }))}
           />
         </label>
         <label>
@@ -3386,14 +3541,59 @@ function RuleEditor({
           />
         </label>
       </div>
-      {query.trim() && (
+      {action === "rewrite" && (
+        <div className="rule-rewrites">
+          <div className="rule-when-title">{t("settings.filters.rewritesTitle")}</div>
+          {rewrites.map((r, i) => (
+            <div className="rule-rewrite-row" key={i}>
+              <input
+                className="rule-input"
+                {...NO_AUTOCORRECT}
+                value={r.from}
+                onChange={(e) => patchRewrite(i, { from: e.target.value })}
+                placeholder={t("settings.filters.rewriteFrom")}
+              />
+              <span className="rule-rewrite-arrow">→</span>
+              <input
+                className="rule-input"
+                {...NO_AUTOCORRECT}
+                value={r.to}
+                onChange={(e) => patchRewrite(i, { to: e.target.value })}
+                placeholder={t("settings.filters.rewriteTo")}
+              />
+              <button
+                className="icon-btn"
+                title={t("common.delete")}
+                disabled={rewrites.length === 1}
+                onClick={() =>
+                  setRewrites((rs) =>
+                    rs.length > 1 ? rs.filter((_, j) => j !== i) : rs,
+                  )
+                }
+              >
+                <Icon name="trash" size={13} />
+              </button>
+            </div>
+          ))}
+          <button
+            className="rule-add"
+            onClick={() => setRewrites((rs) => [...rs, { from: "", to: "" }])}
+          >
+            <Icon name="plus" size={11} /> {t("settings.filters.addRewrite")}
+          </button>
+          <p className="rule-rewrites-hint">{t("settings.filters.rewritesHint")}</p>
+        </div>
+      )}
+      {draftComplete && (
         <div className="rule-preview">
           <span className="rule-preview-count">
-            {previewing && !preview
-              ? t("settings.filters.preview.checking")
-              : t("settings.filters.preview.count", {
-                  count: preview?.count ?? 0,
-                })}
+            {previewInvalid
+              ? t("settings.filters.preview.invalid")
+              : previewing && !preview
+                ? t("settings.filters.preview.checking")
+                : t("settings.filters.preview.count", {
+                    count: preview?.count ?? 0,
+                  })}
           </span>
           {preview && preview.samples.length > 0 && (
             <ul className="rule-preview-samples">

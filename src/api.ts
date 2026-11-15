@@ -20,8 +20,9 @@ import type {
   RefreshProgress,
   Rule,
   RuleAction,
-  RuleField,
+  RuleCondition,
   RulePreview,
+  RuleRewrite,
   RsshubCatalog,
   RsshubEngineInfo,
   RsshubEngineStatus,
@@ -368,44 +369,55 @@ export const listRules = () => invoke<Rule[]>("list_rules");
 export const createRule = (
   name: string,
   feedId: number | null,
-  field: RuleField,
-  query: string,
+  conditions: RuleCondition[][],
   action: RuleAction,
-) => invoke<number>("create_rule", { name, feedId, field, query, action });
+  rewrites: RuleRewrite[],
+) =>
+  invoke<number>("create_rule", {
+    name,
+    feedId,
+    conditions,
+    action,
+    rewrites,
+  });
 export const updateRule = (
   id: number,
   name: string,
   enabled: boolean,
   feedId: number | null,
-  field: RuleField,
-  query: string,
+  conditions: RuleCondition[][],
   action: RuleAction,
+  rewrites: RuleRewrite[],
 ) =>
   invoke<void>("update_rule", {
     id,
     name,
     enabled,
     feedId,
-    field,
-    query,
+    conditions,
     action,
+    rewrites,
   });
 export const deleteRule = (id: number) => invoke<void>("delete_rule", { id });
 export const previewRule = (
   feedId: number | null,
-  field: RuleField,
-  query: string,
-) => invoke<RulePreview>("preview_rule", { feedId, field, query });
+  conditions: RuleCondition[][],
+) => invoke<RulePreview>("preview_rule", { feedId, conditions });
 /** Apply a rule's action to the already-stored articles it matches; returns the
  *  number acted on. Run once after saving so the rule affects the existing
  *  backlog. A `skip` rule deletes its matches — confirm before calling. */
 export const applyRuleToExisting = (
   feedId: number | null,
-  field: RuleField,
-  query: string,
+  conditions: RuleCondition[][],
   action: RuleAction,
+  rewrites: RuleRewrite[],
 ) =>
-  invoke<number>("apply_rule_to_existing", { feedId, field, query, action });
+  invoke<number>("apply_rule_to_existing", {
+    feedId,
+    conditions,
+    action,
+    rewrites,
+  });
 
 // ── highlights / annotations (F7) ──
 export interface NewHighlight {

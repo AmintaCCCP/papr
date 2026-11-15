@@ -1200,10 +1200,18 @@ pub async fn edit_feed_url(state: State<'_, AppState>, id: i64, url: String) -> 
         let dedup = db::setting_flag(&tx, "dedup_enabled", false);
         let rules = db::active_rules(&tx).unwrap_or_default();
         for article in &parsed.articles {
-            if let Some((start_read, start_starred)) =
-                db::article_precheck(&tx, id, article, dedup, &rules)?
-            {
-                db::insert_article_row(&tx, id, article, start_read, start_starred)?;
+            if let Some(effects) = db::article_precheck(&tx, id, article, dedup, &rules)? {
+                // Rewrites land on a clone; the borrow checker is happier with
+                // an owned option than with a conditional temporary.
+                let mut rewritten;
+                let stored: &db::NewArticle = if effects.rewrites.is_empty() {
+                    article
+                } else {
+                    rewritten = article.clone();
+                    db::apply_rewrites(&mut rewritten, &effects.rewrites);
+                    &rewritten
+                };
+                db::insert_article_row(&tx, id, stored, effects.read, effects.starred)?;
             }
         }
         // The document was fetched here, so record it — otherwise the feed
@@ -2628,6 +2636,14 @@ pub async fn set_article_tag(
 
 // ─────────────────────────── filter rules ───────────────────────────
 
+/// Validate a draft rule's When-document, mapping the model's error codes onto
+/// localisable [`AppError`]s. Runs on every write / preview path (the regex
+/// check compiles each pattern) so only well-formed rules land in the
+/// database; the matchers themselves stay defensive for hand-edited rows.
+fn validate_rule_conditions(conditions: &[Vec<RuleCondition>]) -> AppResult<()> {
+    validate_conditions(conditions).map_err(AppError::code)
+}
+
 #[tauri::command]
 pub async fn list_rules(state: State<'_, AppState>) -> AppResult<Vec<Rule>> {
     let conn = state.read().await;
@@ -2639,15 +2655,13 @@ pub async fn create_rule(
     state: State<'_, AppState>,
     name: String,
     feed_id: Option<i64>,
-    field: String,
-    query: String,
+    conditions: Vec<Vec<RuleCondition>>,
     action: String,
+    rewrites: Vec<RuleRewrite>,
 ) -> AppResult<i64> {
-    if query.trim().is_empty() {
-        return Err(AppError::code("emptyRuleQuery"));
-    }
+    validate_rule_parts(&conditions, &action, &rewrites).map_err(AppError::code)?;
     let conn = state.db.lock().await;
-    db::create_rule(&conn, name.trim(), feed_id, &field, query.trim(), &action)
+    db::create_rule(&conn, name.trim(), feed_id, &conditions, &action, &rewrites)
 }
 
 #[tauri::command]
@@ -2658,13 +2672,11 @@ pub async fn update_rule(
     name: String,
     enabled: bool,
     feed_id: Option<i64>,
-    field: String,
-    query: String,
+    conditions: Vec<Vec<RuleCondition>>,
     action: String,
+    rewrites: Vec<RuleRewrite>,
 ) -> AppResult<()> {
-    if query.trim().is_empty() {
-        return Err(AppError::code("emptyRuleQuery"));
-    }
+    validate_rule_parts(&conditions, &action, &rewrites).map_err(AppError::code)?;
     let conn = state.db.lock().await;
     db::update_rule(
         &conn,
@@ -2672,9 +2684,9 @@ pub async fn update_rule(
         name.trim(),
         enabled,
         feed_id,
-        &field,
-        query.trim(),
+        &conditions,
         &action,
+        &rewrites,
     )
 }
 
@@ -2692,15 +2704,13 @@ pub async fn delete_rule(state: State<'_, AppState>, id: i64) -> AppResult<()> {
 pub async fn apply_rule_to_existing(
     state: State<'_, AppState>,
     feed_id: Option<i64>,
-    field: String,
-    query: String,
+    conditions: Vec<Vec<RuleCondition>>,
     action: String,
+    rewrites: Vec<RuleRewrite>,
 ) -> AppResult<usize> {
-    if query.trim().is_empty() {
-        return Err(AppError::code("emptyRuleQuery"));
-    }
+    validate_rule_parts(&conditions, &action, &rewrites).map_err(AppError::code)?;
     let conn = state.db.lock().await;
-    db::apply_rule_to_existing(&conn, feed_id, &field, query.trim(), &action)
+    db::apply_rule_to_existing(&conn, feed_id, &conditions, &action, &rewrites)
 }
 
 /// Persist a reordered tag list (ids in the new display order).
@@ -2722,11 +2732,11 @@ pub struct RulePreview {
 pub async fn preview_rule(
     state: State<'_, AppState>,
     feed_id: Option<i64>,
-    field: String,
-    query: String,
+    conditions: Vec<Vec<RuleCondition>>,
 ) -> AppResult<RulePreview> {
+    validate_rule_conditions(&conditions)?;
     let conn = state.read().await;
-    let (count, samples) = db::preview_rule(&conn, feed_id, &field, query.trim())?;
+    let (count, samples) = db::preview_rule(&conn, feed_id, &conditions)?;
     Ok(RulePreview { count, samples })
 }
 
