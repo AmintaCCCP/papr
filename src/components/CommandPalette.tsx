@@ -191,6 +191,12 @@ export default function CommandPalette({
       ?.scrollIntoView({ block: "nearest" });
   }, [active]);
 
+  // Hooks must run on every render — this component early-returns while
+  // closed, so the backdrop-close props are built unconditionally up here
+  // instead of inline at the JSX site (a conditional hook call would crash
+  // React the moment `open` flips).
+  const backdropProps = useBackdropClose(onClose);
+
   if (!open) return null;
 
   const run = (it: Item) => {
@@ -265,7 +271,7 @@ export default function CommandPalette({
   };
 
   return (
-    <div className="cp-backdrop" {...useBackdropClose(onClose)}>
+    <div className="cp-backdrop" {...backdropProps}>
       <div className="cp" ref={cpRef} onClick={(e) => e.stopPropagation()}>
         <div className="cp-input">
           <Icon name="search" size={16} />
