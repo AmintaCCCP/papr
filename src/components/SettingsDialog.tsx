@@ -3315,16 +3315,16 @@ function RuleEditor({
   const patchRewrite = (i: number, patch: Partial<RuleRewrite>) =>
     setRewrites((rs) => rs.map((r, j) => (j !== i ? r : { ...r, ...patch })));
 
-  // The trimmed draft the save/preview paths use. A draft is complete when
-  // every condition carries a value (empty needles are rejected server-side);
-  // regex syntax is validated server-side too — JS `RegExp` and Rust `regex`
-  // disagree on inline flags like `(?i)`, so a client check would false-red
-  // valid patterns.
-  const draft: RuleCondition[][] = groups.map((g) =>
-    g.map((c) => ({ ...c, value: c.value.trim() })),
-  );
+  // The draft is sent as-typed — trimming would change what the rule means
+  // (a regex pattern `"foo "` must not become `"foo"`: that starts matching
+  // "foobar"). A draft is complete when every condition carries a non-blank
+  // value (whitespace-only needles are rejected server-side); regex syntax
+  // is validated server-side too — JS `RegExp` and Rust `regex` disagree on
+  // inline flags like `(?i)`, so a client check would false-red valid
+  // patterns.
+  const draft: RuleCondition[][] = groups;
   const draftComplete =
-    draft.flat().length > 0 && draft.flat().every((c) => c.value !== "");
+    draft.flat().length > 0 && draft.flat().every((c) => c.value.trim() !== "");
   const rewritesComplete =
     action !== "rewrite" || rewrites.every((r) => r.from.trim() !== "");
 

@@ -1610,7 +1610,13 @@ fn condition_matches(c: &RuleCondition, a: &NewArticle) -> bool {
     match c.operator.as_str() {
         "contains" => {
             let needle = c.value.to_lowercase();
+            // A needle with an embedded NUL stays inert: SQLite's LIKE treats
+            // its pattern as NUL-terminated, so the SQL twin could silently
+            // widen `%x\0y%` into `%` (match everything). Rust's `contains`
+            // keeps NULs literal — inert on both sides is the only way they
+            // can agree.
             !needle.is_empty()
+                && !needle.contains('\0')
                 && sources.iter().any(|h| h.to_lowercase().contains(&needle))
         }
         // Negations quantify over *all* sources: "no source contains" /
@@ -1618,6 +1624,7 @@ fn condition_matches(c: &RuleCondition, a: &NewArticle) -> bool {
         "not_contains" => {
             let needle = c.value.to_lowercase();
             !needle.is_empty()
+                && !needle.contains('\0')
                 && sources.iter().all(|h| !h.to_lowercase().contains(&needle))
         }
         "eq" => {
@@ -2769,6 +2776,13 @@ fn condition_where(c: &RuleCondition, binds: &mut Vec<Value>) -> String {
     let mut parts: Vec<String> = Vec::new();
     match c.operator.as_str() {
         "contains" | "not_contains" => {
+            // SQLite may truncate a LIKE pattern at an embedded NUL, which
+            // would silently widen the match; keep such needles inert here
+            // exactly as `condition_matches` does (eq / not_eq / regex don't
+            // use LIKE and are unaffected).
+            if c.value.contains('\0') {
+                return "0".to_string();
+            }
             let escaped = c.value.to_lowercase();
             let escaped = escaped
                 .replace('\\', "\\\\")
@@ -5378,6 +5392,62 @@ mod tests {
             .query_row("SELECT title FROM articles WHERE id = ?1", [x1], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "Rust Letter #1");
+    }
+
+    #[test]
+    fn nul_bearing_needles_are_inert_on_both_sides() {
+        // SQLite's LIKE treats its pattern as NUL-terminated: a needle like
+        // `x\0y` bound into `LIKE '%x\0y%'` can silently become `%` on the
+        // SQL side — matching *everything* — while Rust's `contains` keeps
+        // the NUL literal. `contains` / `not_contains` needles with embedded
+        // NULs are therefore inert on both sides, the same policy as
+        // whitespace-only values.
+        let (conn, _aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let contains_doc = vec![vec![cond("title", "contains", "a\0b")]];
+        let not_contains_doc = vec![vec![cond("title", "not_contains", "a\0b")]];
+        for (name, doc) in [("nul-c", &contains_doc), ("nul-nc", &not_contains_doc)] {
+            conn.execute(
+                "INSERT INTO rules(name, feed_id, field, query, action, position, conditions)
+                 VALUES (?1, NULL, 'title', '', 'skip', 0, ?2)",
+                params![name, serde_json::to_string(doc).unwrap()],
+            )
+            .unwrap();
+        }
+        let rules = active_rules(&conn).unwrap();
+
+        let mk = |guid: &str, title: &str| NewArticle {
+            guid: guid.into(),
+            url: Some(format!("https://example.com/{guid}")),
+            title: title.into(),
+            author: None,
+            summary: None,
+            content_html: None,
+            body_text: "body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        // A title that literally carries the needle still inserts — the
+        // contains rule is inert, not widened.
+        assert!(
+            upsert_article(&conn, feed_id, &mk("z1", "a\0b headline"), false, &rules).unwrap(),
+            "a NUL-bearing contains needle must never fire"
+        );
+        // An ordinary title would be matched by a (truncated) SQL pattern —
+        // inertness keeps it safe; and the not_contains rule must not turn
+        // into match-everything either.
+        assert!(
+            upsert_article(&conn, feed_id, &mk("z2", "ordinary headline"), false, &rules).unwrap(),
+            "a NUL-bearing not_contains needle must never fire"
+        );
+        // The SQL side agrees on both documents.
+        let (n1, _) = preview_rule(&conn, None, &contains_doc).unwrap();
+        let (n2, _) = preview_rule(&conn, None, &not_contains_doc).unwrap();
+        assert_eq!(n1, 0, "SQL contains stays inert for NUL needles");
+        assert_eq!(n2, 0, "SQL not_contains stays inert for NUL needles");
     }
 
     #[test]
