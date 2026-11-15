@@ -9,7 +9,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
-import { decideAutoTranslate } from "../lib/autoTranslate";
+import { useAutoTranslateOnOpen } from "../hooks/useAutoTranslate";
 import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
@@ -374,13 +374,9 @@ export default function Reader({ onToast }: Props) {
     // already put the reader back on the default body, so the next open of
     // the *same* article must re-apply its open mode (a mid-read feeds
     // refetch still can't yank the view — the marker is consumed right after
-    // the effect applies it). Same for the auto-translate marker — the reset
-    // above already hid the translation panel, and `showTranslation` is per
-    // open, so its guard must be too. Re-spending is still prevented by the
-    // effect's cached-translation check: a cached translation in the target
-    // language surfaces without a new job.
+    // the effect applies it). The auto-translate marker lives in
+    // useAutoTranslateOnOpen and resets with its view state there.
     openModeAppliedRef.current = null;
-    autoTranslatedRef.current = null;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -833,35 +829,30 @@ export default function Reader({ onToast }: Props) {
   // cached article doesn't re-spend an API call. The toolbar toggle still
   // lets the reader flip back to the original at any time.
   const autoTranslateNow = autoTranslateFeed || ruleAutoTranslate;
-  const autoTranslatedRef = useRef<number | null>(null);
-  useEffect(() => {
-    // The gating order lives in `decideAutoTranslate` (unit-tested in
-    // autoTranslate.test.ts — above all the delayed-settings scenario, where
-    // the saved configuration must win over the loading fallbacks); this
-    // effect only consumes the decision and owns the once-per-open marker.
-    const decision = decideAutoTranslate({
-      requested: autoTranslateNow,
-      articleId: a?.id ?? null,
-      openModeKnown: openMode !== undefined,
-      rulesFetching: ruleActionsQ.isFetching,
-      configReady: translateConfigReady,
-      extractionBlocking,
-      canTranslate,
-      alreadyMarked: !!(a && autoTranslatedRef.current === a.id),
-      hasCachedTranslation: !!(
-        a?.translatedHtml && a.translatedLang === targetLang
-      ),
-      targetLang,
-      engine,
-    });
-    if (!decision.proceed || !a) return;
-    autoTranslatedRef.current = a.id;
-    // A fresh cached translation for the target language needs no new job;
-    // just surface it. Otherwise start a background translation.
-    if (decision.start) startTranslate(a.id, decision.lang, decision.engine);
-    setShowTranslation(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, autoTranslateNow, openMode, translateConfigReady, ruleActionsQ.isFetching, extractionBlocking, canTranslate, targetLang, engine]);
+  // Auto-translate on open (see useAutoTranslateOnOpen + decideAutoTranslate
+  // for the full gating order and its tests): starts once the article is
+  // ready — effective open mode known, this open's rule fetch settled,
+  // translate settings loaded (never the loading fallbacks), extraction
+  // settled — then either surfaces a cached translation or starts a job with
+  // the saved configuration. The hook owns the once-per-open marker; the
+  // toolbar toggle still lets the reader flip back to the original at any
+  // time.
+  useAutoTranslateOnOpen({
+    requested: autoTranslateNow,
+    articleId: a?.id ?? null,
+    openModeKnown: openMode !== undefined,
+    rulesFetching: ruleActionsQ.isFetching,
+    configReady: translateConfigReady,
+    extractionBlocking,
+    canTranslate,
+    hasCachedTranslation: !!(
+      a?.translatedHtml && a.translatedLang === targetLang
+    ),
+    targetLang,
+    engine,
+    onStart: startTranslate,
+    onSurface: () => setShowTranslation(true),
+  });
 
   // Mark the current article read once its foot is reached. Also fires for an
   // article short enough to need no scrolling at all (`scrollHeight` already
