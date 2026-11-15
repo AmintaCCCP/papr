@@ -136,7 +136,9 @@ pub struct RuleRewrite {
     pub to: String,
 }
 
-/// A user-defined filter applied to incoming articles at ingestion time.
+/// A user-defined filter rule. Ingestion-time actions apply the moment an
+/// article lands; open-time actions take effect when a matching article is
+/// opened in the reader (see [`RULE_ACTIONS`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -150,7 +152,9 @@ pub struct Rule {
     /// group matches. Legacy rules (v≤23) had no stored document; `row_to_rule`
     /// synthesises one from their `field`/`query` keyword columns.
     pub conditions: Vec<Vec<RuleCondition>>,
-    /// What to do on a match: `skip` | `read` | `star` | `rewrite`.
+    /// What to do on a match: an ingestion-time action (`skip` | `read` |
+    /// `star` | `rewrite`) or an open-time one (`translate` | `summarize` |
+    /// `fulltext` | `open_original`).
     pub action: String,
     /// Literal from→to replacements applied when `action` is `rewrite`.
     pub rewrites: Vec<RuleRewrite>,
@@ -168,8 +172,31 @@ pub const RULE_FIELDS: &[&str] = &["title", "author", "content", "any", "url"];
 pub const RULE_OPERATORS: &[&str] =
     &["contains", "not_contains", "eq", "not_eq", "regex"];
 
-/// What a rule can do when it fires.
-pub const RULE_ACTIONS: &[&str] = &["skip", "read", "star", "rewrite"];
+/// What a rule can do when it fires. Two timing classes: the ingestion-time
+/// actions (`skip` drops the article, `read` / `star` pre-set its flags,
+/// `rewrite` replaces text) apply once, as the article lands; the open-time
+/// actions (`translate` / `summarize` / `fulltext` / `open_original`) are
+/// reader behaviours that take effect when a matching article is opened —
+/// see [`RULE_OPEN_ACTIONS`]. Open-time actions need no backfill: evaluating
+/// the stored rules against the row at open time (SQL side:
+/// `rule_match_where`) covers existing articles automatically, and nothing is
+/// spent (network / LLM calls) until the reader actually opens the article.
+pub const RULE_ACTIONS: &[&str] = &[
+    "skip",
+    "read",
+    "star",
+    "rewrite",
+    "translate",
+    "summarize",
+    "fulltext",
+    "open_original",
+];
+
+/// The open-time subset of [`RULE_ACTIONS`]: the actions
+/// `db::rule_actions_for_article` collects when the reader opens an article.
+/// Ingestion-time actions are not listed here — by the time a row exists they
+/// have already acted (or dropped it), so there is nothing left to re-derive.
+pub const RULE_OPEN_ACTIONS: &[&str] = &["translate", "summarize", "fulltext", "open_original"];
 
 impl RuleCondition {
     /// True when the condition is well-formed enough to save: a known field
@@ -246,7 +273,8 @@ pub fn validate_conditions(
 }
 
 /// Validate a draft rule's full Then-parts (action + rewrites) on top of its
-/// When-document.
+/// When-document. Open-time actions carry no Then-extras — their effect lives
+/// in the action name itself, resolved against the reader at open time.
 pub fn validate_rule_parts(
     conditions: &[Vec<RuleCondition>],
     action: &str,

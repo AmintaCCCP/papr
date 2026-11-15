@@ -2740,6 +2740,18 @@ pub async fn preview_rule(
     Ok(RulePreview { count, samples })
 }
 
+/// The open-time rule actions (`translate` / `summarize` / `fulltext` /
+/// `open_original`) matching the article — the reader asks this as the
+/// article opens, so an open-time rule affects the existing backlog too.
+#[tauri::command]
+pub async fn rule_actions_for_article(
+    state: State<'_, AppState>,
+    id: i64,
+) -> AppResult<Vec<String>> {
+    let conn = state.read().await;
+    db::rule_actions_for_article(&conn, id)
+}
+
 // ─────────────────────────── newsletter sources ───────────────────────────
 
 /// A configured email-newsletter source, as shown in the UI (no password).

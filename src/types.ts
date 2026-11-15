@@ -213,7 +213,30 @@ export type RuleOperator =
   | "eq"
   | "not_eq"
   | "regex";
-export type RuleAction = "skip" | "read" | "star" | "rewrite";
+/** What a rule does when it fires. Ingestion-time actions act once as the
+ *  article lands (`skip` / `read` / `star` / `rewrite`); open-time actions are
+ *  reader behaviours resolved when a matching article is opened — see
+ *  RULE_OPEN_ACTIONS below. */
+export type RuleAction =
+  | "skip"
+  | "read"
+  | "star"
+  | "rewrite"
+  | "translate"
+  | "summarize"
+  | "fulltext"
+  | "open_original";
+
+/** The open-time subset of RULE_ACTIONS: resolved per article by the
+ *  rule_actions_for_article command as the reader opens it, so editing a rule
+ *  affects every matching article (old or new) with no backfill. */
+export type RuleOpenAction = "translate" | "summarize" | "fulltext" | "open_original";
+export const RULE_OPEN_ACTIONS: RuleOpenAction[] = [
+  "translate",
+  "summarize",
+  "fulltext",
+  "open_original",
+];
 
 /** Runtime mirrors of models.rs's RULE_* constants — the Select options for
  *  the rule editor are built from these so the two sides stay in lockstep. */
@@ -231,7 +254,16 @@ export const RULE_OPERATORS: RuleOperator[] = [
   "not_eq",
   "regex",
 ];
-export const RULE_ACTIONS: RuleAction[] = ["skip", "read", "star", "rewrite"];
+export const RULE_ACTIONS: RuleAction[] = [
+  "skip",
+  "read",
+  "star",
+  "rewrite",
+  "translate",
+  "summarize",
+  "fulltext",
+  "open_original",
+];
 
 /** One When-condition: `value` tested against one `field` with one `operator`.
  *  Mirrors models::RuleCondition. */

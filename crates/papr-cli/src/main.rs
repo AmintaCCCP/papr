@@ -322,8 +322,11 @@ enum RuleCmd {
         /// Which text to match.
         #[arg(long, default_value = "title", value_parser = ["title", "author", "content", "any", "url"])]
         field: String,
-        /// What to do on a match.
-        #[arg(long, default_value = "skip", value_parser = ["skip", "read", "star", "rewrite"])]
+        /// What to do on a match. `skip` / `read` / `star` / `rewrite` act as
+        /// articles are fetched; `translate` / `summarize` / `fulltext` /
+        /// `open_original` are reader behaviours that take effect when a
+        /// matching article is opened.
+        #[arg(long, default_value = "skip", value_parser = ["skip", "read", "star", "rewrite", "translate", "summarize", "fulltext", "open_original"])]
         action: String,
         /// Scope the rule to one feed (default: all feeds).
         #[arg(long, value_name = "ID")]

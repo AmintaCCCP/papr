@@ -302,19 +302,46 @@ export default function Reader({ onToast }: Props) {
   // Feed list, so the article's source feed can be checked for its per-feed
   // auto-translate flag. Shared cache key with the sidebar — no extra fetch.
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
+  // Open-time rule actions for this article (`translate` / `summarize` /
+  // `fulltext` / `open_original`), resolved against the live rules when the
+  // article opens — so editing a rule affects matching articles old and new,
+  // with no per-article state (rule edits invalidate this cache). While the
+  // query is in flight `ruleOpenMode` below stays `undefined`, so the
+  // once-per-article effects wait instead of firing before the rules are
+  // known; a failed query degrades to "no rule actions".
+  const ruleActionsQ = useQuery({
+    queryKey: ["ruleActions", id],
+    queryFn: () => api.getRuleActions(id!),
+    enabled: !!id,
+  });
+  const ruleActions = ruleActionsQ.data ?? [];
+  const ruleAutoTranslate = ruleActions.includes("translate");
+  const ruleAutoSummarize = ruleActions.includes("summarize");
   const autoTranslateFeed = !!(
     a && feeds.data?.find((f) => f.id === a.feedId)?.autoTranslate
   );
   // Effective open mode (issue #110): the feed's own setting, falling back to
-  // the global default. `undefined` while the article or feed list is still
-  // loading, so the open-mode/auto-extract effects below don't fire before the
-  // feed's own setting is known.
+  // the global default. A matching rule (`fulltext` → auto extraction,
+  // `open_original` → embedded web view) is the most specific intent, so it
+  // wins over both; `open_original` beats `fulltext` when rules ask for both.
+  // `undefined` while the article, feed list or rule query is still loading,
+  // so the open-mode/auto-extract effects below don't fire before the whole
+  // picture is known.
   const feedOpenMode =
     a && feeds.data
       ? feeds.data.find((f) => f.id === a.feedId)?.openMode ?? null
       : undefined;
+  const ruleOpenMode = ruleActionsQ.isLoading
+    ? undefined
+    : ruleActions.includes("open_original")
+      ? "web"
+      : ruleActions.includes("fulltext")
+        ? "extracted"
+        : null;
   const openMode =
-    feedOpenMode === undefined ? undefined : feedOpenMode ?? defaultOpenMode;
+    feedOpenMode === undefined || ruleOpenMode === undefined
+      ? undefined
+      : (ruleOpenMode ?? (feedOpenMode ?? defaultOpenMode));
 
   const readMinutes = useMemo(() => {
     return estimateReadMinutes(bodyPlainText(a?.extractedHtml || a?.contentHtml || ""));
@@ -353,18 +380,21 @@ export default function Reader({ onToast }: Props) {
     else setShowExtracted(openMode === "extracted");
   }, [a, openMode]);
 
-  // Auto-load the summary (Folo-style): with the preference on, the card
-  // appears as soon as the article loads — a cached summary shows instantly,
-  // a missing one starts generating (see AISummary). Fires once per article
-  // and only while the card is closed, so dismissing it keeps it closed for
-  // this article; switching away and back loads it again.
+  // Auto-load the summary (Folo-style): with the preference on — or a matching
+  // rule asking for `summarize` — the card appears as soon as the article
+  // loads. A cached summary shows instantly, a missing one starts generating
+  // (see AISummary). Fires once per article and only while the card is closed,
+  // so dismissing it keeps it closed for this article; switching away and back
+  // loads it again. Waits for the rule query so a rule-driven open isn't lost
+  // to the once-per-article ref firing early.
+  const autoSummarizeNow = autoSummarize || ruleAutoSummarize;
   useEffect(() => {
-    if (!a || !autoSummarize) return;
+    if (!a || ruleActionsQ.isLoading || !autoSummarizeNow) return;
     if (autoSummarizedRef.current === a.id) return;
     autoSummarizedRef.current = a.id;
     setAiOpen(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, autoSummarize]);
+  }, [a?.id, autoSummarizeNow, ruleActionsQ.isLoading]);
 
   // Drive the native original-page child webview (page_view.rs) while in web
   // mode. It floats above the DOM, so we measure the host rect and keep the
@@ -716,26 +746,32 @@ export default function Reader({ onToast }: Props) {
     // meant to replace. `bodyPlainText` decodes entities and drops markup
     // cleanly, the same measurement the reading-time estimate already uses.
     // An explicit per-feed "extracted" skips the bar entirely — the user asked
-    // for the page's own text even when the feed body looks complete.
-    if (feedOpenMode !== "extracted") {
+    // for the page's own text even when the feed body looks complete. So does
+    // a matching rule's `fulltext` action: the rule is the same explicit ask.
+    if (feedOpenMode !== "extracted" && ruleOpenMode !== "extracted") {
       const plain = bodyPlainText(a.contentHtml || "").trim();
       if (plain.length >= 800) return; // feed already delivers the full text
     }
     autoExtractedRef.current = a.id;
     extract.mutate(a.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, a?.extractedHtml, openMode, feedOpenMode, isXPost]);
+  }, [a?.id, a?.extractedHtml, openMode, feedOpenMode, ruleOpenMode, isXPost]);
 
-  // Per-feed auto-translate: when the article's source feed opts in, translate
-  // it into the configured target the moment it opens. Fires once per article
-  // (guarded by `autoTranslatedRef`), only when there's a body to translate and
-  // a usable cached translation in the target language isn't already present —
-  // so a feed left untouched still shows its original text, and reopening a
-  // cached article doesn't re-spend an API call. The toolbar toggle still lets
-  // the reader flip back to the original at any time.
+  // Auto-translate on open: when the article's source feed opts in — or a
+  // matching rule asks for `translate` — translate it into the configured
+  // target the moment it opens. Waits for the rule query so a rule-driven
+  // translation isn't lost to the once-per-article ref firing early. Fires
+  // once per article (guarded by `autoTranslatedRef`), only when there's a
+  // body to translate and a usable cached translation in the target language
+  // isn't already present — so a feed left untouched still shows its original
+  // text, and reopening a cached article doesn't re-spend an API call. The
+  // toolbar toggle still lets the reader flip back to the original at any
+  // time.
+  const autoTranslateNow = autoTranslateFeed || ruleAutoTranslate;
   const autoTranslatedRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!autoTranslateFeed || !a || !canTranslate) return;
+    if (!autoTranslateNow || ruleActionsQ.isLoading || !a || !canTranslate)
+      return;
     if (autoTranslatedRef.current === a.id) return;
     autoTranslatedRef.current = a.id;
     // A fresh cached translation for the target language needs no new job;
@@ -745,7 +781,7 @@ export default function Reader({ onToast }: Props) {
     }
     setShowTranslation(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, autoTranslateFeed, canTranslate, targetLang, engine]);
+  }, [a?.id, autoTranslateNow, ruleActionsQ.isLoading, canTranslate, targetLang, engine]);
 
   // Mark the current article read once its foot is reached. Also fires for an
   // article short enough to need no scrolling at all (`scrollHeight` already
