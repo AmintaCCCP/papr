@@ -60,8 +60,10 @@ pub struct ParserConfig {
     /// X: the `ct0` CSRF cookie (sent back as `X-CSRF-Token`).
     pub ct0: Option<String>,
     /// Xiaohongshu / Kuaishou: the pasted `Cookie` header from a logged-in
-    /// browser session. Optional for both — xiaohongshu works anonymously
-    /// from the SSR page, kuaishou's web API is captcha-gated without it.
+    /// browser session. Kuaishou's live-api answers anonymous requests with
+    /// the captcha gate, so there the cookie is required; xiaohongshu's SSR
+    /// also only serves browser-fingerprinted clients anonymously — the
+    /// cookie is the reliable path for both.
     pub cookie: Option<String>,
 }
 

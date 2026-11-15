@@ -1,37 +1,45 @@
 //! Built-in Kuaishou parser: turns a creator profile URL into feed data from
-//! the www.kuaishou.com GraphQL web API.
+//! live.kuaishou.com's plain JSON web APIs.
 //!
 //! Upstream reality (verified 2026-11 against the live site):
-//! - The profile page itself is a client-rendered SPA shell — the SSR
-//!   document carries no feed data.
-//! - The SPA reads the feed from `POST /graphql`
-//!   (`visionProfile` / `visionProfilePhotoList`), the same operations the
-//!   web client sends.
-//! - Anonymous traffic to those operations is captcha-gated (`result: 400002`,
-//!   `bizName: ANTICRAWL_DEFAULT`) — the SPA survives it because the web
-//!   client's own signed REST endpoints (`/rest/v/profile/feed?__NS_hxfalcon=…`)
-//!   run inside the page's JS signing realm, a VM-obfuscated signer no plain
-//!   HTTP client can reproduce faithfully.
+//! - www.kuaishou.com's profile page is a client-rendered SPA shell, and the
+//!   unsigned GraphQL route is gone for good: the `Photo` type became an
+//!   interface (`Cannot query field "id" on type "Photo"` — HTTP 400, the
+//!   fields moved behind `... on PhotoEntity` inline fragments), and a schema
+//!   fix only reaches the next gate — `visionProfilePhotoList` then answers
+//!   `result: 50` to any unsigned call, because the web client signs its own
+//!   requests with `__NS_hxfalcon`, a VM-obfuscated signer no plain HTTP
+//!   client reproduces faithfully.
+//! - live.kuaishou.com still serves two plain, unsigned JSON endpoints that
+//!   the profile SPA itself calls: `/live_api/baseuser/userinfo/byid`
+//!   (name / avatar / bio / ban status) and `/live_api/profile/public` (the
+//!   newest ~20 works: id, cover, video, gallery, like counts). Both are
+//!   login-gated for anonymous traffic (`result: 2`, or the `400002` captcha
+//!   shape), so the parser requires the pasted logged-in `Cookie`
+//!   (Settings → Parsers), mirroring the X parser's credential model. For a
+//!   cookie-free setup, the RSSHub route marketplace's browser-flavor engine
+//!   can run the signed flow headlessly — the error copy says so.
+//! - The works payload carries no captions and no publish timestamps (the
+//!   profile grid shows neither either): articles are media cards titled by
+//!   work type and deduped by the stable work id — the same limitation the
+//!   RSSHub route lives with.
 //!
-//! So this parser runs one request shape: the unsigned GraphQL operations
-//! with the full browser XHR header group. Anonymous mode tries it first and
-//! surfaces the captcha as a distinct coded error; pasting a logged-in
-//! `Cookie` (Settings → Parsers) is the supported path, mirroring the X
-//! parser's credential model. For a cookie-free setup, the RSSHub route
-//! marketplace's browser-flavor engine can run the signed flow headlessly —
-//! the error copy says so.
+//! Anti-abuse posture: read-only, first page only, strictly serial per feed
+//! leg, jittered pacing between feeds, cookies only in an explicit header
+//! (never a jar), and every response's final URL must still belong to
+//! kuaishou.com.
 
 use crate::error::AppError;
 use reqwest::{Client, StatusCode};
-use serde_json::{json, Value};
+use serde_json::Value;
 use url::Url;
 
 use super::transport::{browser_api_headers, is_host_or_subdomain};
 
 /// The site every kuaishou request must stay on.
 const REGISTRABLE_DOMAIN: &str = "kuaishou.com";
-/// The host the GraphQL API lives on.
-const WEB_HOST: &str = "www.kuaishou.com";
+/// The host the JSON web APIs live on.
+const LIVE_HOST: &str = "live.kuaishou.com";
 
 /// Pause between per-feed fetches (the refresh leg adds jitter).
 pub const FEED_THROTTLE_MS: u64 = 900;
@@ -47,11 +55,13 @@ pub const CODE_HANDLE_INVALID: &str = "kuaishouHandleInvalid";
 /// Everything that can go wrong while fetching one profile.
 #[derive(Debug, thiserror::Error)]
 pub enum KsError {
-    /// `result: 400002` — the anti-crawl captcha. Anonymous traffic hits
-    /// this by design; a stale cookie can too, so the message covers both.
+    /// `result: 400002`, or an anonymous `result: 2` — the anti-crawl gate.
+    /// Anonymous traffic hits this by design; a stale cookie can too, so the
+    /// message covers both.
     #[error("captcha")]
     Captcha,
-    /// `result: 2/50` — rate-limited, risk-controlled or signature-required.
+    /// `result: 2/50` with a cookie — rate-limited, risk-controlled or
+    /// signature-required.
     #[error("blocked")]
     Blocked,
     /// The creator is gone, banned, or the profile is private.
@@ -100,7 +110,9 @@ pub type KsResult<T> = Result<T, KsError>;
 /* ── URL / profile-id normalisation (pure) ───────────────────────────── */
 
 /// True for a syntactically valid Kuaishou principal id: 10–24 lowercase
-/// letters/digits (the web profile path's format, e.g. `3x4kuwfd24jzzf4`).
+/// letters/digits. Covers both shapes the live profile URLs use — the
+/// `3x…`-style web ids and 10-char app short names — both of which the
+/// `principalId=` endpoints resolve.
 pub fn is_valid_profile_id(id: &str) -> bool {
     (10..=24).contains(&id.len())
         && id
@@ -130,7 +142,7 @@ pub fn normalize_kuaishou_url(url: &Url) -> Option<String> {
     if !is_valid_profile_id(&id) {
         return None;
     }
-    Some(format!("https://{WEB_HOST}/profile/{id}"))
+    Some(format!("https://www.kuaishou.com/profile/{id}"))
 }
 
 /// Recognize an app share short link (`https://v.kuaishou.com/<token>`).
@@ -147,7 +159,7 @@ pub fn is_kuaishou_short_url(url: &Url) -> bool {
 /// [`normalize_kuaishou_url`] restricted to canonical URLs.
 pub fn profile_id_from_feed_url(feed_url: &str) -> Option<String> {
     let url = Url::parse(feed_url).ok()?;
-    if url.host_str()?.to_lowercase() != WEB_HOST {
+    if url.host_str()?.to_lowercase() != "www.kuaishou.com" {
         return None;
     }
     let segments: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
@@ -178,37 +190,9 @@ pub fn sanitize_profile_input(input: &str) -> Option<String> {
     None
 }
 
-/* ── GraphQL request bodies (pure) ───────────────────────────────────── */
-
-/// The `visionProfile` operation — creator metadata (nickname, avatar, bio).
-pub fn build_vision_profile_body(user_id: &str) -> Value {
-    json!({
-        "operationName": "visionProfile",
-        "variables": { "userId": user_id },
-        "query": "query visionProfile($userId: String) { visionProfile(userId: $userId) { result hostName userProfile { ownerCount { fan photo follow photo_public } profile { gender user_name user_id headurl user_text user_profile_bg_url } isFollowing } } }",
-    })
-}
-
-/// The `visionProfilePhotoList` operation, page 1. The periodic-refresh model
-/// re-pulls the newest page each cycle and dedupes by photo id — the `pcursor`
-/// is parsed but never followed.
-pub fn build_photo_list_body(user_id: &str) -> Value {
-    json!({
-        "operationName": "visionProfilePhotoList",
-        "variables": { "page": "profile", "pcursor": "", "userId": user_id },
-        "query": PHOTO_LIST_QUERY,
-    })
-}
-
-/// The feed-list query, verbatim the web client's own shape (ported from the
-/// battle-tested open-source clients). Its selection set is the contract the
-/// parser below walks; widening it risks schema errors that fail the whole
-/// operation.
-const PHOTO_LIST_QUERY: &str = "query visionProfilePhotoList($pcursor: String, $userId: String, $page: String, $webPageArea: String) { visionProfilePhotoList(pcursor: $pcursor, userId: $userId, page: $page, webPageArea: $webPageArea) { result llsid webPageArea feeds { type author { id name headerUrl } photo { id duration caption originCaption likeCount viewCount commentCount realLikeCount coverUrl photoUrl coverUrls { url } timestamp expTag animatedCoverUrl distance videoRatio liked stereoType profileUserTopPhoto musicBlocked } canAddComment llsid status currentPcursor tags { type name } } hostName pcursor } }";
-
 /* ── parsed shapes ───────────────────────────────────────────────────── */
 
-/// The creator resolved via `visionProfile`.
+/// The creator resolved via `/live_api/baseuser/userinfo/byid`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KsProfile {
     pub user_id: String,
@@ -221,18 +205,17 @@ pub struct KsProfile {
 /// One work mapped for ingestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KsPhoto {
-    /// Photo id — the stable dedup key (`articles.guid`).
+    /// Work id — the stable dedup key (`articles.guid`).
     pub id: String,
-    pub caption: String,
-    /// Author display name as shipped on the feed row.
-    pub author: Option<String>,
-    /// Best cover (`coverUrl`, else the first `coverUrls` entry).
+    /// As shipped by the payload: `"video"`, `"multiple"` (image set), …
+    pub work_type: Option<String>,
+    /// Best cover (`poster`).
     pub cover: Option<String>,
     /// The mp4 URL, when the work is a video.
     pub video: Option<String>,
-    /// Publish time, epoch milliseconds.
-    pub timestamp_ms: Option<i64>,
-    /// Like counter, as shipped (raw number or `-1` when hidden).
+    /// Gallery images for image-set works.
+    pub images: Vec<String>,
+    /// Like counter, as shipped (`counts.like`).
     pub like_count: Option<String>,
 }
 
@@ -243,166 +226,158 @@ pub struct KsUserPage {
     pub photos: Vec<KsPhoto>,
 }
 
-/// Map a GraphQL `result` code onto the error taxonomy.
-fn result_to_error(result: i64) -> KsError {
+/// Map a live-api `result` code onto the error taxonomy. Anonymous traffic is
+/// refused with `2` or the `400002` captcha shape — both read as "configure a
+/// cookie" when no cookie was sent; the same codes with a cookie sent are
+/// risk control, not a missing credential.
+fn result_to_error(result: i64, cookie_sent: bool) -> KsError {
     match result {
         400002 => KsError::Captcha,
-        2 | 50 => KsError::Blocked,
+        2 | 50 if cookie_sent => KsError::Blocked,
+        2 | 50 => KsError::Captcha,
         _ => KsError::Unavailable(format!("result {result}")),
     }
 }
 
-/// Pull the operation payload out of a GraphQL response. Kuaishou wraps
-/// success under `data.<operation>`; failures collapse to `data.result` (the
-/// captcha shape) without the operation key. Top-level fallbacks keep the
-/// parser total across both shapes.
-fn operation_payload<'a>(response: &'a Value, operation: &str) -> Option<&'a Value> {
-    if let Some(op) = response.pointer(&format!("/data/{operation}")) {
-        return Some(op);
+/// Walk a live-api envelope: `{"data": {"result": 1, …}}`. Returns the `data`
+/// object after checking `result` (absent result counts as success — the
+/// payloads ship it only on failure).
+fn envelope_data(response: &Value, cookie_sent: bool) -> KsResult<&Value> {
+    let data = response
+        .get("data")
+        .filter(|d| d.is_object())
+        .ok_or_else(|| KsError::Parse("live api: no `data` object".into()))?;
+    if let Some(result) = data.get("result").and_then(|r| r.as_i64()) {
+        if result != 1 {
+            return Err(result_to_error(result, cookie_sent));
+        }
     }
-    if let Some(op) = response.get(operation) {
-        return Some(op);
-    }
-    response.pointer("/data").or(Some(response))
+    Ok(data)
 }
 
-/// Parse the `visionProfile` response.
-pub fn parse_profile_response(response: &str) -> KsResult<KsProfile> {
-    let value: Value =
-        serde_json::from_str(response).map_err(|e| KsError::Parse(format!("profile json: {e}")))?;
-    let payload = operation_payload(&value, "visionProfile");
-    let result = payload
-        .and_then(|p| p.get("result"))
-        .and_then(|r| r.as_i64())
-        .unwrap_or(0);
-    if result != 1 {
-        return Err(result_to_error(result));
+/// Parse the `/live_api/baseuser/userinfo/byid` response. `cookie_sent`
+/// distinguishes "the credential was refused" (`Blocked`) from "there was no
+/// credential to refuse" (`Captcha`) for the gate codes.
+pub fn parse_userinfo_response(
+    response: &str,
+    principal: &str,
+    cookie_sent: bool,
+) -> KsResult<KsProfile> {
+    let value: Value = serde_json::from_str(response)
+        .map_err(|e| KsError::Parse(format!("userinfo json: {e}")))?;
+    let data = envelope_data(&value, cookie_sent)?;
+    let user = data
+        .get("userInfo")
+        .filter(|u| u.is_object())
+        .ok_or_else(|| KsError::Unavailable("userinfo returned no userInfo".into()))?;
+    let banned = user
+        .pointer("/bannedStatus/banned")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let social_banned = user
+        .pointer("/bannedStatus/socialBanned")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let isolate = user
+        .pointer("/bannedStatus/isolate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if banned || social_banned || isolate {
+        return Err(KsError::Unavailable("account banned or suspended".into()));
     }
-    let profile = payload
-        .and_then(|p| p.pointer("/userProfile/profile"))
-        .ok_or_else(|| KsError::Unavailable("visionProfile returned no userProfile".into()))?;
-    let user_id = profile
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let name = profile
-        .get("user_name")
+    let name = user
+        .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .trim()
         .to_string();
     if name.is_empty() {
-        return Err(KsError::Unavailable("profile has no nickname".into()));
+        return Err(KsError::Unavailable("userinfo has no nickname".into()));
     }
     Ok(KsProfile {
-        user_id,
+        user_id: user
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(principal)
+            .to_string(),
         name,
-        avatar: profile
-            .get("headurl")
+        avatar: user
+            .get("avatar")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from),
-        bio: profile
-            .get("user_text")
+        bio: user
+            .get("description")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .map(String::from),
-        fan: payload
-            .and_then(|p| p.pointer("/userProfile/ownerCount/fan"))
-            .and_then(|v| v.as_i64())
-            .map(|n| n.to_string()),
+        fan: None,
     })
 }
 
-/// Parse the `visionProfilePhotoList` response into typed photos.
-pub fn parse_photo_list_response(response: &str) -> KsResult<(Vec<KsPhoto>, String)> {
+/// Parse the `/live_api/profile/public` response into typed works.
+/// `cookie_sent` distinguishes the anonymous gate (`Captcha`) from a refused
+/// credential (`Blocked`), as in [`parse_userinfo_response`].
+pub fn parse_public_profile_response(response: &str, cookie_sent: bool) -> KsResult<Vec<KsPhoto>> {
     let value: Value = serde_json::from_str(response)
-        .map_err(|e| KsError::Parse(format!("photo list json: {e}")))?;
-    let payload = operation_payload(&value, "visionProfilePhotoList");
-    let result = payload
-        .and_then(|p| p.get("result"))
-        .and_then(|r| r.as_i64())
-        .unwrap_or(0);
-    if result != 1 {
-        return Err(result_to_error(result));
-    }
-    let pcursor = payload
-        .and_then(|p| p.get("pcursor"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+        .map_err(|e| KsError::Parse(format!("profile public json: {e}")))?;
+    let data = envelope_data(&value, cookie_sent)?;
+    let list = data
+        .get("list")
+        .and_then(|l| l.as_array())
+        .ok_or_else(|| KsError::Parse("profile public: no `list`".into()))?;
     let mut photos = Vec::new();
-    if let Some(feeds) = payload
-        .and_then(|p| p.get("feeds"))
-        .and_then(|f| f.as_array())
-    {
-        for feed in feeds {
-            let photo = feed.get("photo");
-            let id = photo
-                .and_then(|p| p.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if id.is_empty() {
-                continue;
-            }
-            let caption = photo
-                .and_then(|p| p.get("caption").or_else(|| p.get("originCaption")))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let cover = photo
-                .and_then(|p| p.get("coverUrl"))
+    for item in list {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let images: Vec<String> = item
+            .get("imgUrls")
+            .and_then(|v| v.as_array())
+            .map(|urls| {
+                urls.iter()
+                    .filter_map(|u| u.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let like_count = item
+            .pointer("/counts/like")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n >= 0)
+            .map(|n| n.to_string());
+        photos.push(KsPhoto {
+            id,
+            work_type: item
+                .get("workType")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .map(String::from)
-                .or_else(|| {
-                    photo
-                        .and_then(|p| p.get("coverUrls"))
-                        .and_then(|v| v.as_array())
-                        .and_then(|list| list.first())
-                        .and_then(|c| c.get("url"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                });
-            photos.push(KsPhoto {
-                id,
-                caption,
-                author: feed
-                    .get("author")
-                    .and_then(|a| a.get("name"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
-                cover,
-                video: photo
-                    .and_then(|p| p.get("photoUrl"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
-                timestamp_ms: photo
-                    .and_then(|p| p.get("timestamp"))
-                    .and_then(|v| v.as_i64()),
-                like_count: photo
-                    .and_then(|p| p.get("realLikeCount").or_else(|| p.get("likeCount")))
-                    .and_then(|v| v.as_i64())
-                    .filter(|n| *n >= 0)
-                    .map(|n| n.to_string()),
-            });
-        }
+                .map(String::from),
+            cover: item
+                .get("poster")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            video: item
+                .get("playUrl")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            images,
+            like_count,
+        });
     }
-    Ok((photos, pcursor))
+    Ok(photos)
 }
 
-/* ── dates / article builders (pure) ─────────────────────────────────── */
-
-/// Epoch milliseconds → RFC 3339.
-pub fn ms_to_rfc3339(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339())
-}
+/* ── article builders (pure) ─────────────────────────────────────────── */
 
 fn escape_html_text(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -411,10 +386,21 @@ fn escape_html_text(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The fallback title for a caption-less work. The payload carries no
+/// captions, so the work type is what the card can say.
+fn work_title(photo: &KsPhoto) -> &'static str {
+    match photo.work_type.as_deref() {
+        Some("video") => "视频作品",
+        Some("multiple") => "图集作品",
+        _ => "作品",
+    }
+}
+
 /// Map one work to the ingestion shape: video player (with poster) when the
-/// payload carries an mp4, cover image otherwise, caption below.
-pub fn photo_to_article(photo: &KsPhoto, profile_url: &str) -> crate::db::NewArticle {
-    let permalink = format!("https://{WEB_HOST}/short-video/{}", photo.id);
+/// payload carries an mp4, gallery images otherwise (falling back to the
+/// cover), meta line below.
+pub fn photo_to_article(photo: &KsPhoto, _profile_url: &str) -> crate::db::NewArticle {
+    let permalink = format!("https://www.kuaishou.com/short-video/{}", photo.id);
     let sanitize_base = permalink.clone();
     let mut html = String::new();
     match (&photo.video, &photo.cover) {
@@ -431,45 +417,38 @@ pub fn photo_to_article(photo: &KsPhoto, profile_url: &str) -> crate::db::NewArt
                 escape_html_text(video)
             ));
         }
-        (None, Some(cover)) => {
-            html.push_str(&format!(
-                "<p><img src=\"{}\" alt=\"{}\"></p>",
-                escape_html_text(cover),
-                escape_html_text(&photo.caption)
-            ));
+        _ => {}
+    }
+    let gallery: Vec<&String> = if photo.images.is_empty() {
+        photo.cover.iter().collect()
+    } else {
+        photo.images.iter().collect()
+    };
+    if !photo.video.is_some() {
+        for image in gallery {
+            html.push_str(&format!("<p><img src=\"{}\"></p>", escape_html_text(image)));
         }
-        (None, None) => {}
     }
-    if !photo.caption.is_empty() {
-        html.push_str(&format!(
-            "<p>{}</p>",
-            escape_html_text(&photo.caption)
-                .split('\n')
-                .collect::<Vec<_>>()
-                .join("<br>")
-        ));
+    let mut meta = Vec::new();
+    if let Some(likes) = &photo.like_count {
+        meta.push(format!("♥ {}", escape_html_text(likes)));
     }
-    let _ = profile_url;
+    if !meta.is_empty() {
+        html.push_str(&format!("<p>{}</p>", escape_html_text(&meta.join(" · "))));
+    }
     crate::db::NewArticle {
         guid: photo.id.clone(),
         url: Some(permalink),
-        title: if photo.caption.is_empty() {
-            match photo.timestamp_ms.and_then(ms_to_rfc3339) {
-                Some(ts) => format!("作品 {}", &ts[..10.min(ts.len())]),
-                None => "无标题作品".into(),
-            }
-        } else {
-            photo.caption.clone()
-        },
-        author: photo.author.clone(),
-        summary: Some(photo.caption.clone()),
+        title: work_title(photo).to_string(),
+        author: None,
+        summary: Some(work_title(photo).to_string()),
         content_html: Some(crate::sanitize::sanitize_parser(
             &html,
             Some(&sanitize_base),
         )),
-        body_text: photo.caption.clone(),
+        body_text: String::new(),
         image_url: photo.cover.clone(),
-        published_at: photo.timestamp_ms.and_then(ms_to_rfc3339),
+        published_at: None,
         enclosures: photo
             .video
             .as_ref()
@@ -486,25 +465,26 @@ pub fn photo_to_article(photo: &KsPhoto, profile_url: &str) -> crate::db::NewArt
 
 /* ── network transport ───────────────────────────────────────────────── */
 
-/// POST one GraphQL operation with the browser XHR header group. The shared
-/// client honours the app's proxy settings; cookies ride only in the explicit
+/// GET one live-api JSON endpoint with the browser XHR header group. The
+/// shared client honours the app's proxy settings and does not follow
+/// redirects (cookies must never ride one); cookies ride only in the explicit
 /// header. The final URL must still belong to kuaishou.com.
-async fn graphql(
-    client: &Client,
-    body: &Value,
-    referer: &str,
-    cookie: Option<&str>,
-) -> KsResult<String> {
-    let mut req = client.post(format!("https://{WEB_HOST}/graphql").as_str());
-    for (name, value) in browser_api_headers(WEB_HOST, referer, cookie) {
+async fn get_json(client: &Client, url: &str, cookie: Option<&str>) -> KsResult<String> {
+    let mut req = client.get(url);
+    for (name, value) in browser_api_headers(LIVE_HOST, cookie) {
         req = req.header(name, value);
     }
-    let resp = req.json(body).send().await?;
+    let resp = req.send().await?;
     if !is_host_or_subdomain(resp.url(), REGISTRABLE_DOMAIN) {
         return Err(KsError::Transport(format!(
             "redirect to non-kuaishou host blocked: {}",
             resp.url()
         )));
+    }
+    if resp.status().is_redirection() {
+        // The parser client does not follow redirects; the edge's redirect
+        // here is the login bounce, same as the other parsers' gates.
+        return Err(KsError::Blocked);
     }
     match resp.status() {
         StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED => return Err(KsError::Blocked),
@@ -517,61 +497,57 @@ async fn graphql(
     String::from_utf8(bytes).map_err(|_| KsError::Parse("response is not UTF-8".into()))
 }
 
+async fn get_live_api(client: &Client, path_query: &str, cookie: Option<&str>) -> KsResult<String> {
+    get_json(client, &format!("https://{LIVE_HOST}{path_query}"), cookie).await
+}
+
 /// Fetch one creator's metadata + newest works page.
 ///
-/// `cookie` (optional) is the pasted logged-in Cookie header; without it the
-/// captcha-gate typically answers `Captcha` — that is the coded, localisable
+/// `cookie` is the pasted logged-in Cookie header; without it the live-api
+/// answers the captcha/`result: 2` gate — that is the coded, localisable
 /// signal to configure one.
 pub async fn fetch_creator_page(
     client: &Client,
     user_id: &str,
     cookie: Option<&str>,
 ) -> KsResult<KsUserPage> {
-    let referer = format!("https://{WEB_HOST}/profile/{user_id}");
-    let (photos, _) = {
-        let response = graphql(client, &build_photo_list_body(user_id), &referer, cookie).await?;
-        parse_photo_list_response(&response)?
-    };
-    // The photo list already carries per-row author names; `visionProfile`
-    // only pins down the nickname/avatar for the feed row itself. The
-    // metadata call's failure is tolerable only while the list actually
-    // yielded works to fall back on — an empty list plus a captcha must
-    // propagate, or subscribing would "succeed" with a nameless feed.
-    let author_from_list = photos.first().and_then(|p| p.author.clone());
-    let fallback_profile = || KsProfile {
-        user_id: user_id.to_string(),
-        name: author_from_list
-            .clone()
-            .unwrap_or_else(|| user_id.to_string()),
-        avatar: None,
-        bio: None,
-        fan: None,
-    };
-    let profile = match graphql(
+    // The id is validated `[a-z0-9]{10,24}` upstream — no escaping needed.
+    let userinfo_q = format!("/live_api/baseuser/userinfo/byid?principalId={user_id}");
+    let userinfo = get_live_api(client, &userinfo_q, cookie)
+        .await
+        .and_then(|body| parse_userinfo_response(&body, user_id, cookie.is_some()));
+    let public = get_live_api(
         client,
-        &build_vision_profile_body(user_id),
-        &referer,
+        &format!("/live_api/profile/public?principalId={user_id}"),
         cookie,
     )
-    .await
-    {
-        Ok(response) => match parse_profile_response(&response) {
-            Ok(profile) => profile,
-            Err(e) => {
-                if photos.is_empty() {
-                    return Err(e);
-                }
-                fallback_profile()
-            }
-        },
+    .await?;
+    let photos = parse_public_profile_response(&public, cookie.is_some())?;
+    // The works list already identifies the creator per row; the userinfo
+    // call only pins down the nickname/avatar for the feed row itself. Its
+    // failure is tolerable only while the list actually yielded works to fall
+    // back on — an empty list plus a metadata failure must propagate, or
+    // subscribing would "succeed" with a nameless feed.
+    let profile = match userinfo {
+        Ok(profile) => profile,
         Err(e) => {
             if photos.is_empty() {
                 return Err(e);
             }
-            fallback_profile()
+            fallback_profile(user_id)
         }
     };
     Ok(KsUserPage { profile, photos })
+}
+
+fn fallback_profile(user_id: &str) -> KsProfile {
+    KsProfile {
+        user_id: user_id.to_string(),
+        name: user_id.to_string(),
+        avatar: None,
+        bio: None,
+        fan: None,
+    }
 }
 
 #[cfg(test)]
@@ -603,7 +579,7 @@ mod tests {
     #[test]
     fn rejects_other_pages_and_bad_ids() {
         for url in [
-            "https://www.kuaishou.com/short-video/3x4kuwfd24jzzf4",
+            "https://www.kuaishou.com/short-video/3xkuwfd24jzzf4",
             "https://www.kuaishou.com/profile/short",
             "https://www.kuaishou.com/profile/UPPERCASE!",
             "https://evil.com/profile/3x4kuwfd24jzzf4",
@@ -650,105 +626,105 @@ mod tests {
         );
     }
 
-    /* ── request bodies ────────────────────────────────────────────── */
-
-    #[test]
-    fn operation_bodies_carry_the_expected_shapes() {
-        let profile = build_vision_profile_body("abc");
-        assert_eq!(profile["operationName"], "visionProfile");
-        assert_eq!(profile["variables"]["userId"], "abc");
-        let list = build_photo_list_body("abc");
-        assert_eq!(list["operationName"], "visionProfilePhotoList");
-        assert_eq!(list["variables"]["pcursor"], "");
-        assert_eq!(list["variables"]["page"], "profile");
-        assert!(list["query"]
-            .as_str()
-            .unwrap()
-            .contains("visionProfilePhotoList"));
-    }
-
     /* ── response parsing ──────────────────────────────────────────── */
 
-    fn profile_response() -> String {
-        r#"{"data":{"visionProfile":{"result":1,"hostName":"www.kuaishou.com","userProfile":{"ownerCount":{"fan":123456,"photo":321},"profile":{"gender":"F","user_name":"创作者昵称","user_id":"3x4kuwfd24jzzf4","headurl":"https://p2-pro.a.yximgs.com/uhead/abc.jpg","user_text":"作者简介"}}}}}"#.to_string()
+    fn userinfo_response() -> String {
+        r#"{"data":{"result":1,"userInfo":{"id":"youbao5266","name":"彩色角落","description":"每周更新","avatar":"https://p5-pro.a.yximgs.com/uhead/abc.jpg","sex":"F","originUserId":1317646681,"bannedStatus":{"banned":false,"socialBanned":false,"isolate":false,"defriend":false},"counts":{}}}}"#.to_string()
     }
 
     #[test]
-    fn parses_profile_response() {
-        let p = parse_profile_response(&profile_response()).unwrap();
-        assert_eq!(p.name, "创作者昵称");
-        assert_eq!(p.user_id, "3x4kuwfd24jzzf4");
+    fn parses_userinfo_response() {
+        let p = parse_userinfo_response(&userinfo_response(), "youbao5266", false).unwrap();
+        assert_eq!(p.name, "彩色角落");
+        assert_eq!(p.user_id, "youbao5266");
         assert_eq!(
             p.avatar.as_deref(),
-            Some("https://p2-pro.a.yximgs.com/uhead/abc.jpg")
+            Some("https://p5-pro.a.yximgs.com/uhead/abc.jpg")
         );
-        assert_eq!(p.bio.as_deref(), Some("作者简介"));
-        assert_eq!(p.fan.as_deref(), Some("123456"));
+        assert_eq!(p.bio.as_deref(), Some("每周更新"));
     }
 
     #[test]
-    fn profile_error_codes_map_to_taxonomy() {
-        let captcha = r#"{"data":{"result":400002,"jsSdkUrl":"//static.yximgs.com/x.js","url":"https://captcha.zt.kuaishou.com/iframe/index.html?captchaSession=x"}}"#;
+    fn userinfo_error_codes_map_to_taxonomy() {
+        let captcha = r#"{"data":{"result":400002,"url":"https://captcha.zt.kuaishou.com/…","jsSdkUrl":"//static.yximgs.com/x.js"}}"#;
         assert!(matches!(
-            parse_profile_response(captcha),
+            parse_userinfo_response(captcha, "x", false),
             Err(KsError::Captcha)
         ));
-        let blocked = r#"{"data":{"result":2}}"#;
+        let gone = r#"{"data":{"result":21,"userInfo":{}}}"#;
         assert!(matches!(
-            parse_profile_response(blocked),
+            parse_userinfo_response(gone, "x", true),
+            Err(KsError::Unavailable(_))
+        ));
+        let banned =
+            r#"{"data":{"result":1,"userInfo":{"name":"x","bannedStatus":{"banned":true}}}}"#;
+        assert!(matches!(
+            parse_userinfo_response(banned, "x", true),
+            Err(KsError::Unavailable(_))
+        ));
+        let no_user = r#"{"data":{"result":1}}"#;
+        assert!(matches!(
+            parse_userinfo_response(no_user, "x", true),
+            Err(KsError::Unavailable(_))
+        ));
+        // The gate codes read as a refused credential once a cookie was sent.
+        let gate = r#"{"data":{"result":2,"error_msg":null}}"#;
+        assert!(matches!(
+            parse_userinfo_response(gate, "x", true),
             Err(KsError::Blocked)
         ));
-        let gone = r#"{"data":{"result":99}}"#;
         assert!(matches!(
-            parse_profile_response(gone),
-            Err(KsError::Unavailable(_))
+            parse_userinfo_response(gate, "x", false),
+            Err(KsError::Captcha)
         ));
     }
 
-    fn photo_list_response() -> String {
-        r#"{"data":{"visionProfilePhotoList":{"result":1,"pcursor":"1.0","feeds":[
-            {"type":"1","author":{"id":"3x4kuwfd24jzzf4","name":"创作者昵称","headerUrl":"https://p2-pro.a.yximgs.com/uhead/abc.jpg"},
-             "photo":{"id":"3xphoto00001","duration":45000,"caption":"第一条作品","originCaption":"第一条作品",
-                      "likeCount":100,"viewCount":2000,"commentCount":10,"realLikeCount":120,
-                      "coverUrl":"https://p2-pro.a.yximgs.com/cover1.jpg","photoUrl":"https://p2-pro.a.yximgs.com/video1.mp4",
-                      "coverUrls":[{"url":"https://p2-pro.a.yximgs.com/cover1.jpg"}],
-                      "timestamp":1794462771000,"expTag":"1.1.1","animatedCoverUrl":"https://p2-pro.a.yximgs.com/anim.gif",
-                      "distance":-1,"videoRatio":"1.7778","liked":false,"stereoType":0,"profileUserTopPhoto":false,"musicBlocked":false},
-             "canAddComment":true,"llsid":"1","status":1,"currentPcursor":null,"tags":[]},
-            {"type":"1","author":{"id":"3x4kuwfd24jzzf4","name":"创作者昵称"},
-             "photo":{"id":"3xphoto00002","caption":"图集封面","coverUrls":[{"url":"https://p2-pro.a.yximgs.com/cover2.jpg"}],
-                      "timestamp":1794370000000,"realLikeCount":-1}},
-            {"type":"1","author":{"id":"x"},"photo":{"id":"","caption":"无 id 丢弃"}}]}}}"#.to_string()
+    fn public_profile_response() -> String {
+        r#"{"data":{"result":1,"list":[
+            {"type":"work","workType":"video","id":"3xks5c62378xie2",
+             "poster":"https://p23.a.yximgs.com/cover1.jpg",
+             "playUrl":"https://txmov2.a.kwimgs.com/video1.mp4",
+             "width":720,"height":1280,"imgUrls":[],"imgSizes":[],
+             "counts":{"like":31,"displayView":"999","displayLike":"31"}},
+            {"type":"work","workType":"multiple","id":"3xjrscpkm6dsj5k",
+             "poster":"https://p23.a.yximgs.com/cover2.jpg",
+             "imgUrls":["https://p23.a.yximgs.com/g1.jpg","https://p23.a.yximgs.com/g2.jpg"],
+             "counts":{"like":-1}},
+            {"type":"work","id":"","poster":"https://x"}]}}"#
+            .to_string()
     }
 
     #[test]
-    fn parses_photo_list_page() {
-        let (photos, pcursor) = parse_photo_list_response(&photo_list_response()).unwrap();
-        assert_eq!(pcursor, "1.0");
+    fn parses_public_profile_page() {
+        let photos = parse_public_profile_response(&public_profile_response(), true).unwrap();
         assert_eq!(photos.len(), 2);
-        assert_eq!(photos[0].id, "3xphoto00001");
-        assert_eq!(photos[0].caption, "第一条作品");
+        assert_eq!(photos[0].id, "3xks5c62378xie2");
+        assert_eq!(photos[0].work_type.as_deref(), Some("video"));
         assert_eq!(
             photos[0].video.as_deref(),
-            Some("https://p2-pro.a.yximgs.com/video1.mp4")
+            Some("https://txmov2.a.kwimgs.com/video1.mp4")
         );
-        assert_eq!(photos[0].timestamp_ms, Some(1794462771000));
-        assert_eq!(photos[0].like_count.as_deref(), Some("120"));
-        // Works without an mp4 fall back to the cover; hidden like counts drop.
-        assert!(photos[1].video.is_none());
         assert_eq!(
-            photos[1].cover.as_deref(),
-            Some("https://p2-pro.a.yximgs.com/cover2.jpg")
+            photos[0].cover.as_deref(),
+            Some("https://p23.a.yximgs.com/cover1.jpg")
         );
+        assert_eq!(photos[0].like_count.as_deref(), Some("31"));
+        // Image-set work: gallery carried, hidden like count dropped.
+        assert_eq!(photos[1].images.len(), 2);
+        assert!(photos[1].video.is_none());
         assert!(photos[1].like_count.is_none());
     }
 
     #[test]
-    fn photo_list_error_codes_map_to_taxonomy() {
-        let captcha = r#"{"data":{"result":400002}}"#;
+    fn public_profile_error_codes_map_to_taxonomy() {
+        let gate = r#"{"data":{"result":2,"error_msg":null}}"#;
         assert!(matches!(
-            parse_photo_list_response(captcha),
+            parse_public_profile_response(gate, false),
             Err(KsError::Captcha)
+        ));
+        assert!(matches!(
+            parse_public_profile_response(gate, true),
+            Err(KsError::Blocked)
         ));
     }
 
@@ -757,51 +733,71 @@ mod tests {
     #[test]
     fn video_article_carries_player_poster_and_enclosure() {
         let photo = KsPhoto {
-            id: "3xphoto00001".into(),
-            caption: "第一条\n作品".into(),
-            author: Some("创作者昵称".into()),
-            cover: Some("https://p2-pro.a.yximgs.com/cover1.jpg".into()),
-            video: Some("https://p2-pro.a.yximgs.com/video1.mp4".into()),
-            timestamp_ms: Some(1794462771000),
-            like_count: Some("120".into()),
+            id: "3xks5c62378xie2".into(),
+            work_type: Some("video".into()),
+            cover: Some("https://p23.a.yximgs.com/cover1.jpg".into()),
+            video: Some("https://txmov2.a.kwimgs.com/video1.mp4".into()),
+            images: vec![],
+            like_count: Some("31".into()),
         };
         let article = photo_to_article(&photo, "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4");
-        assert_eq!(article.guid, "3xphoto00001");
+        assert_eq!(article.guid, "3xks5c62378xie2");
+        assert_eq!(article.title, "视频作品");
         assert!(article
             .url
             .as_deref()
             .unwrap()
-            .starts_with("https://www.kuaishou.com/short-video/3xphoto00001"));
+            .starts_with("https://www.kuaishou.com/short-video/3xks5c62378xie2"));
         let html = article.content_html.unwrap();
         assert!(html.contains("<video"));
-        assert!(html.contains("poster=\"https://p2-pro.a.yximgs.com/cover1.jpg\""));
-        assert!(html.contains("第一条<br>作品"));
+        assert!(html.contains("poster=\"https://p23.a.yximgs.com/cover1.jpg\""));
+        assert!(html.contains("♥ 31"));
         assert_eq!(
             article.enclosures.first().map(|e| e.mime_type.as_deref()),
             Some(Some("video/mp4"))
         );
-        assert!(article.published_at.is_some());
     }
 
     #[test]
-    fn photo_article_falls_back_to_cover_and_title() {
+    fn gallery_article_renders_the_image_set() {
         let photo = KsPhoto {
-            id: "3xphoto00002".into(),
-            caption: String::new(),
-            author: None,
-            cover: Some("https://p2-pro.a.yximgs.com/cover2.jpg".into()),
+            id: "3xjrscpkm6dsj5k".into(),
+            work_type: Some("multiple".into()),
+            cover: Some("https://p23.a.yximgs.com/cover2.jpg".into()),
             video: None,
-            timestamp_ms: Some(1794370000000),
+            images: vec![
+                "https://p23.a.yximgs.com/g1.jpg".into(),
+                "https://p23.a.yximgs.com/g2.jpg".into(),
+            ],
             like_count: None,
         };
         let article = photo_to_article(&photo, "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4");
-        assert!(article.title.starts_with("作品 20"));
+        assert_eq!(article.title, "图集作品");
         let html = article.content_html.unwrap();
-        assert!(html.contains("<img src="));
+        assert!(html.contains("g1.jpg"));
+        assert!(html.contains("g2.jpg"));
         assert!(!html.contains("<video"));
         assert_eq!(
             article.image_url.as_deref(),
-            Some("https://p2-pro.a.yximgs.com/cover2.jpg")
+            Some("https://p23.a.yximgs.com/cover2.jpg")
         );
+        assert!(article.enclosures.is_empty());
+    }
+
+    #[test]
+    fn unknown_work_type_falls_back_to_a_generic_title() {
+        let photo = KsPhoto {
+            id: "3xabc".into(),
+            work_type: None,
+            cover: Some("https://p23.a.yximgs.com/cover3.jpg".into()),
+            video: None,
+            images: vec![],
+            like_count: None,
+        };
+        let article = photo_to_article(&photo, "");
+        assert_eq!(article.title, "作品");
+        // No gallery: the cover renders as the single image.
+        let html = article.content_html.unwrap();
+        assert!(html.contains("cover3.jpg"));
     }
 }

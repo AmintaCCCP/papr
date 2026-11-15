@@ -98,6 +98,10 @@ pub fn build_download_client(conn: &Connection) -> Client {
 ///   answers throttled visitors with a 302 onto its login page, which is a
 ///   coded error, not a document to read; and a redirect must never be
 ///   followed off-site with session cookies attached.
+/// - No `Accept-Encoding` is advertised: reqwest's automatic `gzip, br` lands
+///   the request inside xiaohongshu's bot heuristics — the same request
+///   without the header is served (verified live 2026-11; responses then
+///   arrive uncompressed, so nothing needs decoding either).
 pub fn build_parser_client(conn: &Connection) -> Client {
     let timeout = db::setting_parsed::<u64>(conn, "net_timeout_sec", 30);
     let proxy = db::get_setting(conn, "net_proxy")
@@ -107,6 +111,8 @@ pub fn build_parser_client(conn: &Connection) -> Client {
     let mut builder = Client::builder()
         .cookie_store(false)
         .redirect(reqwest::redirect::Policy::none())
+        .gzip(false)
+        .brotli(false)
         .timeout(Duration::from_secs(timeout.clamp(5, 300)))
         .connect_timeout(Duration::from_secs(10));
     match proxy.as_str() {

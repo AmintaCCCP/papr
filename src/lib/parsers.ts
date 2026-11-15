@@ -9,10 +9,10 @@
 // URL patterns subscribable.
 //
 // Credential models differ per parser: X needs its two session cookies (hard
-// requirement), while xiaohongshu works anonymously from the SSR profile page
-// (a pasted cookie is an upgrade) and kuaishou's web API is captcha-gated for
-// anonymous traffic (a pasted cookie is the supported path) — the UI says so
-// per parser instead of one hard rule.
+// requirement), kuaishou's live-api refuses anonymous traffic outright (a
+// pasted cookie is required), and xiaohongshu's SSR only serves
+// browser-fingerprinted clients anonymously — a pasted cookie is the reliable
+// path there too. The UI says so per parser instead of one hard rule.
 
 /** The built-in parsers, in settings-page display order. */
 export type ParserKey = "x" | "xiaohongshu" | "kuaishou";
@@ -152,9 +152,9 @@ export function parseParsers(raw: unknown): ParsersSettings {
 }
 
 /** The parser's credential readiness. X has no unauthenticated fallback, so
- *  "ready" means both cookies; the other parsers work anonymously (cookie is
- *  an upgrade or the supported path), so "ready" mirrors the X card's signal
- *  only in spirit: it reports the credential as configured when present. */
+ *  "ready" means both cookies; the other parsers need the pasted cookie, so
+ *  "ready" mirrors the X card's signal in spirit: it reports the credential
+ *  as configured when present. */
 export function parserReady(key: ParserKey, cfg: ParserConfig): boolean {
   if (key === "x") return Boolean(cfg.authToken && cfg.ct0);
   return Boolean(cfg.cookie);
