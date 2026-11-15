@@ -1199,8 +1199,18 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     };
     // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
     // and rewriting identical bytes would churn WAL pages and re-index FTS.
+    // An empty incoming body carries no information (the kuaishou live-api
+    // ships no captions): keep what is stored rather than blanking it — the
+    // same contract as the COALESCE on url/published_at below. The equality
+    // check compares the effective body so an always-empty incoming body
+    // does not read as a change on every refresh.
+    let effective_body = if a.body_text.is_empty() {
+        body_text.clone()
+    } else {
+        a.body_text.clone()
+    };
     let rendered_differs =
-        content_html.as_deref() != a.content_html.as_deref() || body_text != a.body_text;
+        content_html.as_deref() != a.content_html.as_deref() || body_text != effective_body;
     let stale_extraction = extracted_html.is_some();
     // A URL the stored row lacks counts as a change too: the permalink
     // backfill must land even when the body is byte-identical (an anonymous
@@ -1228,7 +1238,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             a.title,
             a.summary,
             a.content_html,
-            a.body_text,
+            effective_body,
             a.image_url,
             a.published_at,
             a.url
@@ -1250,7 +1260,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     }
     tx.execute(
         "UPDATE articles_fts SET title = ?2, body = ?3 WHERE rowid = ?1",
-        params![id, a.title, a.body_text],
+        params![id, a.title, effective_body],
     )?;
     tx.commit()?;
     Ok(true)
@@ -4086,6 +4096,68 @@ mod tests {
 
         // And the next refresh with the same article is a no-op again.
         assert!(!refresh_parser_article(&conn, feed_id, &upgraded).unwrap());
+    }
+
+    #[test]
+    fn refresh_parser_article_keeps_the_stored_body_when_incoming_is_empty() {
+        // The kuaishou live-api ships no captions: its refresh results carry
+        // an empty body_text, which must never blank the caption a
+        // pre-migration row stored. An empty incoming body is "no
+        // information", the same contract as the url/published_at COALESCE.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4",
+            None,
+            "创作者昵称",
+            None,
+            SourceType::Kuaishou,
+            None,
+        )
+        .unwrap();
+        let stored = NewArticle {
+            guid: "3xphoto00001".into(),
+            url: Some("https://www.kuaishou.com/short-video/3xphoto00001".into()),
+            title: "第一条作品".into(),
+            author: None,
+            summary: Some("第一条作品".into()),
+            content_html: Some("<p>旧文案</p>".into()),
+            body_text: "旧文案".into(),
+            image_url: None,
+            published_at: Some("2026-11-12T05:52:51+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+
+        // The new parse re-renders the row to a media card with no caption.
+        let refreshed = NewArticle {
+            title: "视频作品".into(),
+            summary: Some("视频作品".into()),
+            content_html: Some("<p><video controls preload=\"metadata\"></video></p>".into()),
+            body_text: String::new(),
+            ..stored.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
+        let (body, fts_body): (String, String) = conn
+            .query_row(
+                "SELECT a.body_text, f.body FROM articles a
+                 JOIN articles_fts f ON f.rowid = a.id
+                 WHERE a.feed_id = ?1 AND a.guid = ?2",
+                params![feed_id, stored.guid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "旧文案");
+        assert_eq!(fts_body, "旧文案");
+        // Title/summary follow the new parse as intended.
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, stored.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "视频作品");
     }
 
     #[test]

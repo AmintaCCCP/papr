@@ -558,7 +558,9 @@ async fn add_kuaishou_feed(
     }
     let dedup = db::setting_flag(&conn, "dedup_enabled", false);
     let rules = db::active_rules(&conn).unwrap_or_default();
-    for photo in &page.photos {
+    // Newest-first page, no publish times: write oldest-first so the newest
+    // work lands last (highest rowid) and stays on top of the list.
+    for photo in page.photos.iter().rev() {
         let article = parsers::kuaishou::photo_to_article(photo, feed_url);
         db::upsert_article(&conn, feed_id, &article, dedup, &rules)?;
     }
