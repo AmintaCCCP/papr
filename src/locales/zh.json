@@ -872,7 +872,7 @@
     "parserUnknown": "未知的解析器。",
     "xiaohongshuAuthInvalid": "小红书会话已失效（Cookie 无效或过期）——可在 设置 → 解析器 中更新 Cookie，或清除后匿名使用。",
     "xiaohongshuAccountUnavailable": "该小红书博主不可访问（主页可能不存在、已注销或被限制）。",
-    "xiaohongshuBlocked": "匿名访问触发了小红书的访客限流（匿名请求只有很小的配额，冷却期内一律拦截——与浏览器能否打开无关）。请到 设置 → 解析器 中粘贴登录 Cookie 后稳定使用；若粘贴后仍出现，请确认 Cookie 有效、主页链接无误，并稍后重试。",
+    "xiaohongshuBlocked": "请求被小红书风控拦截（限流或冷却期内——匿名访问的配额尤其小，用尽后一律拦截）。若尚未配置 Cookie，请到 设置 → 解析器 中粘贴登录 Cookie 后稳定使用；若已配置，请确认 Cookie 仍有效、主页链接无误，稍后重试。",
     "xiaohongshuHandleInvalid": "无效的小红书博主主页链接或用户 ID（24 位十六进制）。",
     "kuaishouCaptcha": "快手网页端对匿名请求返回风控拦截（其网页签名无法在本地复刻）。请到 设置 → 解析器 中粘贴登录 Cookie（live.kuaishou.com 或 www.kuaishou.com 的均可）；或改用 RSSHub 路由市场的快手路由（需浏览器版引擎）。",
     "kuaishouAccountUnavailable": "该快手创作者不可访问（主页可能不存在、已封禁或被限制）。",

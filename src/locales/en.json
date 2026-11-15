@@ -872,7 +872,7 @@
     "parserUnknown": "Unknown parser.",
     "xiaohongshuAuthInvalid": "The Xiaohongshu session was rejected (cookie invalid or expired) — update the cookie in Settings → Parsers, or clear it to stay anonymous.",
     "xiaohongshuAccountUnavailable": "This Xiaohongshu blogger is unavailable (the profile may not exist, be deactivated, or be restricted).",
-    "xiaohongshuBlocked": "The anonymous request tripped Xiaohongshu's visitor rate limit (anonymous requests get a small allowance; once spent, everything is bounced until the cooldown lapses — regardless of whether a browser opens the page). Paste a login cookie in Settings → Parsers for stable access; if it persists with one pasted, double-check the cookie and the profile URL, then retry later.",
+    "xiaohongshuBlocked": "The request was stopped by Xiaohongshu risk control (rate limiting or a cooldown — anonymous access gets a very small allowance and bounces once it is spent). Without a cookie, paste one in Settings → Parsers for stable access; with one configured, double-check that it is still valid and the profile URL is correct, then retry later.",
     "xiaohongshuHandleInvalid": "Invalid Xiaohongshu profile URL or user ID (24 hex characters).",
     "kuaishouCaptcha": "Kuaishou refuses anonymous requests (its web signature cannot be reproduced locally). Paste a login cookie in Settings → Parsers (from live.kuaishou.com or www.kuaishou.com alike); or use the Kuaishou route from the RSSHub marketplace (needs the browser engine).",
     "kuaishouAccountUnavailable": "This Kuaishou creator is unavailable (the profile may not exist, be banned, or be restricted).",
