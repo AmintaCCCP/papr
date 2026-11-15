@@ -844,9 +844,16 @@ fn text_source(
                     });
                 }
             }
-        } else if let Some(legacy_media) =
-            legacy.pointer("/entities/media").and_then(|m| m.as_array())
-        {
+        } else {
+            // No note-side media list: locate the legacy t.co placeholders by
+            // string search. Videos live only in extended_entities, photos in
+            // both — scan the same sources extract_media reads, most specific
+            // first.
+            let legacy_media = legacy
+                .pointer("/extended_entities/media")
+                .or_else(|| legacy.pointer("/entities/media"))
+                .and_then(|m| m.as_array());
+            if let Some(legacy_media) = legacy_media {
             let boundaries = utf16_boundaries(note_text);
             for m in legacy_media {
                 // An empty `url` would make `find("")` match forever without
@@ -873,6 +880,7 @@ fn text_source(
                     }
                     from = at + tco.len();
                 }
+            }
             }
         }
         // The render list: legacy `extended_entities` stays complete for note
@@ -2281,6 +2289,44 @@ mod tests {
         assert!(t
             .content_html
             .contains("<a href=\"https://x.com/jack/status/908\">空正文标题</a>"));
+    }
+
+    #[test]
+    fn extended_entities_placeholders_are_dropped_from_note_text() {
+        // A note without an entity_set.media list whose attachment lives
+        // only in legacy extended_entities: the string-search fallback must
+        // find the t.co placeholder there too, or the card renders both the
+        // image and the raw link.
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-909", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "rest_id": "909",
+                        "legacy": {
+                            "full_text": "note body https://t.co/pic",
+                            "created_at": "Sun Sep 13 08:30:00 +0000 2026",
+                            "entities": {},
+                            "extended_entities": {"media": [{"url": "https://t.co/pic", "type": "photo", "media_url_https": "https://pbs.twimg.com/media/only-ext.jpg"}]}
+                        },
+                        "note_tweet": {"note_tweet_results": {"result": {
+                            "id": "NOTE5",
+                            "text": "note body with the picture https://t.co/pic inline",
+                            "entity_set": {"urls": []}
+                        }}}
+                    }}}}}
+                ]}
+            ]}}}}}}
+        )
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        assert_eq!(tweets.len(), 1);
+        let t = &tweets[0];
+        assert!(!t.content_html.contains("t.co/pic"));
+        assert!(!t.text.contains("t.co/pic"));
+        assert!(t
+            .content_html
+            .contains(r#"<img src="https://pbs.twimg.com/media/only-ext.jpg""#));
     }
 
     #[test]
