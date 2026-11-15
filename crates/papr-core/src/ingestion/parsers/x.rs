@@ -849,7 +849,13 @@ fn text_source(
         {
             let boundaries = utf16_boundaries(note_text);
             for m in legacy_media {
-                let Some(tco) = m.get("url").and_then(|u| u.as_str()) else {
+                // An empty `url` would make `find("")` match forever without
+                // advancing — skip it.
+                let Some(tco) = m
+                    .get("url")
+                    .and_then(|u| u.as_str())
+                    .filter(|u| !u.is_empty())
+                else {
                     continue;
                 };
                 let mut from = 0;
@@ -888,12 +894,38 @@ fn text_source(
     )
 }
 
-/// `true` when the plain text carries no words of its own — only media
-/// placeholders (dropped) and, at most, a bare link. Article tweets ship
-/// exactly this shape: the content is the article, and its title is the card.
-fn is_link_only_text(text: &str) -> bool {
-    let t = text.trim();
-    t.is_empty() || (!t.contains(char::is_whitespace) && t.starts_with("http"))
+/// `true` when `text` says nothing beyond its URL entities — the URL anchors
+/// cover every word, so whatever remains is blank. Article tweets ship
+/// exactly this shape (a bare permalink); prose attached to the link
+/// (`"https://t.co/x，推荐阅读"`) does not, and must keep its commentary.
+fn is_link_only_text(text: &str, entities: &[TextEntity]) -> bool {
+    let mut links: Vec<(usize, usize)> = entities
+        .iter()
+        .filter(|e| e.href.is_some())
+        .map(|e| (e.start, e.end))
+        .collect();
+    if links.is_empty() {
+        return false;
+    }
+    links.sort_by_key(|&(s, _)| s);
+    let boundaries = utf16_boundaries(text);
+    let mut utf16_pos = 0usize;
+    let mut byte_pos = 0usize;
+    for (s, e) in links {
+        if s < utf16_pos {
+            return false; // overlapping entities — not a bare link chain
+        }
+        let (Some(bs), Some(be)) = (utf16_to_byte(&boundaries, s), utf16_to_byte(&boundaries, e))
+        else {
+            return false;
+        };
+        if !text[byte_pos..bs].trim().is_empty() {
+            return false; // prose between links — commentary, not a bare link
+        }
+        utf16_pos = e;
+        byte_pos = be;
+    }
+    text[byte_pos..].trim().is_empty()
 }
 
 /// UTC date (`2026-09-13`) for a card's permalink label. UTC on purpose: the
@@ -997,13 +1029,16 @@ fn nested_tweet(result: &serde_json::Value) -> Option<XNestedTweet> {
     if result.get("__typename").and_then(|t| t.as_str()) == Some("TweetTombstone") {
         return None;
     }
-    let legacy = result.get("legacy")?;
-    let id = result.get("rest_id").and_then(|v| v.as_str())?;
-    let (full_text, entities, media) = text_source(result, legacy);
+    // Some payloads wrap the real tweet in a `tweet` object — resolve to the
+    // actual tweet once, so note/author lookups see the inner shape.
+    let tweet_obj = result.get("tweet").unwrap_or(result);
+    let legacy = tweet_obj.get("legacy")?;
+    let id = tweet_obj.get("rest_id").and_then(|v| v.as_str())?;
+    let (full_text, entities, media) = text_source(tweet_obj, legacy);
     if full_text.is_empty() {
         return None;
     }
-    let (author_name, handle) = result_author(result);
+    let (author_name, handle) = result_author(tweet_obj);
     let published_at = legacy
         .get("created_at")
         .and_then(|c| c.as_str())
@@ -1034,21 +1069,21 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
     if result.get("__typename").and_then(|t| t.as_str()) == Some("TweetTombstone") {
         return None;
     }
-    // Quoted/retweeted shapes nest the real tweet under `tweet`.
-    let legacy = result
-        .get("legacy")
-        .or_else(|| result.pointer("/tweet/legacy"))?;
-    let tweet_id = result
+    // Quoted/retweeted shapes nest the real tweet under `tweet` — resolve to
+    // the actual tweet once, so every lookup below sees the inner shape
+    // (note_tweet bodies, article titles and authors all live there).
+    let tweet_obj = result.get("tweet").unwrap_or(result);
+    let legacy = tweet_obj.get("legacy")?;
+    let tweet_id = tweet_obj
         .get("rest_id")
-        .or_else(|| result.pointer("/tweet/rest_id"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| entry_id.trim_start_matches("tweet-").to_string());
 
-    let (full_text, text_entities, media) = text_source(result, legacy);
+    let (full_text, text_entities, media) = text_source(tweet_obj, legacy);
     // No text and no article: the entry is a stub the card cannot render
     // (promoted shells and the like) — drop it as the tombstones above.
-    let has_article = result
+    let has_article = tweet_obj
         .pointer("/article/article_results/result/title")
         .and_then(|t| t.as_str())
         .is_some_and(|s| !s.trim().is_empty());
@@ -1074,12 +1109,12 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
     // An X "Article" tweet (long-form publishing) ships no inline text of its
     // own — the payload is the title plus a cover; everything beyond that
     // would need a per-tweet detail round-trip. The card is the title, linked.
-    let article_title = result
+    let article_title = tweet_obj
         .pointer("/article/article_results/result/title")
         .and_then(|t| t.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter(|_| is_link_only_text(&text));
+        .filter(|_| is_link_only_text(&full_text, &text_entities));
 
     if let Some(title) = article_title {
         text = title.to_string();
@@ -1090,7 +1125,7 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
         .and_then(|c| c.as_str())
         .and_then(tweet_created_at_to_rfc3339)
         .or_else(|| tweet_snowflake_to_rfc3339(&tweet_id));
-    let (author_name, author_handle) = result_author(result);
+    let (author_name, author_handle) = result_author(tweet_obj);
     let url = format!(
         "https://x.com/{}/status/{tweet_id}",
         author_handle.as_deref().unwrap_or(handle)
@@ -2049,6 +2084,104 @@ mod tests {
             .content_html
             .contains("<a href=\"https://x.com/jack/status/903\">标题</a>"));
         assert_eq!(t.text, "我自己的推荐语");
+    }
+
+    #[test]
+    fn prose_attached_to_the_article_link_is_not_link_only() {
+        // `https://t.co/article，推荐阅读` has no whitespace after the
+        // link, but the URL entity only covers the link — the trailing prose
+        // is the author's commentary and must survive (no title swap).
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-904", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "rest_id": "904",
+                        "article": {"article_results": {"result": {"__typename": "TweetArticle", "title": "标题"}}},
+                        "legacy": {
+                            "full_text": "https://t.co/article，推荐阅读",
+                            "created_at": "Sun Sep 13 07:40:00 +0000 2026",
+                            "entities": {"urls": [{"url": "https://t.co/article", "expanded_url": "https://x.com/i/article/123", "indices": [0, 20]}]}
+                        }
+                    }}}}}
+                ]}
+            ]}}}}}}
+        )
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        let t = &tweets[0];
+        assert!(t.text.contains("推荐阅读"));
+        assert!(!t
+            .content_html
+            .contains("<a href=\"https://x.com/jack/status/904\">标题</a>"));
+    }
+
+    #[test]
+    fn wrapped_tweets_resolve_note_and_author_from_the_inner_object() {
+        // The `result.tweet` wrapper: note body, rest_id and author all live
+        // on the inner object — reading them off the outer one silently
+        // degrades to the truncated legacy text.
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-905", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "tweet": {
+                            "__typename": "Tweet",
+                            "rest_id": "905",
+                            "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Display Name"}, "legacy": {"screen_name": "jack"}}}},
+                            "legacy": {"full_text": "截断的开头", "created_at": "Sun Sep 13 07:50:00 +0000 2026", "entities": {}},
+                            "note_tweet": {"note_tweet_results": {"result": {
+                                "id": "NOTE3",
+                                "text": "wrapped 的完整长文正文，远超截断长度",
+                                "entity_set": {"urls": []}
+                            }}}
+                    }}}}}}
+                ]}
+            ]}}}}}}
+        )
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        assert_eq!(tweets.len(), 1);
+        let t = &tweets[0];
+        assert_eq!(t.id, "905");
+        assert!(t.content_html.contains("wrapped 的完整长文正文"));
+        assert!(!t.content_html.contains("截断的开头"));
+        assert!(t
+            .content_html
+            .contains(r#"<span class="x-handle">@jack</span>"#));
+        assert_eq!(t.url, "https://x.com/jack/status/905");
+    }
+
+    #[test]
+    fn empty_media_urls_do_not_hang_the_placeholder_search() {
+        // A legacy media entity with an empty `url`: the string-search
+        // fallback must skip it (`find("")` would match forever).
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-906", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "rest_id": "906",
+                        "legacy": {
+                            "full_text": "note body",
+                            "created_at": "Sun Sep 13 08:00:00 +0000 2026",
+                            "entities": {"media": [{"url": "", "indices": [0, 1]}]},
+                            "extended_entities": {"media": [{"url": "", "type": "photo", "media_url_https": "https://pbs.twimg.com/media/x.jpg"}]}
+                        },
+                        "note_tweet": {"note_tweet_results": {"result": {
+                            "id": "NOTE4",
+                            "text": "note body with an empty placeholder source",
+                            "entity_set": {"urls": []}
+                        }}}
+                    }}}}}
+                ]}
+            ]}}}}}}
+        )
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        assert_eq!(tweets.len(), 1);
+        assert!(tweets[0].text.contains("note body"));
     }
 
     #[test]
