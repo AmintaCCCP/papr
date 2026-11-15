@@ -418,6 +418,11 @@ export const applyRuleToExisting = (
     action,
     rewrites,
   });
+/** The open-time rule actions (`translate` / `summarize` / `fulltext` /
+ *  `open_original`) matching this article — the reader asks once per open and
+ *  merges them with the per-feed / global behaviour flags. */
+export const getRuleActions = (id: number) =>
+  invoke<RuleAction[]>("rule_actions_for_article", { id });
 
 // ── highlights / annotations (F7) ──
 export interface NewHighlight {

@@ -1672,7 +1672,8 @@ pub struct RuleEffects {
 /// `read` / `star` matches pre-set the article's state on insert, and matching
 /// `rewrite` rules replace literal text in the article before it lands (rules
 /// match the *original* text — rewrites compose in rule order and never
-/// influence which rules fire).
+/// influence which rules fire). Open-time actions (`translate` …) are no-ops
+/// here — the reader resolves them per article via [`rule_actions_for_article`].
 pub fn upsert_article(
     conn: &Connection,
     feed_id: i64,
@@ -1766,7 +1767,9 @@ pub fn article_precheck(
         return Ok(None);
     }
     // Apply filter rules: skip wins outright; read / star tint the new row;
-    // every matching rewrite rule contributes its replacements.
+    // every matching rewrite rule contributes its replacements. Open-time
+    // actions (`translate` …) land in the catch-all: they are resolved when
+    // the reader opens the article (`rule_actions_for_article`), not here.
     let mut effects = RuleEffects::default();
     for rule in rules {
         if !rule_matches(rule, feed_id, a) {
@@ -2850,6 +2853,45 @@ pub fn preview_rule(
     Ok((count, samples))
 }
 
+/// The open-time rule actions (`translate` / `summarize` / `fulltext` /
+/// `open_original`) the reader should honour for one article: the union over
+/// every *enabled* rule whose When-document matches the stored row, in rule
+/// order. This is the read-side twin of [`article_precheck`] — open-time
+/// actions never touch ingestion (they would either cost network / LLM calls
+/// for every landed article or make no sense at all), so they are resolved
+/// here, the moment a matching article is opened. Evaluating the live rules
+/// against the row — through the same [`rule_match_where`] builder the
+/// preview and the backfill use — means editing a rule takes effect for every
+/// matching article, old or new, with no backfill and no per-article state.
+///
+/// Like the preview and the backfill, matching runs against the *stored* row,
+/// i.e. the text after any `rewrite` rules have applied at ingestion — the
+/// stored twin of ingestion's match-the-original-text guarantee. A rewrite
+/// that added or removed a later rule's needle therefore shifts what the
+/// open-time rule sees, exactly as it already shifts what the preview shows.
+pub fn rule_actions_for_article(conn: &Connection, article_id: i64) -> AppResult<Vec<String>> {
+    let mut actions: Vec<String> = Vec::new();
+    for rule in active_rules(conn)? {
+        if !RULE_OPEN_ACTIONS.contains(&rule.action.as_str()) {
+            // Ingestion-time action: by the time a row exists it has already
+            // acted (or dropped the row), so there is nothing to re-derive.
+            continue;
+        }
+        let Some((where_sql, binds)) = rule_match_where(&rule.conditions, rule.feed_id) else {
+            continue;
+        };
+        let hits: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM articles WHERE ({where_sql}) AND id = ?)"),
+            params_from_iter(binds.iter().cloned().chain([Value::Integer(article_id)])),
+            |r| r.get(0),
+        )?;
+        if hits && !actions.contains(&rule.action) {
+            actions.push(rule.action);
+        }
+    }
+    Ok(actions)
+}
+
 /// Apply a saved rule's action to the articles already in the store that it
 /// matches — the one-time backfill run when a rule is created or edited so it
 /// affects the existing backlog, not only articles fetched afterwards. Returns
@@ -2866,7 +2908,11 @@ pub fn preview_rule(
 /// pairs in the matched articles' text (title / summary / HTML body / plain
 /// body), the stored twin of [`apply_rewrites`] at ingestion; no UPDATE
 /// trigger keeps `articles_fts` fresh, so the matched rows' FTS entries are
-/// rebuilt from the updated columns afterwards.
+/// rebuilt from the updated columns afterwards. The open-time actions
+/// (`translate` / `summarize` / `fulltext` / `open_original`) fall to the
+/// catch-all and backfill nothing: they are reader behaviours resolved at
+/// open time ([`rule_actions_for_article`]), which by design covers the
+/// existing backlog the moment the rules change.
 pub fn apply_rule_to_existing(
     conn: &Connection,
     feed_id: Option<i64>,
@@ -4551,6 +4597,129 @@ mod tests {
             order.last(),
             Some(&zoo),
             "a rule created after a middle delete must sort last, got {order:?}",
+        );
+    }
+
+    #[test]
+    fn validate_rule_parts_accepts_open_time_actions() {
+        // The open-time actions are valid Then-parts with no extras — only
+        // `rewrite` demands rewrites — and unknown names are still rejected.
+        for action in RULE_OPEN_ACTIONS {
+            validate_rule_parts(&one("title", "contains", "x"), action, &[]).unwrap();
+        }
+        assert_eq!(
+            validate_rule_parts(&one("title", "contains", "x"), "nope", &[]).unwrap_err(),
+            "badRuleAction",
+        );
+    }
+
+    /// A title-keyword rule with a fixed action — thin enough that the test
+    /// bodies stay readable.
+    fn rule(
+        conn: &Connection,
+        name: &str,
+        feed_id: Option<i64>,
+        needle: &str,
+        action: &str,
+    ) -> i64 {
+        create_rule(conn, name, feed_id, &kw("title", needle), action, &[]).unwrap()
+    }
+
+    #[test]
+    fn rule_actions_for_article_returns_matching_open_time_actions() {
+        let (conn, aid) = test_db();
+        // The fixture article's title contains "Article"; a `read` rule (the
+        // ingestion-twin action) must never appear in the open-time set.
+        rule(&conn, "tr", None, "Article", "translate");
+        rule(&conn, "rd", None, "Article", "read");
+        assert_eq!(
+            rule_actions_for_article(&conn, aid).unwrap(),
+            vec!["translate".to_string()],
+        );
+
+        // A rule whose When-document doesn't match contributes nothing.
+        rule(&conn, "no", None, "absent", "summarize");
+        assert_eq!(
+            rule_actions_for_article(&conn, aid).unwrap(),
+            vec!["translate".to_string()],
+        );
+    }
+
+    #[test]
+    fn rule_actions_for_article_unions_and_dedupes_matching_rules() {
+        let (conn, aid) = test_db();
+        rule(&conn, "ft", None, "Article", "fulltext");
+        // Same action again (two rules asking for the same behaviour) and a
+        // third distinct one — the union is deduped, in rule order.
+        rule(&conn, "ft-2", None, "Article", "fulltext");
+        rule(&conn, "oo", None, "Article", "open_original");
+        assert_eq!(
+            rule_actions_for_article(&conn, aid).unwrap(),
+            vec!["fulltext".to_string(), "open_original".to_string()],
+        );
+    }
+
+    #[test]
+    fn rule_actions_for_article_respects_enabled_and_feed_scope() {
+        let (conn, aid) = test_db();
+        let feed_id: i64 = conn
+            .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        // Disabled rules never fire.
+        let tr = rule(&conn, "tr", None, "Article", "translate");
+        update_rule(
+            &conn,
+            tr,
+            "tr",
+            false,
+            None,
+            &one("title", "contains", "Article"),
+            "translate",
+            &[],
+        )
+        .unwrap();
+        assert!(rule_actions_for_article(&conn, aid).unwrap().is_empty());
+
+        // A feed-scoped rule matches only its own feed's articles.
+        rule(&conn, "sc", Some(feed_id), "Article", "summarize");
+        assert_eq!(
+            rule_actions_for_article(&conn, aid).unwrap(),
+            vec!["summarize".to_string()],
+        );
+
+        // A rule scoped to a *different* feed must not match.
+        let other = insert_feed(
+            &conn,
+            "https://example.com/other.xml",
+            None,
+            "Other Feed",
+            None,
+            SourceType::Rss,
+            None,
+        )
+        .unwrap();
+        rule(&conn, "ot", Some(other), "Article", "fulltext");
+        assert_eq!(
+            rule_actions_for_article(&conn, aid).unwrap(),
+            vec!["summarize".to_string()],
+        );
+    }
+
+    #[test]
+    fn rule_actions_for_article_fires_for_legacy_keyword_rows() {
+        // A pre-v24 keyword row synthesises its When-document at read time;
+        // open-time resolution must see it exactly like the preview/backfill
+        // paths do.
+        let (conn, aid) = test_db();
+        conn.execute(
+            "INSERT INTO rules(name, feed_id, field, query, action, position)
+             VALUES ('legacy', NULL, 'title', 'Article', 'translate', 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            rule_actions_for_article(&conn, aid).unwrap(),
+            vec!["translate".to_string()],
         );
     }
 

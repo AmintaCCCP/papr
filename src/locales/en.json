@@ -417,7 +417,11 @@
         "skip": "Skip",
         "read": "Mark read",
         "star": "Star",
-        "rewrite": "Rewrite text"
+        "rewrite": "Rewrite text",
+        "translate": "Auto-translate",
+        "summarize": "Auto-summarize",
+        "fulltext": "Fetch full text",
+        "open_original": "Open original page"
       },
       "preview": {
         "checking": "Checking…",
@@ -438,6 +442,7 @@
       "rewritesHint": "Replacements apply to the title, summary and body; saving also rewrites matching articles you already have.",
       "needCondition": "Fill in at least one complete condition",
       "needRewrite": "Fill in the find text of every replacement",
+      "openActionsHint": "These actions take effect when a matching article is opened, and apply to already-stored articles too.",
       "operator": {
         "contains": "contains",
         "not_contains": "does not contain",

@@ -323,6 +323,7 @@ pub fn run() {
             commands::delete_rule,
             commands::preview_rule,
             commands::apply_rule_to_existing,
+            commands::rule_actions_for_article,
             commands::add_newsletter_source,
             commands::list_newsletter_sources,
             commands::remove_newsletter_source,

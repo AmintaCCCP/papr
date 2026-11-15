@@ -9,6 +9,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
+import { useAutoTranslateOnOpen } from "../hooks/useAutoTranslate";
 import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
@@ -302,19 +303,52 @@ export default function Reader({ onToast }: Props) {
   // Feed list, so the article's source feed can be checked for its per-feed
   // auto-translate flag. Shared cache key with the sidebar — no extra fetch.
   const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
+  // Open-time rule actions for this article (`translate` / `summarize` /
+  // `fulltext` / `open_original`), resolved against the live rules when the
+  // article opens — so editing a rule affects matching articles old and new,
+  // with no per-article state (rule edits invalidate this cache). The gate
+  // below is `isFetching`, not `isLoading`: a cached-but-stale set (an
+  // earlier open of the same article, invalidated by a rule edit) must not
+  // be applied while this open's refetch is still running. A failed fetch —
+  // first load *or* background refetch, where TanStack Query keeps the
+  // previous (possibly stale) data around — degrades to "no rule actions".
+  const ruleActionsQ = useQuery({
+    queryKey: ["ruleActions", id],
+    queryFn: () => api.getRuleActions(id!),
+    enabled: !!id,
+  });
+  const ruleActions = ruleActionsQ.isError ? [] : (ruleActionsQ.data ?? []);
+  const ruleAutoTranslate = ruleActions.includes("translate");
+  const ruleAutoSummarize = ruleActions.includes("summarize");
   const autoTranslateFeed = !!(
     a && feeds.data?.find((f) => f.id === a.feedId)?.autoTranslate
   );
   // Effective open mode (issue #110): the feed's own setting, falling back to
-  // the global default. `undefined` while the article or feed list is still
-  // loading, so the open-mode/auto-extract effects below don't fire before the
-  // feed's own setting is known.
+  // the global default. A matching rule (`fulltext` → auto extraction,
+  // `open_original` → embedded web view) is the most specific intent, so it
+  // wins over both; `open_original` beats `fulltext` when rules ask for both.
+  // `undefined` while the article, feed list or this open's rule fetch is
+  // still in flight, so the open-mode/auto-extract effects below don't fire
+  // before the whole picture is known. A failed feed list degrades to "no
+  // feed override" (the global default) instead of stalling the effects for
+  // good.
   const feedOpenMode =
-    a && feeds.data
-      ? feeds.data.find((f) => f.id === a.feedId)?.openMode ?? null
-      : undefined;
+    feeds.isError
+      ? null
+      : a && feeds.data
+        ? feeds.data.find((f) => f.id === a.feedId)?.openMode ?? null
+        : undefined;
+  const ruleOpenMode = ruleActionsQ.isFetching
+    ? undefined
+    : ruleActions.includes("open_original")
+      ? "web"
+      : ruleActions.includes("fulltext")
+        ? "extracted"
+        : null;
   const openMode =
-    feedOpenMode === undefined ? undefined : feedOpenMode ?? defaultOpenMode;
+    feedOpenMode === undefined || ruleOpenMode === undefined
+      ? undefined
+      : (ruleOpenMode ?? (feedOpenMode ?? defaultOpenMode));
 
   const readMinutes = useMemo(() => {
     return estimateReadMinutes(bodyPlainText(a?.extractedHtml || a?.contentHtml || ""));
@@ -336,14 +370,21 @@ export default function Reader({ onToast }: Props) {
     // fresh (the auto-summarize preference re-opens it below when enabled).
     setAiOpen(false);
     autoSummarizedRef.current = null;
+    // The open-mode marker resets with the view it books: the reset above
+    // already put the reader back on the default body, so the next open of
+    // the *same* article must re-apply its open mode (a mid-read feeds
+    // refetch still can't yank the view — the marker is consumed right after
+    // the effect applies it). The auto-translate marker lives in
+    // useAutoTranslateOnOpen and resets with its view state there.
+    openModeAppliedRef.current = null;
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // Apply the effective open mode once the article (and the feed list) is
   // available — declared after the reset above so it wins the same commit.
-  // Applied once per article, so the toolbar toggles keep working afterwards
-  // and a feeds refetch never yanks the view back.
+  // Applied once per open, so the toolbar toggles keep working afterwards
+  // and a feeds refetch never yanks the view back mid-read.
   const openModeAppliedRef = useRef<number | null>(null);
   useEffect(() => {
     if (!a || openMode === undefined || openModeAppliedRef.current === a.id)
@@ -352,19 +393,6 @@ export default function Reader({ onToast }: Props) {
     if (openMode === "web" && a.url) setReaderView("web");
     else setShowExtracted(openMode === "extracted");
   }, [a, openMode]);
-
-  // Auto-load the summary (Folo-style): with the preference on, the card
-  // appears as soon as the article loads — a cached summary shows instantly,
-  // a missing one starts generating (see AISummary). Fires once per article
-  // and only while the card is closed, so dismissing it keeps it closed for
-  // this article; switching away and back loads it again.
-  useEffect(() => {
-    if (!a || !autoSummarize) return;
-    if (autoSummarizedRef.current === a.id) return;
-    autoSummarizedRef.current = a.id;
-    setAiOpen(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, autoSummarize]);
 
   // Drive the native original-page child webview (page_view.rs) while in web
   // mode. It floats above the DOM, so we measure the host rect and keep the
@@ -574,6 +602,15 @@ export default function Reader({ onToast }: Props) {
   const [tmpEngine, setTmpEngine] = useState<string | null>(null);
   const targetLang = tmpLang ?? defaultLang;
   const engine = tmpEngine ?? defaultEngine;
+  // Both translate settings must have finished loading before an *automatic*
+  // translation may start: while they are in flight, `targetLang` / `engine`
+  // above are only the UI-language / "llm" fallbacks, so a rule- or feed-
+  // driven translate would start with the wrong configuration and consume
+  // the once-per-open marker. A failed settings query skips auto-translate
+  // for this session (the toolbar toggle stays available) instead of
+  // guessing.
+  const translateConfigReady =
+    translateSetting.isSuccess && engineSetting.isSuccess;
   // Drop the temporary overrides when the article changes so each article opens
   // on the configured defaults.
   useEffect(() => {
@@ -594,6 +631,28 @@ export default function Reader({ onToast }: Props) {
   // earlier version must never win over the card, and the extract/toggle
   // controls are hidden below.
   const isXPost = a?.sourceType != null && isParserSourceType(a.sourceType);
+  // Whether a full-text extraction for the current article is still "in play":
+  // in flight (auto or manual), or planned and not finished successfully.
+  // While it is, the auto-translate and auto-summary effects hold off — their
+  // input is the article body, and starting them on the feed's stub would
+  // translate the excerpt and cache that result for good (the translation
+  // cache is keyed by language, not content), or summarise an empty body
+  // (ai_summarize fails with noArticleBody and the card's failed state blocks
+  // the auto retry). A *failed* planned extraction falls back to the stub: the
+  // article's extraction was attempted, so waiting would skip the behaviour
+  // for good. Declared here (next to the extract mutation and `isXPost` it
+  // reads) and consumed by the two effects below and the auto-extract effect.
+  const extractionPlanned =
+    openMode === "extracted" &&
+    !!a?.url &&
+    !a?.extractedHtml &&
+    !isXPost &&
+    (feedOpenMode === "extracted" ||
+      ruleOpenMode === "extracted" ||
+      bodyPlainText(a.contentHtml || "").trim().length < 800);
+  const extractionBlocking =
+    extract.isPending ||
+    (extractionPlanned && !(extract.isError && extract.variables === a?.id));
   // The source badge carries each parser platform's own glyph (PARSER_META),
   // not a hardcoded X — xiaohongshu and kuaishou articles are parser posts
   // too, and "X" would mislabel them.
@@ -601,6 +660,32 @@ export default function Reader({ onToast }: Props) {
     a && isParserSourceType(a.sourceType)
       ? PARSER_META[a.sourceType as ParserKey].glyph
       : "X";
+  // Auto-load the summary (Folo-style): with the preference on — or a matching
+  // rule asking for `summarize` — the card appears once the article is ready.
+  // "Ready" waits for the effective open mode (so the article isn't summarised
+  // from the feed's stub while it is still unknown whether a full-text
+  // extraction will run and replace it — the summary is cached on the row),
+  // for this open's rule fetch (`isFetching`, so a stale cached set is never
+  // honoured), and for any planned/in-flight full-text extraction
+  // (`extractionBlocking`) to settle. A cached summary shows instantly, a
+  // missing one starts generating (see AISummary). Fires once per open and
+  // only while the card is closed, so dismissing it keeps it closed for this
+  // article; switching away and back loads it again.
+  const autoSummarizeNow = autoSummarize || ruleAutoSummarize;
+  useEffect(() => {
+    if (
+      !a ||
+      openMode === undefined ||
+      ruleActionsQ.isFetching ||
+      extractionBlocking ||
+      !autoSummarizeNow
+    )
+      return;
+    if (autoSummarizedRef.current === a.id) return;
+    autoSummarizedRef.current = a.id;
+    setAiOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [a?.id, autoSummarizeNow, openMode, ruleActionsQ.isFetching, extractionBlocking]);
   const hasExtracted = !!a?.extractedHtml && !isXPost;
   const canTranslate = !!(a?.extractedHtml || a?.contentHtml);
   const baseBody = isXPost
@@ -704,48 +789,70 @@ export default function Reader({ onToast }: Props) {
   // article — so a failed fetch isn't retried on every re-render.
   const autoExtractedRef = useRef<number | null>(null);
   useEffect(() => {
-    // Parser articles are already complete (see `isXPost`): extracting their
-    // URL would replace a rendered tweet with the site's SPA shell.
-    if (openMode !== "extracted" || !a || !a.url || a.extractedHtml || isXPost) return;
+    // `extractionPlanned` (above) owns the whole "should this article be
+    // extracted on open" decision — open mode, parser-post exclusion, the
+    // stub-body bar and the explicit per-feed / per-rule asks — so this
+    // effect and the translate/summarize gates can never drift apart. (The
+    // bar measures the *decoded* text via `bodyPlainText`, not the raw
+    // markup: entity-heavy stubs are over-counted by a bare tag-strip, and
+    // an explicit per-feed "extracted" or a rule's `fulltext` skips the bar
+    // entirely — the user asked for the page's own text even when the feed
+    // body looks complete.)
+    if (!a || !extractionPlanned) return;
     if (autoExtractedRef.current === a.id || extract.isPending) return;
-    // Measure the *decoded* text, not the raw markup. A bare `<[^>]+>` tag
-    // strip leaves HTML entities intact, so an entity-heavy stub
-    // (`&nbsp;`-padded copy, `&mdash;`/`&amp;` runs) is over-counted — a
-    // genuinely short snippet can clear the 800-char bar and wrongly look
-    // "complete", leaving the reader showing the very stub auto-extract is
-    // meant to replace. `bodyPlainText` decodes entities and drops markup
-    // cleanly, the same measurement the reading-time estimate already uses.
-    // An explicit per-feed "extracted" skips the bar entirely — the user asked
-    // for the page's own text even when the feed body looks complete.
-    if (feedOpenMode !== "extracted") {
-      const plain = bodyPlainText(a.contentHtml || "").trim();
-      if (plain.length >= 800) return; // feed already delivers the full text
-    }
     autoExtractedRef.current = a.id;
     extract.mutate(a.id);
+    // `extract.isPending` in the deps: switching to this article while
+    // another article's extraction is still running skips the mutate above —
+    // without the dep, that earlier settle wouldn't re-run the effect and
+    // this article would never be extracted (nor un-block translate /
+    // summarize, which wait on `extractionBlocking`).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, a?.extractedHtml, openMode, feedOpenMode, isXPost]);
+  }, [a?.id, a?.extractedHtml, a?.contentHtml, openMode, feedOpenMode, ruleOpenMode, isXPost, extract.isPending]);
 
-  // Per-feed auto-translate: when the article's source feed opts in, translate
-  // it into the configured target the moment it opens. Fires once per article
-  // (guarded by `autoTranslatedRef`), only when there's a body to translate and
-  // a usable cached translation in the target language isn't already present —
+  // Auto-translate on open: when the article's source feed opts in — or a
+  // matching rule asks for `translate` — translate it into the configured
+  // target once the article is ready. "Ready" waits for the effective open
+  // mode (so it can't start while it is still unknown whether a full-text
+  // extraction will run — `ai_translate` reads the body at call time, and a
+  // start before extraction lands would translate the feed's stub and cache
+  // that result for good, the translation cache being keyed by language, not
+  // content), for this open's rule fetch (`isFetching`, so a stale cached
+  // set is never honoured), for the translate settings to load
+  // (`translateConfigReady` — the fallbacks above would start the job in the
+  // wrong language/engine), and for any planned/in-flight full-text
+  // extraction to settle (`extractionBlocking`). A failed planned extraction
+  // falls back to the stub. Fires once per open (the marker resets with the
+  // view on article change), only when there's a body to translate and a
+  // usable cached translation in the target language isn't already present —
   // so a feed left untouched still shows its original text, and reopening a
-  // cached article doesn't re-spend an API call. The toolbar toggle still lets
-  // the reader flip back to the original at any time.
-  const autoTranslatedRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (!autoTranslateFeed || !a || !canTranslate) return;
-    if (autoTranslatedRef.current === a.id) return;
-    autoTranslatedRef.current = a.id;
-    // A fresh cached translation for the target language needs no new job;
-    // just surface it. Otherwise start a background translation.
-    if (!(a.translatedHtml && a.translatedLang === targetLang)) {
-      startTranslate(a.id, targetLang, engine);
-    }
-    setShowTranslation(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a?.id, autoTranslateFeed, canTranslate, targetLang, engine]);
+  // cached article doesn't re-spend an API call. The toolbar toggle still
+  // lets the reader flip back to the original at any time.
+  const autoTranslateNow = autoTranslateFeed || ruleAutoTranslate;
+  // Auto-translate on open (see useAutoTranslateOnOpen + decideAutoTranslate
+  // for the full gating order and its tests): starts once the article is
+  // ready — effective open mode known, this open's rule fetch settled,
+  // translate settings loaded (never the loading fallbacks), extraction
+  // settled — then either surfaces a cached translation or starts a job with
+  // the saved configuration. The hook owns the once-per-open marker; the
+  // toolbar toggle still lets the reader flip back to the original at any
+  // time.
+  useAutoTranslateOnOpen({
+    requested: autoTranslateNow,
+    articleId: a?.id ?? null,
+    openModeKnown: openMode !== undefined,
+    rulesFetching: ruleActionsQ.isFetching,
+    configReady: translateConfigReady,
+    extractionBlocking,
+    canTranslate,
+    hasCachedTranslation: !!(
+      a?.translatedHtml && a.translatedLang === targetLang
+    ),
+    targetLang,
+    engine,
+    onStart: startTranslate,
+    onSurface: () => setShowTranslation(true),
+  });
 
   // Mark the current article read once its foot is reached. Also fires for an
   // article short enough to need no scrolling at all (`scrollHeight` already

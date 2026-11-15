@@ -417,7 +417,11 @@
         "skip": "丢弃",
         "read": "标为已读",
         "star": "加星",
-        "rewrite": "替换文本"
+        "rewrite": "替换文本",
+        "translate": "自动翻译",
+        "summarize": "自动总结",
+        "fulltext": "自动获取全文",
+        "open_original": "自动打开原文"
       },
       "preview": {
         "checking": "检测中…",
@@ -438,6 +442,7 @@
       "rewritesHint": "替换会应用到标题、摘要与正文；保存时也会同步改写已匹配的已有文章。",
       "needCondition": "请至少填写一个完整条件",
       "needRewrite": "请填写每条替换的查找文本",
+      "openActionsHint": "这类动作在打开匹配的文章时自动生效，对已入库的文章同样有效。",
       "operator": {
         "contains": "包含",
         "not_contains": "不包含",

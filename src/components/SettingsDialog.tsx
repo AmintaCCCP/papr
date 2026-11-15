@@ -53,11 +53,12 @@ import type {
   RuleAction,
   RuleCondition,
   RuleField,
+  RuleOpenAction,
   RuleOperator,
   RulePreview,
   RuleRewrite,
 } from "../types";
-import { RULE_ACTIONS, RULE_FIELDS, RULE_OPERATORS } from "../types";
+import { RULE_ACTIONS, RULE_FIELDS, RULE_OPEN_ACTIONS, RULE_OPERATORS } from "../types";
 import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
 import FeedAvatar from "./FeedAvatar";
@@ -3110,7 +3111,14 @@ function FiltersSection({
   // `null` = not editing, "new" = the add form, a Rule = editing that rule.
   const [editing, setEditing] = useState<Rule | "new" | null>(null);
 
-  const refresh = () => qc.invalidateQueries({ queryKey: ["rules"] });
+  // Any rule change — save, enable/disable toggle, delete — invalidates the
+  // reader's cached open-time action sets too: open-time actions (`translate`
+  // …) are re-evaluated per article open, and the reader caches them per
+  // article under ["ruleActions", id].
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["rules"] });
+    qc.invalidateQueries({ queryKey: ["ruleActions"] });
+  };
   // Saving a rule also backfills existing articles (star / read / skip), so
   // refresh the article list, sidebar counts and per-feed counts the backfill
   // touched — not just the rule list. The editor shows the "saved"/"applied"
@@ -3541,6 +3549,9 @@ function RuleEditor({
           />
         </label>
       </div>
+      {RULE_OPEN_ACTIONS.includes(action as RuleOpenAction) && (
+        <p className="rule-rewrites-hint">{t("settings.filters.openActionsHint")}</p>
+      )}
       {action === "rewrite" && (
         <div className="rule-rewrites">
           <div className="rule-when-title">{t("settings.filters.rewritesTitle")}</div>
