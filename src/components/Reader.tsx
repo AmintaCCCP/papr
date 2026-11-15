@@ -9,6 +9,7 @@ import { usePlayer } from "../player";
 import { useTranslationJobs } from "../translation";
 import { useArticleActions } from "../hooks/articleActions";
 import { renderMarkdown } from "../lib/markdown";
+import { decideAutoTranslate } from "../lib/autoTranslate";
 import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
@@ -834,23 +835,30 @@ export default function Reader({ onToast }: Props) {
   const autoTranslateNow = autoTranslateFeed || ruleAutoTranslate;
   const autoTranslatedRef = useRef<number | null>(null);
   useEffect(() => {
-    if (
-      !autoTranslateNow ||
-      openMode === undefined ||
-      !translateConfigReady ||
-      ruleActionsQ.isFetching ||
-      extractionBlocking ||
-      !a ||
-      !canTranslate
-    )
-      return;
-    if (autoTranslatedRef.current === a.id) return;
+    // The gating order lives in `decideAutoTranslate` (unit-tested in
+    // autoTranslate.test.ts — above all the delayed-settings scenario, where
+    // the saved configuration must win over the loading fallbacks); this
+    // effect only consumes the decision and owns the once-per-open marker.
+    const decision = decideAutoTranslate({
+      requested: autoTranslateNow,
+      articleId: a?.id ?? null,
+      openModeKnown: openMode !== undefined,
+      rulesFetching: ruleActionsQ.isFetching,
+      configReady: translateConfigReady,
+      extractionBlocking,
+      canTranslate,
+      alreadyMarked: !!(a && autoTranslatedRef.current === a.id),
+      hasCachedTranslation: !!(
+        a?.translatedHtml && a.translatedLang === targetLang
+      ),
+      targetLang,
+      engine,
+    });
+    if (!decision.proceed || !a) return;
     autoTranslatedRef.current = a.id;
     // A fresh cached translation for the target language needs no new job;
     // just surface it. Otherwise start a background translation.
-    if (!(a.translatedHtml && a.translatedLang === targetLang)) {
-      startTranslate(a.id, targetLang, engine);
-    }
+    if (decision.start) startTranslate(a.id, decision.lang, decision.engine);
     setShowTranslation(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [a?.id, autoTranslateNow, openMode, translateConfigReady, ruleActionsQ.isFetching, extractionBlocking, canTranslate, targetLang, engine]);
