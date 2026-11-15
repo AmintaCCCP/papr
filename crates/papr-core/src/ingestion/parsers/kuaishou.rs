@@ -424,14 +424,14 @@ pub fn photo_to_article(photo: &KsPhoto, _profile_url: &str) -> crate::db::NewAr
     } else {
         photo.images.iter().collect()
     };
-    if !photo.video.is_some() {
+    if photo.video.is_none() {
         for image in gallery {
             html.push_str(&format!("<p><img src=\"{}\"></p>", escape_html_text(image)));
         }
     }
     let mut meta = Vec::new();
     if let Some(likes) = &photo.like_count {
-        meta.push(format!("♥ {}", escape_html_text(likes)));
+        meta.push(format!("♥ {likes}"));
     }
     if !meta.is_empty() {
         html.push_str(&format!("<p>{}</p>", escape_html_text(&meta.join(" · "))));
