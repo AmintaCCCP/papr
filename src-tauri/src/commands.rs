@@ -2111,6 +2111,81 @@ pub async fn ai_ask(
     Ok(())
 }
 
+/// One prior turn of the article-chat conversation, as the webview holds it.
+/// `role` is `"user"` or `"assistant"`.
+#[derive(Debug, Deserialize)]
+pub struct ChatTurn {
+    role: String,
+    content: String,
+}
+
+/// Stream an answer to a question about ONE article — the reader's AI-chat
+/// sidebar. The full article text rides in the system prompt; the prior turns
+/// of the sidebar conversation fold into the user message (the shared
+/// [`ai::stream_chat`] takes one system + one user turn, and the history is
+/// short — a chat session about a single article).
+#[tauri::command]
+pub async fn ai_article_chat(
+    state: State<'_, AppState>,
+    article_id: i64,
+    history: Vec<ChatTurn>,
+    question: String,
+    on_token: Channel<AiEvent>,
+) -> AppResult<()> {
+    let ((title, body), cfg, lang) = {
+        let conn = state.read().await;
+        (
+            db::article_text(&conn, article_id)?,
+            load_ai_config(&conn)?,
+            response_language(&conn),
+        )
+    };
+    if body.trim().is_empty() {
+        return Err(AppError::code("noArticleBody"));
+    }
+
+    let system = format!(
+        "You are the reader's AI assistant for one article. Answer the \
+         user's questions grounded in the article below; if the answer is \
+         not in the article, say so plainly. You may also follow the user's \
+         instructions about the article (explain, translate a passage, \
+         extract facts, take a side on its argument). Quote short passages \
+         when they support the answer.\n\n\
+         Article: “{title}”\n\n{}{lang}",
+        truncate(&body, ARTICLE_CHAT_BODY_BUDGET)
+    );
+
+    // Fold the conversation so far into the user turn, transcript-style.
+    // Bounded both ways: only the most recent turns ride along (a long
+    // sidebar session must not grow the request until the provider rejects
+    // it) and each turn's text is truncated.
+    let recent_turns: &[ChatTurn] = if history.len() > CHAT_HISTORY_TURNS {
+        &history[history.len() - CHAT_HISTORY_TURNS..]
+    } else {
+        &history
+    };
+    let mut user = String::new();
+    for turn in recent_turns {
+        let speaker = if turn.role == "assistant" { "Assistant" } else { "User" };
+        user.push_str(&format!("{speaker}: {}\n\n", truncate(&turn.content, 2000)));
+    }
+    user.push_str(&format!("User: {}", truncate(&question, CHAT_QUESTION_BUDGET)));
+
+    let http = state.http();
+    stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::CHAT_MAX_TOKENS).await?;
+    Ok(())
+}
+
+/// Character budget for the article body embedded in the chat system prompt:
+/// enough for even the longest extracted feed article, small enough to leave
+/// the model room for the conversation itself.
+const ARTICLE_CHAT_BODY_BUDGET: usize = 16_000;
+/// Prior turns folded into a chat request — older ones drop off; the recent
+/// context is what an answer needs.
+const CHAT_HISTORY_TURNS: usize = 20;
+/// Character cap on one chat question.
+const CHAT_QUESTION_BUDGET: usize = 4000;
+
 /// Stream an AI briefing that synthesizes the most recent articles by theme.
 #[tauri::command]
 pub async fn ai_digest(state: State<'_, AppState>, on_token: Channel<AiEvent>) -> AppResult<()> {

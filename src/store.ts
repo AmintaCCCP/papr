@@ -69,6 +69,9 @@ export const READER_BOUNDS = {
 export const PANEL_BOUNDS = {
   sidebar: { min: 200, max: 420 },
   list: { min: 300, max: 560 },
+  /** The reader's AI-chat sidebar — a conversation pane, not a reading
+   *  surface: it may go narrow, but never so narrow the bubbles wrap badly. */
+  aiChat: { min: 280, max: 560 },
 } as const;
 
 /** Clamp `n` into `[min, max]`. */
@@ -163,6 +166,8 @@ interface UiState {
   // draggable pane widths (px)
   sidebarWidth: number;
   listWidth: number;
+  /** The reader's AI-chat sidebar width. */
+  aiChatWidth: number;
 
   // behavioural preferences
   prefs: Prefs;
@@ -173,6 +178,10 @@ interface UiState {
    *  article — the reader closes it on article switch (the auto-summarize
    *  preference re-opens it for the new article when on). */
   aiOpen: boolean;
+  /** The reader's AI-chat sidebar (article Q&A) is open. Independent of the
+   *  summary card: the card's interaction is untouched, this pane only ever
+   *  hosts the conversation. */
+  aiChatOpen: boolean;
   /** Whether the reader shows the reading view or the article's original
    *  page (native child webview). Lives here, not in the reader component,
    *  so the keyboard / command-palette AI-summary toggle can return to the
@@ -202,12 +211,13 @@ interface UiState {
   setViewMode: (v: ViewMode) => void;
   setReaderFont: (v: ReaderFont) => void;
   setReader: (p: Partial<Pick<UiState, "readerSize" | "readerLeading" | "readerWidth">>) => void;
-  setPanel: (p: Partial<Pick<UiState, "sidebarWidth" | "listWidth">>) => void;
+  setPanel: (p: Partial<Pick<UiState, "sidebarWidth" | "listWidth" | "aiChatWidth">>) => void;
 
   setPref: (patch: Partial<Prefs>) => void;
 
   setFocusMode: (v: boolean) => void;
   setAiOpen: (v: boolean) => void;
+  setAiChatOpen: (v: boolean) => void;
   setReaderView: (v: "reader" | "web") => void;
   setModalOpen: (v: boolean) => void;
   setMenuOpen: (v: boolean) => void;
@@ -323,11 +333,13 @@ export const useUi = create<UiState>((set, get) => ({
 
   sidebarWidth: ls.num("sidebarWidth", 248, PANEL_BOUNDS.sidebar.min, PANEL_BOUNDS.sidebar.max),
   listWidth: ls.num("listWidth", 388, PANEL_BOUNDS.list.min, PANEL_BOUNDS.list.max),
+  aiChatWidth: ls.num("aiChatWidth", 360, PANEL_BOUNDS.aiChat.min, PANEL_BOUNDS.aiChat.max),
 
   prefs: loadPrefs(),
 
   focusMode: false,
   aiOpen: false,
+  aiChatOpen: false,
   readerView: "reader",
   modalOpen: false,
   menuOpen: false,
@@ -376,7 +388,7 @@ export const useUi = create<UiState>((set, get) => ({
     // Clamp on write so neither a drag past the handle's guard nor a stale
     // persisted value (from an older build with different limits) can push an
     // out-of-range width into the store or its `--col-*` CSS variable.
-    const next: Partial<Pick<UiState, "sidebarWidth" | "listWidth">> = {};
+    const next: Partial<Pick<UiState, "sidebarWidth" | "listWidth" | "aiChatWidth">> = {};
     if (p.sidebarWidth != null) {
       next.sidebarWidth = clamp(p.sidebarWidth, PANEL_BOUNDS.sidebar.min, PANEL_BOUNDS.sidebar.max);
       ls.set("sidebarWidth", next.sidebarWidth);
@@ -384,6 +396,10 @@ export const useUi = create<UiState>((set, get) => ({
     if (p.listWidth != null) {
       next.listWidth = clamp(p.listWidth, PANEL_BOUNDS.list.min, PANEL_BOUNDS.list.max);
       ls.set("listWidth", next.listWidth);
+    }
+    if (p.aiChatWidth != null) {
+      next.aiChatWidth = clamp(p.aiChatWidth, PANEL_BOUNDS.aiChat.min, PANEL_BOUNDS.aiChat.max);
+      ls.set("aiChatWidth", next.aiChatWidth);
     }
     set(next);
   },
@@ -397,6 +413,7 @@ export const useUi = create<UiState>((set, get) => ({
 
   setFocusMode: (focusMode) => set({ focusMode }),
   setAiOpen: (aiOpen) => set({ aiOpen }),
+  setAiChatOpen: (aiChatOpen) => set({ aiChatOpen }),
   setReaderView: (readerView) => set({ readerView }),
   setModalOpen: (modalOpen) => set({ modalOpen }),
   setMenuOpen: (menuOpen) => set({ menuOpen }),

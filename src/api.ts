@@ -209,6 +209,27 @@ export function aiAsk(
   return invoke<void>("ai_ask", { question, onToken: channel });
 }
 
+/** One prior turn of the article-chat conversation (`role` is `"user"` or
+ *  `"assistant"`); mirrors the backend's `ChatTurn`. */
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** Stream an answer to `question` about one article — the reader's AI-chat
+ *  sidebar. `history` carries the conversation so far (oldest first); the
+ *  answer streams over `onToken` as `{type:"delta"}` events. */
+export function aiArticleChat(
+  articleId: number,
+  history: ChatTurn[],
+  question: string,
+  onToken: (e: AiEvent) => void,
+): Promise<void> {
+  const channel = new Channel<AiEvent>();
+  channel.onmessage = onToken;
+  return invoke<void>("ai_article_chat", { articleId, history, question, onToken: channel });
+}
+
 export function aiDigest(onToken: (e: AiEvent) => void): Promise<void> {
   const channel = new Channel<AiEvent>();
   channel.onmessage = onToken;
