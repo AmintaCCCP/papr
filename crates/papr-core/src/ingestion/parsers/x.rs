@@ -854,33 +854,33 @@ fn text_source(
                 .or_else(|| legacy.pointer("/entities/media"))
                 .and_then(|m| m.as_array());
             if let Some(legacy_media) = legacy_media {
-            let boundaries = utf16_boundaries(note_text);
-            for m in legacy_media {
-                // An empty `url` would make `find("")` match forever without
-                // advancing — skip it.
-                let Some(tco) = m
-                    .get("url")
-                    .and_then(|u| u.as_str())
-                    .filter(|u| !u.is_empty())
-                else {
-                    continue;
-                };
-                let mut from = 0;
-                while let Some(rel) = note_text[from..].find(tco) {
-                    let at = from + rel;
-                    if let (Some(start), Some(end)) = (
-                        byte_to_utf16(&boundaries, at),
-                        byte_to_utf16(&boundaries, at + tco.len()),
-                    ) {
-                        entities.push(TextEntity {
-                            start,
-                            end,
-                            href: None,
-                        });
+                let boundaries = utf16_boundaries(note_text);
+                for m in legacy_media {
+                    // An empty `url` would make `find("")` match forever without
+                    // advancing — skip it.
+                    let Some(tco) = m
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .filter(|u| !u.is_empty())
+                    else {
+                        continue;
+                    };
+                    let mut from = 0;
+                    while let Some(rel) = note_text[from..].find(tco) {
+                        let at = from + rel;
+                        if let (Some(start), Some(end)) = (
+                            byte_to_utf16(&boundaries, at),
+                            byte_to_utf16(&boundaries, at + tco.len()),
+                        ) {
+                            entities.push(TextEntity {
+                                start,
+                                end,
+                                href: None,
+                            });
+                        }
+                        from = at + tco.len();
                     }
-                    from = at + tco.len();
                 }
-            }
             }
         }
         // The render list: legacy `extended_entities` stays complete for note
