@@ -579,6 +579,10 @@ async fn poll_x_feeds(
                 // stored (cleared by the same call).
                 // Idempotent: rows whose markup already matches are skipped
                 // inside the helper, so this is one cheap SELECT per tweet.
+                // The helper also refuses to downgrade an X article row whose
+                // stored card carries the full article body (a cycle whose
+                // article fetch failed re-renders the bare title card — the
+                // guard keeps the stored body until the fetch succeeds again).
                 for article in &articles {
                     let _ = db::refresh_parser_article(&conn, *feed_id, article);
                 }

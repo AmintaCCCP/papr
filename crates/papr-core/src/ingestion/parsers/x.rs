@@ -34,19 +34,18 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 use url::Url;
 
 /// Public web-client Bearer token. Public by design: it ships with the x.com
 /// frontend to every visitor and carries no privileges; authenticating users
 /// are identified by their cookies.
-pub const X_BEARER_TOKEN: &str =
-    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+pub const X_BEARER_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
 /// Browser-like UA. x.com's API is pickier about this than most sites: the
 /// generic papr feed UA works for HTML, but the GraphQL endpoint expects a
 /// recognisable browser string.
-pub const X_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+pub const X_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 /// Tweets requested per UserTweets call (the web client's own page size).
 pub const USER_TWEETS_PAGE_SIZE: i64 = 20;
@@ -64,10 +63,12 @@ pub const CODE_ACCOUNT_UNAVAILABLE: &str = "xAccountUnavailable";
 pub const CODE_BLOCKED: &str = "xBlocked";
 pub const CODE_HANDLE_INVALID: &str = "xHandleInvalid";
 
-/// Fallback GraphQL queryIds (verified 2026-09). Only used when the live
-/// bundle extraction fails; stale ids surface as a 404 that re-extracts.
+/// Fallback GraphQL queryIds (verified 2026-09 / TweetDetail 2026-11). Only
+/// used when the live bundle extraction fails; stale ids surface as a 404
+/// that re-extracts.
 const FALLBACK_USER_TWEETS_ID: &str = "OeFjWKHutsuyWXZGmLr02A";
 const FALLBACK_USER_BY_SCREEN_NAME_ID: &str = "KybxDj9RrADIITXlGG8kpw";
+const FALLBACK_TWEET_DETAIL_ID: &str = "R9IzzyzQBV87-DOWpcvDmw";
 
 /// The `features` blob the web client sends with every UserTweets call. Its
 /// exact contents must match what the frontend sends or the API rejects the
@@ -97,6 +98,52 @@ static X_GRAPHQL_FEATURES: LazyLock<String> = LazyLock::new(|| {
         "rweb_video_timestamps_enabled": true,
         "longform_notetweets_rich_text_read_enabled": true,
         "longform_notetweets_inline_media_enabled": true,
+    })
+    .to_string()
+});
+
+/// The `features` blob for `TweetDetail` calls (the rweb tweet-detail feature
+/// set the web client sends — a superset of the timeline features including
+/// `articles_preview_enabled`). Serialized once, like `X_GRAPHQL_FEATURES`.
+static X_TWEET_DETAIL_FEATURES: LazyLock<String> = LazyLock::new(|| {
+    serde_json::json!({
+        "rweb_video_screen_enabled": true,
+        "profile_label_improvements_pcf_label_in_post_enabled": true,
+        "responsive_web_profile_redirect_enabled": true,
+        "rweb_tipjar_consumption_enabled": true,
+        "verified_phone_label_enabled": false,
+        "creator_subscriptions_tweet_preview_api_enabled": true,
+        "responsive_web_graphql_timeline_navigation_enabled": true,
+        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": true,
+        "premium_content_api_read_enabled": true,
+        "communities_web_enable_tweet_community_results_fetch": true,
+        "c9s_tweet_anatomy_moderator_badge_enabled": true,
+        "responsive_web_grok_analyze_button_fetch_trends_enabled": true,
+        "responsive_web_grok_analyze_post_followups_enabled": true,
+        "responsive_web_jetfuel_frame": true,
+        "responsive_web_grok_share_attachment_enabled": true,
+        "responsive_web_grok_annotations_enabled": true,
+        "articles_preview_enabled": true,
+        "responsive_web_edit_tweet_api_enabled": true,
+        "graphql_is_translatable_rweb_tweet_is_translatable_enabled": true,
+        "view_counts_everywhere_api_enabled": true,
+        "longform_notetweets_consumption_enabled": true,
+        "responsive_web_twitter_article_tweet_consumption_enabled": true,
+        "content_disclosure_indicator_enabled": true,
+        "content_disclosure_ai_generated_indicator_enabled": true,
+        "responsive_web_grok_show_grok_translated_post": true,
+        "responsive_web_grok_analysis_button_from_backend": true,
+        "post_ctas_fetch_enabled": true,
+        "freedom_of_speech_not_reach_fetch_enabled": true,
+        "standardized_nudges_misinfo": true,
+        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": true,
+        "longform_notetweets_rich_text_read_enabled": true,
+        "longform_notetweets_inline_media_enabled": true,
+        "responsive_web_grok_image_annotation_enabled": true,
+        "responsive_web_grok_imagine_annotation_enabled": true,
+        "responsive_web_grok_community_note_auto_translation_is_enabled": true,
+        "responsive_web_enhance_cards_enabled": true,
+        "tweet_awards_web_tipping_enabled": false,
     })
     .to_string()
 });
@@ -276,16 +323,59 @@ pub fn sanitize_handle_input(input: &str) -> Option<String> {
 pub struct QueryIds {
     pub user_tweets: Option<String>,
     pub user_by_screen_name: Option<String>,
+    /// `TweetDetail` — the per-tweet round-trip that carries X Articles'
+    /// rich content state (the timeline payload ships only the title).
+    pub tweet_detail: Option<String>,
 }
 
 /// Parser runtime state persisted across refreshes under `parser.x.state`:
-/// queryIds (rotated per x.com release) and the handle → rest_id map (the
-/// UserByScreenName round-trip is one request per new subscription only).
+/// queryIds (rotated per x.com release), the handle → rest_id map (the
+/// UserByScreenName round-trip is one request per new subscription only),
+/// and the per-handle sets of article tweet ids whose full body was already
+/// fetched (one TweetDetail round-trip per article, once).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct XState {
     pub query_ids: QueryIds,
     pub user_ids: BTreeMap<String, String>,
+    /// Per followed handle: tweet ids whose timeline card was upgraded with
+    /// the full article body (`TweetDetail`). Scoped per handle because one
+    /// `XState` is shared across every X feed in a refresh run — a flat set
+    /// pruned to "the current page" would have each feed's fetch erase the
+    /// other feeds' marks. Each handle's set is pruned to the ids of its own
+    /// current timeline page on each fetch, so the blob stays tiny. A state
+    /// blob from the flat-set shape fails to deserialize and degrades to a
+    /// fresh state (the marks are accelerators; the stored bodies survive in
+    /// the article rows).
+    pub enriched_articles: BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl XState {
+    /// The set of article tweet ids already enriched for `handle` (empty when
+    /// the handle has none yet).
+    pub fn enriched_for(&self, handle: &str) -> std::collections::BTreeSet<String> {
+        self.enriched_articles.get(handle).cloned().unwrap_or_default()
+    }
+
+    /// Mark `tweet_id` as enriched for `handle`.
+    pub fn mark_enriched(&mut self, handle: &str, tweet_id: &str) {
+        self.enriched_articles
+            .entry(handle.to_string())
+            .or_default()
+            .insert(tweet_id.to_string());
+    }
+
+    /// Prune `handle`'s enriched set down to `page_ids`: a tweet no longer on
+    /// the page never re-renders (the refresh leg only rewrites rows it just
+    /// re-fetched), so keeping its id would only grow the blob.
+    pub fn prune_enriched_to_page(&mut self, handle: &str, page_ids: &[&str]) {
+        if let Some(set) = self.enriched_articles.get_mut(handle) {
+            set.retain(|id| page_ids.contains(&id.as_str()));
+            if set.is_empty() {
+                self.enriched_articles.remove(handle);
+            }
+        }
+    }
 }
 
 impl XState {
@@ -332,6 +422,34 @@ pub fn build_user_tweets_url(user_id: &str, query_id: &str) -> String {
         "https://x.com/i/api/graphql/{query_id}/UserTweets?variables={}&features={}",
         encode_query_value(&variables.to_string()),
         encode_query_value(&X_GRAPHQL_FEATURES),
+    )
+}
+
+/// `TweetDetail` request URL for one tweet. The `withArticleRichContentState`
+/// field toggle is what makes the response carry the article's rich content
+/// state (DraftJS blocks) — without it only the title ships.
+pub fn build_tweet_detail_url(tweet_id: &str, query_id: &str) -> String {
+    let variables = serde_json::json!({
+        "focalTweetId": tweet_id,
+        "with_rux_injections": false,
+        "rankingMode": "Relevance",
+        "includePromotedContent": false,
+        "withCommunity": false,
+        "withQuickPromoteEligibilityTweetFields": false,
+        "withBirdwatchNotes": true,
+        "withVoice": false,
+    });
+    let field_toggles = serde_json::json!({
+        "withArticleRichContentState": true,
+        "withArticlePlainText": false,
+        "withGrokAnalyze": false,
+        "withDisallowedReplyControls": false,
+    });
+    format!(
+        "https://x.com/i/api/graphql/{query_id}/TweetDetail?variables={}&features={}&fieldToggles={}",
+        encode_query_value(&variables.to_string()),
+        encode_query_value(&X_TWEET_DETAIL_FEATURES),
+        encode_query_value(&field_toggles.to_string()),
     )
 }
 
@@ -393,6 +511,12 @@ pub struct XTweet {
     pub retweeted: Option<XNestedTweet>,
     /// Set when this tweet quotes another: that quoted tweet.
     pub quoted: Option<XNestedTweet>,
+    /// Set when this tweet publishes an X Article — either the payload ships
+    /// the `article` object (older shape, title inline) or its only content is
+    /// a link to `x.com/i/article/<id>` (newer shape, no article object at
+    /// all). Flagging drives the `TweetDetail` enrichment pass that fetches
+    /// the full article body.
+    pub is_article: bool,
 }
 
 /// A tweet embedded inside another one — the retweet target or the quoted
@@ -953,6 +1077,17 @@ fn article_title_of<'a>(
         .filter(|_| full_text.trim().is_empty() || is_link_only_text(full_text, entities))
 }
 
+/// `true` when the tweet's only content is a link to an X Article permalink
+/// (`x.com/i/article/<id>`). The newer timeline payload ships article tweets
+/// in exactly this shape — a bare permalink with **no** `article` object — so
+/// this, not `article_title_of`, is what flags them for enrichment.
+fn article_permalink_only(full_text: &str, entities: &[TextEntity]) -> bool {
+    is_link_only_text(full_text, entities)
+        && entities
+            .iter()
+            .any(|e| e.href.as_deref().is_some_and(|h| h.contains("/i/article/")))
+}
+
 /// UTC date (`2026-09-13`) for a card's permalink label. UTC on purpose: the
 /// card is stored at ingest time, so a locally-rendered date would freeze one
 /// machine's time zone into the article forever (and make tests depend on the
@@ -1132,12 +1267,20 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
     }
 
     // The two ways another account's tweet rides along: a retweet forwards one
-    // verbatim, a quote adds the author's own commentary above it.
+    // verbatim, a quote adds the author's own commentary above it. The quoted
+    // tweet moved between payload generations — current responses carry it at
+    // the tweet-result level, older ones under `legacy` — so both are read,
+    // newest first.
     let retweeted = legacy
         .pointer("/retweeted_status_result/result")
         .and_then(nested_tweet);
-    let quoted = legacy
+    let quoted = tweet_obj
         .pointer("/quoted_status_result/result")
+        // Limited-visibility tweets wrap the real tweet one level down in a
+        // `TweetWithVisibilityResults`; the quote can sit on that outer
+        // wrapper object next to `tweet`.
+        .or_else(|| result.pointer("/quoted_status_result/result"))
+        .or_else(|| legacy.pointer("/quoted_status_result/result"))
         .and_then(nested_tweet);
 
     // The list snippet reads as the content, not as an "RT @…" notice.
@@ -1221,16 +1364,18 @@ fn tweet_from_result(result: &serde_json::Value, handle: &str, entry_id: &str) -
         video_url,
         retweeted,
         quoted,
+        is_article: article_title.is_some() || article_permalink_only(&full_text, &text_entities),
     })
 }
 
 /// Parse a `UserTweets` response body into the mapped tweet list. Retweets
 /// are included and attributed to the followed author (their `full_text`
 /// starts with `RT @…`); tombstoned and malformed entries are skipped rather
-/// than failing the page. Only top-level timeline entries are consumed —
-/// nested reference tweets belong to other authors. Long-form note tweets
-/// render from the inline `note_tweet` body (the full text ships with the
-/// timeline payload); X "Article" tweets render as their linked title.
+/// than failing the page. Top-level timeline entries *and* the pinned entry
+/// are consumed — nested reference tweets belong to other authors. Long-form
+/// note tweets render from the inline `note_tweet` body (the full text ships
+/// with the timeline payload); X "Article" tweets render as their linked
+/// title until the enrichment pass swaps in the full article body.
 pub fn parse_user_tweets_json(body: &str, handle: &str) -> XResult<Vec<XTweet>> {
     let data: serde_json::Value =
         serde_json::from_str(body).map_err(|e| XError::Parse(e.to_string()))?;
@@ -1250,31 +1395,52 @@ pub fn parse_user_tweets_json(body: &str, handle: &str) -> XResult<Vec<XTweet>> 
     let mut tweets = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for instruction in instructions {
-        if instruction.get("type").and_then(|t| t.as_str()) != Some("TimelineAddEntries") {
-            continue;
-        }
-        let Some(entries) = instruction.get("entries").and_then(|e| e.as_array()) else {
-            continue;
-        };
-        for entry in entries {
-            let entry_id = entry.get("entryId").and_then(|e| e.as_str()).unwrap_or("");
-            if !entry_id.starts_with("tweet-") {
-                continue;
+        match instruction.get("type").and_then(|t| t.as_str()) {
+            Some("TimelineAddEntries") => {
+                for entry in instruction
+                    .get("entries")
+                    .and_then(|e| e.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(tweet) = tweet_from_entry(entry, handle) {
+                        // The same tweet can surface twice (pinned +
+                        // timeline); the DB dedupes, keep the page honest.
+                        if seen.insert(tweet.id.clone()) {
+                            tweets.push(tweet);
+                        }
+                    }
+                }
             }
-            let Some(tweet) = entry
-                .pointer("/content/itemContent/tweet_results/result")
-                .and_then(|r| tweet_from_result(r, handle, entry_id))
-            else {
-                continue;
-            };
-            // The same tweet can surface twice (pinned + timeline); the DB
-            // dedupes, but keep the in-memory page honest too.
-            if seen.insert(tweet.id.clone()) {
-                tweets.push(tweet);
+            // Pinned tweets ride in their own `TimelinePinEntry` instruction,
+            // not in the entries list — and a pinned tweet is often the
+            // author's flagship post (frequently an X Article). Ingest it
+            // like any other, deduped by tweet id against the regular page.
+            Some("TimelinePinEntry") => {
+                if let Some(entry) = instruction.get("entry") {
+                    if let Some(tweet) = tweet_from_entry(entry, handle) {
+                        if seen.insert(tweet.id.clone()) {
+                            tweets.push(tweet);
+                        }
+                    }
+                }
             }
+            _ => {}
         }
     }
     Ok(tweets)
+}
+
+/// Map one timeline (or pin) entry to an [`XTweet`]; cursor entries, promoted
+/// content and tombstones yield `None`.
+fn tweet_from_entry(entry: &serde_json::Value, handle: &str) -> Option<XTweet> {
+    let entry_id = entry.get("entryId").and_then(|e| e.as_str()).unwrap_or("");
+    if !entry_id.starts_with("tweet-") {
+        return None;
+    }
+    entry
+        .pointer("/content/itemContent/tweet_results/result")
+        .and_then(|r| tweet_from_result(r, handle, entry_id))
 }
 
 /// Map one fetched tweet to an article row — the single definition shared by
@@ -1310,6 +1476,599 @@ pub fn tweet_to_article(t: &XTweet) -> crate::db::NewArticle {
                 }]
             })
             .unwrap_or_default(),
+    }
+}
+
+/* ── X Articles: the TweetDetail round-trip ──────────────────────────── */
+
+/// The full body of an X Article, fetched per-tweet via `TweetDetail` with the
+/// `withArticleRichContentState` field toggle (the timeline payload ships only
+/// the title). `html` is already escaped; it re-sanitizes at ingestion like
+/// every other parser card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XArticleBody {
+    pub title: String,
+    /// Cover image (poster frame for a GIF cover) — the list thumbnail.
+    pub cover_image_url: Option<String>,
+    /// Playable mp4 when the cover is an animated media item.
+    pub cover_video_url: Option<String>,
+    /// First inline image of the body — the thumbnail fallback when the
+    /// article ships no cover.
+    pub first_body_image: Option<String>,
+    /// The rendered article blocks (paragraphs, headings, quotes, media).
+    pub html: String,
+    /// Plain text of the article (links expanded, media dropped) — feeds the
+    /// list snippet and the full-text index.
+    pub text: String,
+}
+
+/// One resolved media attachment from an article's `media_entities` list.
+struct ArticleMedia {
+    image_url: Option<String>,
+    video_url: Option<String>,
+}
+
+/// Resolve one article `media_info` object (the `ApiImage` / `ApiGif` /
+/// `ApiVideo` shapes) into `(image_url, video_url)`. `ApiImage` ships the
+/// image at the top of `media_info`; animated media nest a preview image plus
+/// playable mp4 variants under `preview_image`.
+fn article_media_urls(info: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let image = |v: &serde_json::Value| {
+        v.get("original_img_url")
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+    };
+    if let Some(preview) = info.get("preview_image") {
+        let video = preview
+            .get("variants")
+            .and_then(best_video_variant)
+            .or_else(|| info.get("variants").and_then(best_video_variant));
+        (image(preview), video)
+    } else {
+        (image(info), None)
+    }
+}
+
+/// `media_entities` (a list of `{media_id, media_info}`) keyed by `media_id`.
+fn article_media_map(article: &serde_json::Value) -> BTreeMap<String, ArticleMedia> {
+    let mut out = BTreeMap::new();
+    let Some(list) = article.get("media_entities").and_then(|m| m.as_array()) else {
+        return out;
+    };
+    for m in list {
+        let Some(id) = m.get("media_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let (image_url, video_url) = m
+            .get("media_info")
+            .map(article_media_urls)
+            .unwrap_or((None, None));
+        if image_url.is_some() || video_url.is_some() {
+            out.insert(
+                id.to_string(),
+                ArticleMedia {
+                    image_url,
+                    video_url,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// The article's cover media (`cover_media.media_info`), resolved like any
+/// other article media item.
+fn article_cover_urls(article: &serde_json::Value) -> (Option<String>, Option<String>) {
+    article
+        .pointer("/cover_media/media_info")
+        .map(article_media_urls)
+        .unwrap_or((None, None))
+}
+
+/// The first media item in the article's `media_entities` list that resolves
+/// to an image — the list-thumbnail fallback for articles without a cover.
+/// Payload order, not document order: a thumbnail candidate, not a layout
+/// guarantee.
+fn first_article_image(article: &serde_json::Value) -> Option<String> {
+    let list = article.get("media_entities")?.as_array()?;
+    list.iter().find_map(|m| {
+        let (image, _) = m
+            .get("media_info")
+            .map(article_media_urls)
+            .unwrap_or((None, None));
+        image
+    })
+}
+
+/// One text/inline-style range inside a DraftJS block's `text` (UTF-16
+/// offsets, like every other X entity contract).
+#[derive(Debug, Clone)]
+enum BlockRange {
+    /// A `LINK` entity — render the covered span as an anchor.
+    Link(String),
+    /// A `MEDIA` entity — the covered span is a placeholder; drop it (the
+    /// media renders from the block itself).
+    Drop,
+    /// An `inlineStyleRange` — bold/italic emphasis.
+    Bold,
+    Italic,
+}
+
+/// The `(start, end)` UTF-16 span of a DraftJS range entry — `entityRanges`
+/// and `inlineStyleRanges` both use the `{offset, length}` contract (not the
+/// `indices` arrays of tweet entities).
+fn draft_range(entry: &serde_json::Value) -> Option<(usize, usize)> {
+    let offset = entry.get("offset")?.as_u64()?;
+    let length = entry.get("length")?.as_u64()?;
+    let start = offset.min(u64::from(u32::MAX)) as usize;
+    Some((
+        start,
+        offset.saturating_add(length).min(u64::from(u32::MAX)) as usize,
+    ))
+}
+
+/// Extract the block's entity + style ranges into [`BlockRange`]s. Malformed
+/// entries (missing spans, unknown entity types) are skipped.
+fn block_ranges(
+    block: &serde_json::Value,
+    entity_map: &BTreeMap<usize, &serde_json::Value>,
+) -> Vec<(usize, usize, BlockRange)> {
+    let mut out = Vec::new();
+    if let Some(list) = block.get("entityRanges").and_then(|e| e.as_array()) {
+        for r in list {
+            let Some((start, end)) = draft_range(r) else {
+                continue;
+            };
+            // A missing or negative key is a malformed range — skip it rather
+            // than clamp it onto entity 0, which is a real entity whose LINK
+            // URL would then render over an arbitrary span.
+            let Some(key) = r.get("key").and_then(|k| k.as_i64()).filter(|k| *k >= 0) else {
+                continue;
+            };
+            let kind = entity_map
+                .get(&(key as usize))
+                .and_then(|v| v.get("type"))
+                .and_then(|t| t.as_str());
+            match kind {
+                Some("LINK") => {
+                    if let Some(url) = v_url(entity_map, key) {
+                        out.push((start, end, BlockRange::Link(url)));
+                    }
+                }
+                Some("MEDIA") | Some("DIVIDER") => out.push((start, end, BlockRange::Drop)),
+                _ => {}
+            }
+        }
+    }
+    if let Some(list) = block.get("inlineStyleRanges").and_then(|e| e.as_array()) {
+        for r in list {
+            let Some((start, end)) = draft_range(r) else {
+                continue;
+            };
+            let style = r.get("style").and_then(|s| s.as_str()).unwrap_or("");
+            match style.to_ascii_lowercase().as_str() {
+                "bold" => out.push((start, end, BlockRange::Bold)),
+                "italic" => out.push((start, end, BlockRange::Italic)),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The `data.url` of the LINK entity registered under `key`.
+fn v_url(entity_map: &BTreeMap<usize, &serde_json::Value>, key: i64) -> Option<String> {
+    entity_map
+        .get(&(key.max(0) as usize))
+        .and_then(|v| v.pointer("/data/url"))
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+}
+
+/// Render one block's text with its entity + style ranges. `plain` produces
+/// the text form instead (links expand to their URL, media placeholders drop).
+///
+/// Walks the text boundary-by-boundary, closing and re-opening active ranges
+/// so the output always nests correctly — even where ranges merely overlap
+/// (a bold span crossing a link), which DraftJS allows and HTML cannot
+/// express directly: the split anchors simply render as two anchors.
+fn render_block_text(text: &str, ranges: Vec<(usize, usize, BlockRange)>, plain: bool) -> String {
+    // Clamp every range into the text; sort so longer ranges open first and
+    // open order is stable.
+    let total16 = text.chars().map(char::len_utf16).sum::<usize>();
+    let mut ranges: Vec<(usize, usize, &BlockRange)> = ranges
+        .iter()
+        .filter(|(s, e, _)| e > s)
+        .map(|(s, e, k)| ((*s).min(total16), (*e).min(total16), k))
+        .filter(|(s, e, _)| e > s)
+        .collect();
+    if ranges.is_empty() {
+        return escape_html_text(text);
+    }
+    ranges.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
+
+    let boundaries = utf16_boundaries(text);
+    let to_byte = |off: usize| {
+        utf16_to_byte(&boundaries, off)
+            .unwrap_or_else(|| utf16_to_byte(&boundaries, total16).unwrap_or(text.len()))
+    };
+
+    let mut out = String::new();
+    let mut active: Vec<(usize, usize, &BlockRange)> = Vec::new();
+    let mut byte_pos = 0usize;
+    // UTF-16 start of the segment being emitted (0 before the first mark).
+    let mut seg_start = 0usize;
+    let mut marks: Vec<usize> = ranges.iter().flat_map(|(s, e, _)| [*s, *e]).collect();
+    marks.sort_unstable();
+    marks.dedup();
+    if marks.last() != Some(&total16) {
+        marks.push(total16);
+    }
+    for &mark in &marks {
+        let mark_byte = to_byte(mark);
+        let segment = &text[byte_pos..mark_byte];
+        // Any active Drop range suppresses the covered text (media
+        // placeholders); links expand to their URL in the plain form.
+        let suppressed = active.iter().any(|(_, _, k)| matches!(k, BlockRange::Drop));
+        if !segment.is_empty() {
+            if plain {
+                if !suppressed {
+                    // A link range expands to its URL exactly once — at its own
+                    // first segment. Every later segment inside the same range
+                    // (split by another boundary) is swallowed by the expansion.
+                    let first = active.iter().rev().find_map(|(s, _, k)| match k {
+                        BlockRange::Link(url) if *s == seg_start => Some(url.clone()),
+                        _ => None,
+                    });
+                    match first {
+                        Some(url) => out.push_str(&url),
+                        None => {
+                            let covered = active
+                                .iter()
+                                .any(|(_, _, k)| matches!(k, BlockRange::Link(_)));
+                            if !covered {
+                                out.push_str(&escape_html_text(segment));
+                            }
+                        }
+                    }
+                }
+            } else if !suppressed {
+                for (_, _, k) in &active {
+                    match k {
+                        BlockRange::Bold => out.push_str("<strong>"),
+                        BlockRange::Italic => out.push_str("<em>"),
+                        BlockRange::Link(url) => {
+                            out.push_str(&format!("<a href=\"{}\">", escape_html_text(url)))
+                        }
+                        BlockRange::Drop => {}
+                    }
+                }
+                out.push_str(&escape_html_text(segment));
+                for (_, _, k) in active.iter().rev() {
+                    match k {
+                        BlockRange::Bold => out.push_str("</strong>"),
+                        BlockRange::Italic => out.push_str("</em>"),
+                        BlockRange::Link(_) => out.push_str("</a>"),
+                        BlockRange::Drop => {}
+                    }
+                }
+            }
+        }
+        byte_pos = mark_byte;
+        seg_start = mark;
+        // Rebuild the active set at this boundary: keep ranges still running
+        // (re-opened, so tags always nest), add the ones starting here.
+        let still: Vec<(usize, usize, &BlockRange)> = active
+            .drain(..)
+            .filter(|(s, e, _)| *e > mark && *s <= mark)
+            .collect();
+        if !still.is_empty() {
+            active.extend(still);
+        }
+        for (s, e, k) in &ranges {
+            if *s == mark
+                && !active
+                    .iter()
+                    .any(|(as_, ae, ak)| std::ptr::eq(*ak, *k) && *as_ == *s && *ae == *e)
+            {
+                active.push((*s, *e, *k));
+            }
+        }
+    }
+    out
+}
+
+/// The `(open, close)` tag pair for a block type, demoting headings one level
+/// (the article title renders above the body as the top heading).
+fn block_tags(block_type: &str) -> (&'static str, &'static str) {
+    match block_type {
+        "header-one" => ("<h2>", "</h2>"),
+        "header-two" => ("<h3>", "</h3>"),
+        "header-three" => ("<h4>", "</h4>"),
+        "blockquote" => ("<blockquote>", "</blockquote>"),
+        "code-block" => ("<pre><code>", "</code></pre>"),
+        _ => ("<p>", "</p>"),
+    }
+}
+
+/// The `entityMap` of a content state, keyed by its numeric entity key. Ships
+/// as a list of `{key, value}` entries.
+fn content_entity_map(content_state: &serde_json::Value) -> BTreeMap<usize, &serde_json::Value> {
+    content_state
+        .get("entityMap")
+        .and_then(|e| e.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|e| {
+                    // X ships the key as a string; tolerate a bare number in
+                    // case a payload drift puts it there.
+                    let key = e
+                        .get("key")
+                        .and_then(|k| {
+                            k.as_str().and_then(|s| s.parse().ok()).or_else(|| {
+                                k.as_u64().map(|n| n.min(u64::from(u32::MAX)) as usize)
+                            })
+                        })?;
+                    Some((key, e.get("value")?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Render one `atomic` block: a media entity (image / animated mp4) or a
+/// divider. Unresolvable entities render as nothing — an article never
+/// degrades to raw links here.
+fn atomic_block_html(
+    block: &serde_json::Value,
+    entity_map: &BTreeMap<usize, &serde_json::Value>,
+    media: &BTreeMap<String, ArticleMedia>,
+) -> String {
+    let Some(range) = block
+        .get("entityRanges")
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first())
+    else {
+        return String::new();
+    };
+    // A missing or negative key is malformed — render nothing rather than
+    // clamp onto entity 0.
+    let Some(key) = range.get("key").and_then(|k| k.as_i64()).filter(|k| *k >= 0) else {
+        return String::new();
+    };
+    let Some(value) = entity_map.get(&(key as usize)) else {
+        return String::new();
+    };
+    match value.get("type").and_then(|t| t.as_str()) {
+        Some("DIVIDER") => "<hr/>".to_string(),
+        Some("MEDIA") => {
+            let items = value
+                .pointer("/data/mediaItems")
+                .and_then(|m| m.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut out = String::new();
+            for item in items {
+                let Some(media_id) = item.get("mediaId").and_then(|m| m.as_str()) else {
+                    continue;
+                };
+                let Some(m) = media.get(media_id) else {
+                    continue;
+                };
+                if let Some(url) = &m.video_url {
+                    let poster = m
+                        .image_url
+                        .as_deref()
+                        .map(|p| format!(" poster=\"{}\"", escape_html_text(p)))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "<video src=\"{}\"{poster} playsinline loop muted preload=\"none\"></video>",
+                        escape_html_text(url)
+                    ));
+                } else if let Some(url) = &m.image_url {
+                    out.push_str(&format!(
+                        "<img src=\"{}\" loading=\"lazy\" alt=\"\">",
+                        escape_html_text(url)
+                    ));
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
+/// Render an article's DraftJS `content_state` into (html, plain text).
+/// Consecutive list blocks group into `<ul>` / `<ol>`; every block type this
+/// renderer does not know falls back to a paragraph, so new X block types
+/// degrade instead of vanishing.
+fn render_content_state(article: &serde_json::Value) -> Option<(String, String)> {
+    let content_state = article.get("content_state")?;
+    let blocks = content_state.get("blocks")?.as_array()?;
+    let entity_map = content_entity_map(content_state);
+    let media = article_media_map(article);
+
+    let mut html = String::new();
+    let mut text = String::new();
+    // Buffered run of list items: `Some((ordered, items_html))`.
+    let mut list_run: Option<(bool, Vec<String>)> = None;
+    let flush_list =
+        |list: &mut Option<(bool, Vec<String>)>, html: &mut String, text: &mut String| {
+            if let Some((ordered, items)) = list.take() {
+                if items.is_empty() {
+                    return;
+                }
+                let tag = if ordered { "ol" } else { "ul" };
+                html.push_str(&format!("<{tag}>{}</{tag}>", items.join("")));
+                text.push('\n');
+            }
+        };
+    for block in blocks {
+        let block_type = block
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("unstyled");
+        if block_type == "atomic" {
+            flush_list(&mut list_run, &mut html, &mut text);
+            let piece = atomic_block_html(block, &entity_map, &media);
+            if !piece.is_empty() {
+                html.push_str(&piece);
+            }
+            continue;
+        }
+        let raw = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let ranges = block_ranges(block, &entity_map);
+        if raw.trim().is_empty() && ranges.is_empty() {
+            continue;
+        }
+        let inner = render_block_text(raw, ranges.clone(), false);
+        let plain = render_block_text(raw, ranges, true);
+        // List items buffer; every other block type flushes the run first.
+        if block_type == "unordered-list-item" || block_type == "ordered-list-item" {
+            let ordered = block_type == "ordered-list-item";
+            match &mut list_run {
+                Some((run_ordered, items)) if *run_ordered == ordered => {
+                    items.push(format!("<li>{inner}</li>"));
+                }
+                _ => {
+                    flush_list(&mut list_run, &mut html, &mut text);
+                    list_run = Some((ordered, vec![format!("<li>{inner}</li>")]));
+                }
+            }
+        } else {
+            flush_list(&mut list_run, &mut html, &mut text);
+            let (open, close) = block_tags(block_type);
+            html.push_str(open);
+            html.push_str(&inner);
+            html.push_str(close);
+        }
+        text.push_str(&plain);
+        text.push('\n');
+    }
+    flush_list(&mut list_run, &mut html, &mut text);
+    let text = text.trim().to_string();
+    (!html.is_empty()).then_some((html, text))
+}
+
+/// Parse a `TweetDetail` response and extract the article body of `tweet_id`.
+/// `Ok(None)` when the tweet resolved but carries no article (a false-positive
+/// flag, a deleted article…) — the caller keeps the timeline card.
+pub fn parse_tweet_detail_json(body: &str, tweet_id: &str) -> XResult<Option<XArticleBody>> {
+    let data: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| XError::Parse(e.to_string()))?;
+    check_graphql_errors(&data, "TweetDetail")?;
+    let instructions = data
+        .pointer("/data/threaded_conversation_with_injections_v2/instructions")
+        .and_then(|i| i.as_array())
+        .ok_or_else(|| XError::Parse("TweetDetail: missing instructions".into()))?;
+    let mut focal: Option<&serde_json::Value> = None;
+    for instruction in instructions {
+        if instruction.get("type").and_then(|t| t.as_str()) != Some("TimelineAddEntries") {
+            continue;
+        }
+        for entry in instruction
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let result = entry.pointer("/content/itemContent/tweet_results/result");
+            let Some(result) = result else {
+                continue;
+            };
+            // Quoted/visibility-wrapped shapes nest the tweet one level down.
+            let tweet_obj = result.get("tweet").unwrap_or(result);
+            if tweet_obj.get("rest_id").and_then(|v| v.as_str()) == Some(tweet_id) {
+                focal = Some(tweet_obj);
+                break;
+            }
+        }
+    }
+    let Some(tweet_obj) = focal else {
+        return Ok(None);
+    };
+    let Some(article) = tweet_obj.pointer("/article/article_results/result") else {
+        return Ok(None);
+    };
+    let title = article
+        .get("title")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let Some((html, text)) = render_content_state(article) else {
+        return Ok(None);
+    };
+    let (cover_image_url, cover_video_url) = article_cover_urls(article);
+    let first_body_image = first_article_image(article);
+    Ok(Some(XArticleBody {
+        title,
+        cover_image_url,
+        cover_video_url,
+        first_body_image,
+        html,
+        text,
+    }))
+}
+
+/// Swap an article tweet's timeline card (title link only) for the full
+/// article body: the card head stays, the body becomes the linked title, the
+/// cover media and the rendered blocks. The plain text becomes
+/// `title + article text` for the snippet and the full-text index.
+fn apply_article_body(tweet: &mut XTweet, article: XArticleBody) {
+    let head = card_head(
+        tweet.author_name.as_deref(),
+        Some(&tweet.handle),
+        &tweet.url,
+        tweet.published_at.as_deref(),
+        None,
+    );
+    let title = if article.title.is_empty() {
+        // A title-less article (rare) falls back to the linked date label the
+        // card head already carries; the body still renders in full.
+        String::new()
+    } else {
+        format!(
+            r#"<a class="x-article-title" href="{}">{}</a>"#,
+            escape_html_text(&tweet.url),
+            escape_html_text(&article.title)
+        )
+    };
+    let cover = match (&article.cover_video_url, &article.cover_image_url) {
+        (Some(url), poster) => format!(
+            "<video src=\"{}\" poster=\"{}\" playsinline loop muted preload=\"none\"></video>",
+            escape_html_text(url),
+            escape_html_text(poster.as_deref().unwrap_or_default())
+        ),
+        (None, Some(url)) => format!(
+            "<img class=\"x-article-cover\" src=\"{}\" loading=\"lazy\" alt=\"\">",
+            escape_html_text(url)
+        ),
+        (None, None) => String::new(),
+    };
+    let mut content_html = String::from(r#"<div class="x-tweet">"#);
+    content_html.push_str(&head);
+    content_html.push_str(&format!(
+        r#"<div class="x-tweet-body">{title}{cover}<div class="x-article-body">{}</div></div>"#,
+        article.html
+    ));
+    // An article tweet can still quote another tweet — keep that block.
+    if let Some(q) = &tweet.quoted {
+        content_html.push_str(&nested_block(q));
+    }
+    content_html.push_str("</div>");
+
+    tweet.content_html = content_html;
+    tweet.text = if article.title.is_empty() {
+        article.text
+    } else {
+        format!("{}\n\n{}", article.title, article.text)
+    };
+    // The list thumbnail follows the visible content: the cover, else the
+    // first image the article's media list carries.
+    if tweet.image_url.is_none() {
+        tweet.image_url = article.cover_image_url.or(article.first_body_image);
     }
 }
 
@@ -1406,17 +2165,21 @@ pub fn find_main_bundle_url(home_html: &str) -> Option<String> {
     is_url_safe_id(hash).then(|| url.to_string())
 }
 
-/// Extract the two operation queryIds from a main-bundle body (pure).
+/// Extract the three operation queryIds from a main-bundle body (pure).
 pub fn extract_query_ids_from_bundle(bundle: &str) -> Option<QueryIds> {
     let mut ids = QueryIds {
         user_tweets: find_query_id_in_bundle(bundle, "UserTweets"),
         user_by_screen_name: find_query_id_in_bundle(bundle, "UserByScreenName"),
+        tweet_detail: find_query_id_in_bundle(bundle, "TweetDetail"),
     };
     if ids.user_tweets.is_none() {
         ids.user_tweets = Some(FALLBACK_USER_TWEETS_ID.to_string());
     }
     if ids.user_by_screen_name.is_none() {
         ids.user_by_screen_name = Some(FALLBACK_USER_BY_SCREEN_NAME_ID.to_string());
+    }
+    if ids.tweet_detail.is_none() {
+        ids.tweet_detail = Some(FALLBACK_TWEET_DETAIL_ID.to_string());
     }
     Some(ids)
 }
@@ -1480,7 +2243,10 @@ async fn resolve_query_ids(
     ct0: &str,
     state: &mut XState,
 ) -> QueryIds {
-    if state.query_ids.user_tweets.is_some() && state.query_ids.user_by_screen_name.is_some() {
+    if state.query_ids.user_tweets.is_some()
+        && state.query_ids.user_by_screen_name.is_some()
+        && state.query_ids.tweet_detail.is_some()
+    {
         return state.query_ids.clone();
     }
     match extract_query_ids(client, auth_token, ct0).await {
@@ -1496,6 +2262,7 @@ async fn resolve_query_ids(
             let fallback = QueryIds {
                 user_tweets: Some(FALLBACK_USER_TWEETS_ID.to_string()),
                 user_by_screen_name: Some(FALLBACK_USER_BY_SCREEN_NAME_ID.to_string()),
+                tweet_detail: Some(FALLBACK_TWEET_DETAIL_ID.to_string()),
             };
             state.query_ids = fallback.clone();
             fallback
@@ -1554,9 +2321,19 @@ async fn resolve_user_profile(
     Ok(profile)
 }
 
+/// Pause between per-article `TweetDetail` fetches within one timeline page.
+pub const ARTICLE_DETAIL_THROTTLE_MS: u64 = 250;
+/// Most article tweets a single timeline fetch enriches — a page of 20
+/// routinely carries at most a few; the cap bounds worst-case latency when an
+/// author publishes a run of articles. The rest enrich on the next cycle.
+pub const ARTICLE_DETAILS_PER_PAGE: usize = 8;
+
 /// Fetch one user's latest timeline page: profile + mapped tweets. This is
 /// the parser's single entry point — the add flow, the refresh leg and the
-/// settings "test connection" all funnel through it.
+/// settings "test connection" all funnel through it. Article tweets found on
+/// the page are enriched with their full body afterwards (one `TweetDetail`
+/// round-trip per new article, throttled and capped); a failed enrichment
+/// keeps the title card and retries on a later cycle.
 pub async fn fetch_user_tweets(
     client: &Client,
     auth_token: &str,
@@ -1591,8 +2368,114 @@ pub async fn fetch_user_tweets(
         )
         .await;
     }
-    let tweets = parse_user_tweets_json(&body?, handle)?;
+    let mut tweets = parse_user_tweets_json(&body?, handle)?;
+    enrich_article_tweets(client, auth_token, ct0, handle, &mut tweets, state).await;
     Ok(XUserPage { profile, tweets })
+}
+
+/// Upgrade the page's article tweets with their full bodies (`TweetDetail`).
+///
+/// `handle`'s persisted enriched set is pruned to the ids of this page first
+/// (per handle — one [`XState`] is shared across every X feed in a run, so a
+/// flat set pruned per fetch would have each feed erase the others' marks).
+/// Ids whose detail fetch resolved — with a body or with the answer "no
+/// article here" — are marked enriched so a periodic refresh never
+/// re-round-trips them; transport failures are not marked, so the next cycle
+/// retries.
+async fn enrich_article_tweets(
+    client: &Client,
+    auth_token: &str,
+    ct0: &str,
+    handle: &str,
+    tweets: &mut [XTweet],
+    state: &mut XState,
+) {
+    let page_ids: Vec<&str> = tweets.iter().map(|t| t.id.as_str()).collect();
+    state.prune_enriched_to_page(handle, &page_ids);
+    let enriched = state.enriched_for(handle);
+
+    let candidates: Vec<usize> = tweets
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_article && !enriched.contains(&t.id))
+        .map(|(i, _)| i)
+        .collect();
+
+    for (fetched, index) in candidates.into_iter().enumerate() {
+        if fetched >= ARTICLE_DETAILS_PER_PAGE {
+            break;
+        }
+        if fetched > 0 {
+            tokio::time::sleep(Duration::from_millis(ARTICLE_DETAIL_THROTTLE_MS)).await;
+        }
+        let tweet = &mut tweets[index];
+        if enrich_one_article(client, auth_token, ct0, handle, tweet, state).await {
+            state.mark_enriched(handle, &tweet.id);
+        }
+    }
+}
+
+/// One `TweetDetail` round-trip for one article tweet. `true` when the tweet
+/// was settled (enriched, or confirmed to carry no article) — either way it
+/// must not be retried; `false` on a transport/shape failure that a later
+/// cycle may recover from. A stale queryId (404) re-extracts and retries once,
+/// the same pattern the timeline fetches use.
+async fn enrich_one_article(
+    client: &Client,
+    auth_token: &str,
+    ct0: &str,
+    handle: &str,
+    tweet: &mut XTweet,
+    state: &mut XState,
+) -> bool {
+    let ids = resolve_query_ids(client, auth_token, ct0, state).await;
+    let Some(query_id) = ids.tweet_detail.clone() else {
+        return false;
+    };
+    let mut body = get_text(
+        client,
+        &build_tweet_detail_url(&tweet.id, &query_id),
+        &api_headers(auth_token, ct0),
+    )
+    .await;
+    if matches!(&body, Err(XError::Upstream(404))) {
+        state.query_ids.tweet_detail = None;
+        let fresh = resolve_query_ids(client, auth_token, ct0, state).await;
+        let Some(fresh_id) = fresh.tweet_detail.clone() else {
+            return false;
+        };
+        body = get_text(
+            client,
+            &build_tweet_detail_url(&tweet.id, &fresh_id),
+            &api_headers(auth_token, ct0),
+        )
+        .await;
+    }
+    let Ok(body) = body else {
+        log::warn!(
+            "x parser: article fetch failed for @{handle} tweet {}",
+            tweet.id
+        );
+        return false;
+    };
+    match parse_tweet_detail_json(&body, &tweet.id) {
+        Ok(Some(article)) => {
+            apply_article_body(tweet, article);
+            true
+        }
+        Ok(None) => {
+            // No article behind this tweet (a bare permalink share whose
+            // target has none, a deleted article…) — settled, keep the card.
+            true
+        }
+        Err(e) => {
+            log::warn!(
+                "x parser: article parse failed for @{handle} tweet {}: {e}",
+                tweet.id
+            );
+            false
+        }
+    }
 }
 
 /* ── tests ───────────────────────────────────────────────────────────── */
@@ -1805,9 +2688,10 @@ mod tests {
         assert_eq!(t.handle, "jack");
         assert_eq!(t.url, "https://x.com/jack/status/111");
         assert!(t.content_html.starts_with(r#"<div class="x-tweet">"#));
-        assert!(t
-            .content_html
-            .contains(r#"<span class="x-handle">@jack</span>"#));
+        assert!(
+            t.content_html
+                .contains(r#"<span class="x-handle">@jack</span>"#)
+        );
         assert!(t.content_html.contains(
             r#"<a class="x-permalink" href="https://x.com/jack/status/111">2026-09-13</a>"#
         ));
@@ -1824,9 +2708,10 @@ mod tests {
         // Photo tweet: media placeholder dropped from text, <img> appended.
         let t = &tweets[1];
         assert!(!t.content_html.contains("t.co/pic"));
-        assert!(t
-            .content_html
-            .contains(r#"<img src="https://pbs.twimg.com/media/abc.jpg""#));
+        assert!(
+            t.content_html
+                .contains(r#"<img src="https://pbs.twimg.com/media/abc.jpg""#)
+        );
         assert_eq!(t.text, "pic");
         assert_eq!(
             t.image_url.as_deref(),
@@ -1835,9 +2720,10 @@ mod tests {
 
         // Video tweet: highest-bitrate mp4 wins; m3u8 ignored.
         let t = &tweets[2];
-        assert!(t
-            .content_html
-            .contains(r#"<video src="https://video.twimg.com/high.mp4""#));
+        assert!(
+            t.content_html
+                .contains(r#"<video src="https://video.twimg.com/high.mp4""#)
+        );
         assert_eq!(
             t.video_url.as_deref(),
             Some("https://video.twimg.com/high.mp4")
@@ -1864,9 +2750,11 @@ mod tests {
         let tweets = parse_user_tweets_json(body, "jack").unwrap();
         assert_eq!(tweets.len(), 1);
         assert_eq!(tweets[0].id, "555");
-        assert!(tweets[0]
-            .content_html
-            .contains(r#"<div class="x-tweet-body">nested text</div>"#));
+        assert!(
+            tweets[0]
+                .content_html
+                .contains(r#"<div class="x-tweet-body">nested text</div>"#)
+        );
     }
 
     /// A retweet entry: the timeline entry belongs to the retweeter, the
@@ -1884,9 +2772,10 @@ mod tests {
 
         // The retweeter owns the entry, marked with the RT chip...
         assert!(t.content_html.contains(r#"<span class="x-chip">RT</span>"#));
-        assert!(t
-            .content_html
-            .contains(r#"<span class="x-handle">@jack</span>"#));
+        assert!(
+            t.content_html
+                .contains(r#"<span class="x-handle">@jack</span>"#)
+        );
         assert!(t.retweeted.is_some());
         // ...and the redundant "RT @...: " body is gone: exactly one body
         // renders, and it is the nested one.
@@ -1901,12 +2790,14 @@ mod tests {
         assert_eq!(nested.author_name.as_deref(), Some("Display Name"));
         assert_eq!(nested.url, "https://x.com/origauthor/status/900");
         assert!(t.content_html.contains(r#"<blockquote class="x-quote">"#));
-        assert!(t
-            .content_html
-            .contains(r#"href="https://x.com/origauthor/status/900">2026-09-12</a>"#));
-        assert!(t
-            .content_html
-            .contains(r#"original words <a href="https://example.com/orig">"#));
+        assert!(
+            t.content_html
+                .contains(r#"href="https://x.com/origauthor/status/900">2026-09-12</a>"#)
+        );
+        assert!(
+            t.content_html
+                .contains(r#"original words <a href="https://example.com/orig">"#)
+        );
 
         // The list snippet and thumbnail follow the visible content.
         assert_eq!(t.text, "original words https://example.com/orig");
@@ -1929,9 +2820,10 @@ mod tests {
         // The author's own words stay visible above the quoted block.
         assert_eq!(t.content_html.matches("x-tweet-body").count(), 2);
         assert!(t.content_html.contains("my commentary"));
-        assert!(t
-            .content_html
-            .contains(r#"href="https://x.com/quotedperson/status/777">2026-09-11</a>"#));
+        assert!(
+            t.content_html
+                .contains(r#"href="https://x.com/quotedperson/status/777">2026-09-11</a>"#)
+        );
         // A quote is not a retweet: no RT chip, and the snippet keeps the
         // author's commentary.
         assert!(!t.content_html.contains("x-chip"));
@@ -1989,9 +2881,10 @@ mod tests {
         // The body is the full note text — the truncation never leaks in.
         assert!(t.content_html.contains("第 281 字之后的完整正文"));
         assert!(t.content_html.contains("😀"));
-        assert!(t
-            .content_html
-            .contains(r#"<a href="https://example.com/long">https://t.co/long</a>"#));
+        assert!(
+            t.content_html
+                .contains(r#"<a href="https://example.com/long">https://t.co/long</a>"#)
+        );
         // The trailing t.co media placeholder is dropped from the text and
         // the photo renders below instead — once.
         assert!(!t.content_html.contains("t.co/pic"));
@@ -2043,9 +2936,10 @@ mod tests {
         let t = &tweets[0];
         assert!(t.content_html.contains("note full text"));
         assert!(!t.content_html.contains("t.co/pic"));
-        assert!(t
-            .content_html
-            .contains(r#"<img src="https://pbs.twimg.com/media/fallback.jpg""#));
+        assert!(
+            t.content_html
+                .contains(r#"<img src="https://pbs.twimg.com/media/fallback.jpg""#)
+        );
         assert_eq!(
             t.image_url.as_deref(),
             Some("https://pbs.twimg.com/media/fallback.jpg")
@@ -2110,9 +3004,10 @@ mod tests {
         let tweets = parse_user_tweets_json(&body, "jack").unwrap();
         let t = &tweets[0];
         assert!(t.content_html.contains("我自己的推荐语"));
-        assert!(!t
-            .content_html
-            .contains("<a href=\"https://x.com/jack/status/903\">标题</a>"));
+        assert!(
+            !t.content_html
+                .contains("<a href=\"https://x.com/jack/status/903\">标题</a>")
+        );
         assert_eq!(t.text, "我自己的推荐语");
     }
 
@@ -2141,9 +3036,10 @@ mod tests {
         let tweets = parse_user_tweets_json(&body, "jack").unwrap();
         let t = &tweets[0];
         assert!(t.text.contains("推荐阅读"));
-        assert!(!t
-            .content_html
-            .contains("<a href=\"https://x.com/jack/status/904\">标题</a>"));
+        assert!(
+            !t.content_html
+                .contains("<a href=\"https://x.com/jack/status/904\">标题</a>")
+        );
     }
 
     #[test]
@@ -2177,9 +3073,10 @@ mod tests {
         assert_eq!(t.id, "905");
         assert!(t.content_html.contains("wrapped 的完整长文正文"));
         assert!(!t.content_html.contains("截断的开头"));
-        assert!(t
-            .content_html
-            .contains(r#"<span class="x-handle">@jack</span>"#));
+        assert!(
+            t.content_html
+                .contains(r#"<span class="x-handle">@jack</span>"#)
+        );
         assert_eq!(t.url, "https://x.com/jack/status/905");
     }
 
@@ -2251,9 +3148,11 @@ mod tests {
         let t = &tweets[0];
         let nested = t.retweeted.as_ref().unwrap();
         assert_eq!(nested.id, "900");
-        assert!(nested
-            .content_html
-            .contains("<a href=\"https://x.com/origauthor/status/900\">原文标题</a>"));
+        assert!(
+            nested
+                .content_html
+                .contains("<a href=\"https://x.com/origauthor/status/900\">原文标题</a>")
+        );
         assert!(!nested.content_html.contains("t.co/art"));
         assert_eq!(t.text, "原文标题");
     }
@@ -2286,9 +3185,10 @@ mod tests {
         assert_eq!(tweets.len(), 1);
         let t = &tweets[0];
         assert_eq!(t.text, "空正文标题");
-        assert!(t
-            .content_html
-            .contains("<a href=\"https://x.com/jack/status/908\">空正文标题</a>"));
+        assert!(
+            t.content_html
+                .contains("<a href=\"https://x.com/jack/status/908\">空正文标题</a>")
+        );
     }
 
     #[test]
@@ -2324,9 +3224,10 @@ mod tests {
         let t = &tweets[0];
         assert!(!t.content_html.contains("t.co/pic"));
         assert!(!t.text.contains("t.co/pic"));
-        assert!(t
-            .content_html
-            .contains(r#"<img src="https://pbs.twimg.com/media/only-ext.jpg""#));
+        assert!(
+            t.content_html
+                .contains(r#"<img src="https://pbs.twimg.com/media/only-ext.jpg""#)
+        );
     }
 
     #[test]
@@ -2392,11 +3293,392 @@ mod tests {
         state.query_ids = QueryIds {
             user_tweets: Some("UT".into()),
             user_by_screen_name: Some("UB".into()),
+            tweet_detail: Some("TD".into()),
         };
         state.user_ids.insert("jack".into(), "123".into());
+        state.mark_enriched("jack", "902");
+        state.mark_enriched("dick", "903");
         state.save(&conn);
 
         let loaded = XState::load(&conn);
         assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn enriched_marks_are_scoped_and_pruned_per_handle() {
+        let mut state = XState::default();
+        state.mark_enriched("jack", "902");
+        state.mark_enriched("dick", "903");
+
+        // One handle's set is untouched by the other's presence…
+        assert_eq!(state.enriched_for("jack"), std::collections::BTreeSet::from(["902".to_string()]));
+        assert_eq!(state.enriched_for("dick"), std::collections::BTreeSet::from(["903".to_string()]));
+        // …and an unknown handle has none.
+        assert!(state.enriched_for("nope").is_empty());
+
+        // Pruning one handle's set down to its current page leaves the other
+        // handle's marks alone — a flat set pruned per fetch would have each
+        // feed erase the others' marks.
+        state.prune_enriched_to_page("jack", &["902"]);
+        state.prune_enriched_to_page("dick", &[]);
+        assert_eq!(state.enriched_for("jack"), std::collections::BTreeSet::from(["902".to_string()]));
+        assert!(state.enriched_for("dick").is_empty());
+        // The emptied entry disappears from the blob.
+        assert!(state.enriched_articles.get("dick").is_none());
+        // Pruning an unknown handle is a no-op.
+        state.prune_enriched_to_page("nope", &["x"]);
+        assert!(state.enriched_for("nope").is_empty());
+    }
+
+    #[test]
+    fn query_ids_cover_tweet_detail() {
+        // The bundle registers each pair adjacently — both argument orders
+        // appear (the forward one first, the reverse one on UserByScreenName).
+        let bundle = r#"x=queryId:"AAAA1111",operationName:"UserTweets",a=1;register({operationName:"UserByScreenName",queryId:"BBBB2222"},{operationName:"TweetDetail",queryId:"CCCC3333"})"#;
+        let ids = extract_query_ids_from_bundle(bundle).unwrap();
+        assert_eq!(ids.user_tweets.as_deref(), Some("AAAA1111"));
+        assert_eq!(ids.user_by_screen_name.as_deref(), Some("BBBB2222"));
+        assert_eq!(ids.tweet_detail.as_deref(), Some("CCCC3333"));
+        // Missing operations fall back to the pinned ids — including TweetDetail.
+        let ids = extract_query_ids_from_bundle("nothing here").unwrap();
+        assert_eq!(ids.tweet_detail.as_deref(), Some(FALLBACK_TWEET_DETAIL_ID));
+    }
+
+    #[test]
+    fn tweet_detail_url_carries_the_rich_content_state_toggle() {
+        let url = build_tweet_detail_url("1000", "QID");
+        assert!(url.starts_with("https://x.com/i/api/graphql/QID/TweetDetail?"));
+        assert!(url.contains("focalTweetId%22%3A%221000%22"));
+        assert!(url.contains("&features="));
+        assert!(url.contains("articles_preview_enabled"));
+        assert!(url.contains("&fieldToggles="));
+        assert!(url.contains("withArticleRichContentState%22%3Atrue"));
+    }
+
+    /// A quote tweet in the *current* payload shape: `quoted_status_result`
+    /// sits at the tweet-result level (verified live 2026-11), not under
+    /// `legacy` where older generations carried it.
+    #[test]
+    fn quoted_tweets_read_the_result_level_shape() {
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-780", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet", "rest_id": "780",
+                        "quoted_status_result": {"result": {
+                            "rest_id": "779",
+                            "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Quoted Person"}, "legacy": {"screen_name": "quotedperson"}}}},
+                            "legacy": {
+                                "full_text": "quoted words https://t.co/pic",
+                                "created_at": "Fri Sep 11 08:00:00 +0000 2026",
+                                "entities": {},
+                                "extended_entities": {"media": [{"type": "photo", "media_url_https": "https://pbs.twimg.com/media/q.jpg", "url": "https://t.co/pic", "indices": [14, 30]}]}
+                            }
+                        }},
+                        "legacy": {"full_text": "my commentary", "created_at": "Sun Sep 13 06:30:00 +0000 2026", "entities": {}}
+                    }}}}}
+                ]}
+            ]}}}}}
+        })
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        let t = &tweets[0];
+        let quoted = t.quoted.as_ref().expect("result-level quote block");
+        assert_eq!(quoted.id, "779");
+        assert_eq!(quoted.handle.as_deref(), Some("quotedperson"));
+        assert!(quoted.content_html.contains("quoted words"));
+        // The quoted media renders inside the nested block, and the outer
+        // commentary stays visible above it.
+        assert!(
+            t.content_html
+                .contains(r#"<img src="https://pbs.twimg.com/media/q.jpg""#)
+        );
+        assert!(t.content_html.contains("my commentary"));
+    }
+
+    /// The pinned entry (`TimelinePinEntry`) carries its tweet one level
+    /// deeper than timeline entries — and pinned tweets are often the
+    /// author's flagship article.
+    #[test]
+    fn pinned_entry_is_ingested_like_a_timeline_entry() {
+        let body = r#"{"data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+            {"type": "TimelinePinEntry", "entry": {"entryId": "tweet-960", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {"__typename": "Tweet", "rest_id": "960", "legacy": {"full_text": "pinned words", "created_at": "Sun Sep 13 09:00:00 +0000 2026", "entities": {}}}}}}}},
+            {"type": "TimelineAddEntries", "entries": [
+                {"entryId": "tweet-961", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {"__typename": "Tweet", "rest_id": "961", "legacy": {"full_text": "regular words", "created_at": "Sun Sep 13 09:10:00 +0000 2026", "entities": {}}}}}}}
+            ]}
+        ]}}}}}}"#;
+        let tweets = parse_user_tweets_json(body, "jack").unwrap();
+        assert_eq!(tweets.len(), 2);
+        assert_eq!(tweets[0].id, "960");
+        assert!(tweets[0].content_html.contains("pinned words"));
+    }
+
+    #[test]
+    fn article_permalink_payload_flags_enrichment() {
+        // The current article shape (verified live 2026-11): no `article`
+        // object on the tweet at all, the body is a bare permalink to
+        // `x.com/i/article/<id>` — flagged for the TweetDetail pass.
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-962", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet", "rest_id": "962",
+                        "legacy": {
+                            "full_text": "https://t.co/art",
+                            "created_at": "Sun Sep 13 09:20:00 +0000 2026",
+                            "entities": {"urls": [{"url": "https://t.co/art", "expanded_url": "https://x.com/i/article/2122257453870116864", "indices": [0, 23]}]}
+                        }
+                    }}}}}
+                ]}
+            ]}}}}}
+        })
+        .to_string();
+        let tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        assert!(tweets[0].is_article, "bare article permalink is flagged");
+
+        // A bare link to a normal page is not.
+        let plain_link = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-963", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet", "rest_id": "963",
+                        "legacy": {
+                            "full_text": "https://t.co/page",
+                            "created_at": "Sun Sep 13 09:25:00 +0000 2026",
+                            "entities": {"urls": [{"url": "https://t.co/page", "expanded_url": "https://example.com/page", "indices": [0, 25]}]}
+                        }
+                    }}}}}
+                ]}
+            ]}}}}}
+        })
+        .to_string();
+        let tweets = parse_user_tweets_json(&plain_link, "jack").unwrap();
+        assert!(!tweets[0].is_article);
+    }
+
+    /// A `TweetDetail` response for an article tweet (the shape the web
+    /// client receives with `withArticleRichContentState`): title, cover and
+    /// a DraftJS content state with every block type this renderer handles.
+    fn tweet_detail_fixture() -> String {
+        json!({
+            "data": {"threaded_conversation_with_injections_v2": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-1000", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet",
+                        "rest_id": "1000",
+                        "article": {"article_results": {"result": {
+                            "__typename": "TweetArticle",
+                            "title": "深度长文标题",
+                            "cover_media": {"media_id": "C1", "media_info": {"__typename": "ApiImage", "original_img_url": "https://pbs.twimg.com/media/cover.jpg"}},
+                            "content_state": {"blocks": [
+                                {"key": "a", "type": "unstyled", "text": "开头一段", "entityRanges": [], "inlineStyleRanges": [{"offset": 2, "length": 2, "style": "Bold"}]},
+                                {"key": "b", "type": "header-two", "text": "小节标题", "entityRanges": [], "inlineStyleRanges": []},
+                                {"key": "c", "type": "blockquote", "text": "点这里", "entityRanges": [{"key": 0, "offset": 0, "length": 3}], "inlineStyleRanges": []},
+                                {"key": "d", "type": "atomic", "text": " ", "entityRanges": [{"key": 1, "offset": 0, "length": 1}], "inlineStyleRanges": []},
+                                {"key": "e", "type": "unstyled", "text": "中间", "entityRanges": [], "inlineStyleRanges": []},
+                                {"key": "f", "type": "unordered-list-item", "text": "列表甲", "entityRanges": [], "inlineStyleRanges": []},
+                                {"key": "g", "type": "unordered-list-item", "text": "列表乙", "entityRanges": [], "inlineStyleRanges": []},
+                                {"key": "h", "type": "atomic", "text": " ", "entityRanges": [{"key": 3, "offset": 0, "length": 1}], "inlineStyleRanges": []},
+                                {"key": "i", "type": "atomic", "text": " ", "entityRanges": [{"key": 2, "offset": 0, "length": 1}], "inlineStyleRanges": []}
+                            ], "entityMap": [
+                                {"key": "0", "value": {"type": "LINK", "data": {"url": "https://example.com/x"}}},
+                                {"key": "1", "value": {"type": "MEDIA", "data": {"mediaItems": [{"mediaId": "M1"}]}}},
+                                {"key": "2", "value": {"type": "MEDIA", "data": {"mediaItems": [{"mediaId": "G1"}]}}},
+                                {"key": "3", "value": {"type": "DIVIDER", "data": {}}}
+                            ]},
+                            "media_entities": [
+                                {"media_id": "C1", "media_info": {"__typename": "ApiImage", "original_img_url": "https://pbs.twimg.com/media/cover.jpg"}},
+                                {"media_id": "M1", "media_info": {"__typename": "ApiImage", "original_img_url": "https://pbs.twimg.com/media/inline.jpg"}},
+                                {"media_id": "G1", "media_info": {"__typename": "ApiGif", "preview_image": {"original_img_url": "https://pbs.twimg.com/tweet_video_thumb/g.jpg", "variants": [{"content_type": "video/mp4", "bitrate": 0, "url": "https://video.twimg.com/tweet_video/g.mp4"}]}}}
+                            ]
+                        }}}
+                    }}}}
+                    }
+                ]}
+            ]}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn tweet_detail_yields_the_full_article_body() {
+        let article = parse_tweet_detail_json(&tweet_detail_fixture(), "1000")
+            .unwrap()
+            .expect("article body");
+        assert_eq!(article.title, "深度长文标题");
+        assert_eq!(
+            article.cover_image_url.as_deref(),
+            Some("https://pbs.twimg.com/media/cover.jpg")
+        );
+
+        // Paragraph with an inline bold span; the heading demotes to <h3>.
+        assert!(article.html.contains("<p>开头<strong>一段</strong></p>"));
+        assert!(article.html.contains("<h3>小节标题</h3>"));
+        // The blockquote's LINK entity renders as an anchor.
+        assert!(
+            article
+                .html
+                .contains(r#"<blockquote><a href="https://example.com/x">点这里</a></blockquote>"#)
+        );
+        // Atomic MEDIA resolves through mediaItems → media_entities.
+        assert!(
+            article
+                .html
+                .contains(r#"<img src="https://pbs.twimg.com/media/inline.jpg""#)
+        );
+        // The GIF ships as a muted looping mp4 with its poster frame.
+        assert!(article.html.contains(
+            r#"<video src="https://video.twimg.com/tweet_video/g.mp4" poster="https://pbs.twimg.com/tweet_video_thumb/g.jpg" playsinline loop muted preload="none"></video>"#
+        ));
+        // Consecutive list items group into one <ul>, and the divider renders.
+        assert!(
+            article
+                .html
+                .contains("<ul><li>列表甲</li><li>列表乙</li></ul>")
+        );
+        assert!(article.html.contains("<hr/>"));
+
+        // The plain text: paragraphs in order, the link expanded, no
+        // placeholders.
+        assert!(article.text.contains("开头一段"));
+        assert!(article.text.contains("https://example.com/x"));
+        assert!(!article.text.contains("t.co/"));
+    }
+
+    #[test]
+    fn tweet_detail_without_an_article_resolves_to_none() {
+        // A regular tweet fetched by mistake (false-positive flag): no
+        // article object, no body — the timeline card stands.
+        let body = json!({
+            "data": {"threaded_conversation_with_injections_v2": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-1001", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet", "rest_id": "1001",
+                        "legacy": {"full_text": "just words", "created_at": "Sun Sep 13 10:00:00 +0000 2026", "entities": {}}
+                    }}}}}
+                ]}
+            ]}}
+        })
+        .to_string();
+        assert_eq!(parse_tweet_detail_json(&body, "1001").unwrap(), None);
+        // A foreign focal tweet id also resolves to None.
+        assert_eq!(
+            parse_tweet_detail_json(&tweet_detail_fixture(), "9999").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn entity_map_keys_tolerate_numbers_and_reject_bad_ranges() {
+        // entityMap keys ship as strings; a bare JSON number (payload drift)
+        // must still resolve the LINK entity.
+        let numeric = json!({
+            "content_state": {"blocks": [
+                {"key": "a", "type": "unstyled", "text": "link text",
+                 "entityRanges": [{"key": 0, "offset": 0, "length": 4}],
+                 "inlineStyleRanges": []}
+            ], "entityMap": [
+                {"key": 0, "value": {"type": "LINK", "data": {"url": "https://example.com/a"}}}
+            ], "media_entities": []}
+        });
+        let (html, _) = render_content_state(&numeric).unwrap();
+        assert!(html.contains(r#"<a href="https://example.com/a">link</a> text"#));
+
+        // A malformed negative entity key is skipped, not clamped onto
+        // entity 0 (whose LINK URL would then render over an arbitrary span).
+        let negative = json!({
+            "content_state": {"blocks": [
+                {"key": "b", "type": "unstyled", "text": "bad range",
+                 "entityRanges": [{"key": -3, "offset": 0, "length": 3}],
+                 "inlineStyleRanges": []}
+            ], "entityMap": [
+                {"key": "0", "value": {"type": "LINK", "data": {"url": "https://example.com/evil"}}}
+            ], "media_entities": []}
+        });
+        let (html, _) = render_content_state(&negative).unwrap();
+        assert_eq!(html, "<p>bad range</p>");
+    }
+
+    #[test]
+    fn article_body_replaces_the_title_card() {
+        let body = json!({
+            "data": {"user": {"result": {"__typename": "User", "timeline_v2": {"timeline": {"instructions": [
+                {"type": "TimelineAddEntries", "entries": [
+                    {"entryId": "tweet-962", "content": {"entryType": "TimelineTimelineItem", "itemContent": {"tweet_results": {"result": {
+                        "__typename": "Tweet", "rest_id": "962",
+                        "core": {"user_results": {"result": {"__typename": "User", "core": {"name": "Display Name"}, "legacy": {"screen_name": "jack"}}}},
+                        "legacy": {
+                            "full_text": "https://t.co/art",
+                            "created_at": "Sun Sep 13 09:20:00 +0000 2026",
+                            "entities": {"urls": [{"url": "https://t.co/art", "expanded_url": "https://x.com/i/article/42", "indices": [0, 23]}]}
+                        }
+                    }}}}}
+                ]}
+            ]}}}}}
+        })
+        .to_string();
+        let mut tweets = parse_user_tweets_json(&body, "jack").unwrap();
+        let article = parse_tweet_detail_json(&tweet_detail_fixture(), "1000")
+            .unwrap()
+            .unwrap();
+        apply_article_body(&mut tweets[0], article);
+
+        let t = &tweets[0];
+        // Card head stays; the body carries the linked title, the cover and
+        // the rendered blocks.
+        assert!(t.content_html.starts_with(r#"<div class="x-tweet">"#));
+        assert!(
+            t.content_html
+                .contains(r#"<span class="x-handle">@jack</span>"#)
+        );
+        assert!(t.content_html.contains(
+            r#"<a class="x-article-title" href="https://x.com/jack/status/962">深度长文标题</a>"#
+        ));
+        assert!(t.content_html.contains(
+            r#"<img class="x-article-cover" src="https://pbs.twimg.com/media/cover.jpg""#
+        ));
+        assert!(
+            t.content_html
+                .contains(r#"<div class="x-article-body"><p>开头"#)
+        );
+
+        // The snippet reads title + article text; the thumbnail is the cover.
+        assert!(t.text.starts_with("深度长文标题\n\n开头一段"));
+        assert_eq!(
+            t.image_url.as_deref(),
+            Some("https://pbs.twimg.com/media/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn block_ranges_overlap_nest_correctly() {
+        // bold [0,10] and a link [5,15] cross each other — the walker must
+        // produce valid nesting (the anchor splits, never interleaves).
+        let text = "0123456789abcdefghij";
+        let ranges = vec![
+            (0, 10, BlockRange::Bold),
+            (5, 15, BlockRange::Link("https://example.com".to_string())),
+        ];
+        let html = render_block_text(text, ranges, false);
+        assert!(html.contains("<strong>01234</strong>"));
+        assert!(html.contains("<strong><a href=\"https://example.com\">56789</a></strong>"));
+        assert!(html.contains("<a href=\"https://example.com\">abcde</a>fghij"));
+        // Valid nesting sanity: no tag opened twice in a row, none orphaned.
+        assert_eq!(
+            html.matches("<strong>").count(),
+            html.matches("</strong>").count()
+        );
+        assert_eq!(html.matches("<a ").count(), html.matches("</a>").count());
+
+        // The plain form expands the link and keeps the words.
+        let plain = render_block_text(
+            text,
+            vec![
+                (0, 10, BlockRange::Bold),
+                (5, 15, BlockRange::Link("https://example.com".to_string())),
+            ],
+            true,
+        );
+        assert_eq!(plain, "01234https://example.comfghij");
     }
 }

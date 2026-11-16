@@ -273,8 +273,10 @@ async fn add_x_feed(
 
     let conn = state.db.lock().await;
     // Persist the caches next to the feed row. Not one atomic transaction —
-    // a cache write that commits before a failed insert is harmless (the
-    // caches are accelerators), so the simplicity wins.
+    // a cache write that commits before a failed insert is harmless for the
+    // queryId / rest_id accelerators, and the enriched-article marks match
+    // the page being ingested right below (the marks gate future
+    // re-enrichment, but the rows here already carry the full bodies).
     parser_state.save(&conn);
     // 用户名 as both feed and article title, per the parser's contract. The
     // avatar doubles as the favicon (a favicon request to x.com would need
@@ -951,10 +953,19 @@ pub async fn test_parser(
                 let conn = state.read().await;
                 parsers::x::XState::load(&conn)
             };
+            // The test fetch enriches article tweets like any other — but the
+            // test flow ingests nothing. Persisting the marks would make the
+            // natural follow-up (subscribe the handle just tested) skip
+            // enrichment and store bare title cards that the refresh-leg
+            // downgrade guard keeps from ever upgrading. So the enriched-set
+            // mutation is rolled back before the save; queryId / rest_id
+            // caches (pure accelerators) still persist.
+            let enriched_before = parser_state.enriched_articles.clone();
             let page =
                 parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
                     .await
                     .map_err(parsers::x::XError::into_app_error)?;
+            parser_state.enriched_articles = enriched_before;
             {
                 let conn = state.db.lock().await;
                 parser_state.save(&conn);

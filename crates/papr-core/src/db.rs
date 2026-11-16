@@ -1230,6 +1230,20 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     // same contract as the COALESCE on url/published_at below. The equality
     // check compares the effective body so an always-empty incoming body
     // does not read as a change on every refresh.
+    // Downgrade guard, X-article specific: a row whose stored card carries the
+    // full article body (`x-article-body`) must never be rewritten by an
+    // incoming card that only renders the bare title link — that is exactly
+    // what a cycle whose TweetDetail fetch failed produces. The stored body
+    // survives until a fetch succeeds again (then the incoming markup carries
+    // the body class and the normal diff path applies).
+    if content_html.as_deref().is_some_and(|h| h.contains("x-article-body"))
+        && !a
+            .content_html
+            .as_deref()
+            .is_some_and(|h| h.contains("x-article-body"))
+    {
+        return Ok(false);
+    }
     let effective_body = if a.body_text.is_empty() {
         body_text.clone()
     } else {
@@ -4177,6 +4191,75 @@ mod tests {
 
         // And the next refresh with the same article is a no-op again.
         assert!(!refresh_parser_article(&conn, feed_id, &upgraded).unwrap());
+    }
+
+    #[test]
+    fn refresh_parser_article_never_downgrades_a_stored_article_body() {
+        // A cycle whose X-article TweetDetail fetch failed re-renders the
+        // bare title card. Rewriting would replace the stored full body with
+        // that stub until a fetch succeeded again — the guard keeps the body.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let full = NewArticle {
+            guid: "902".into(),
+            url: Some("https://x.com/jack/status/902".into()),
+            title: "jack".into(),
+            author: None,
+            summary: Some("标题\n\n正文".into()),
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a class="x-article-title" href="https://x.com/jack/status/902">标题</a><div class="x-article-body"><p>正文</p></div></div></div>"#.into(),
+            ),
+            body_text: "标题\n\n正文".into(),
+            image_url: Some("https://pbs.twimg.com/media/cover.jpg".into()),
+            published_at: Some("2026-09-13T07:20:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &full, false, &[]).unwrap());
+
+        // The degraded card (title link only) is refused.
+        let degraded = NewArticle {
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a href="https://x.com/jack/status/902">标题</a></div></div>"#.into(),
+            ),
+            ..full.clone()
+        };
+        assert!(!refresh_parser_article(&conn, feed_id, &degraded).unwrap());
+        let stored: String = conn
+            .query_row(
+                "SELECT content_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, full.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("x-article-body"));
+
+        // A genuinely new render that carries the body still upgrades (the
+        // diff path applies, e.g. the article was edited on X).
+        let edited = NewArticle {
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a class="x-article-title" href="https://x.com/jack/status/902">标题</a><div class="x-article-body"><p>新正文</p></div></div></div>"#.into(),
+            ),
+            body_text: "标题\n\n新正文".into(),
+            ..full.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &edited).unwrap());
+        let stored: String = conn
+            .query_row(
+                "SELECT content_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, full.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("新正文"));
     }
 
     #[test]
