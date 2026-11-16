@@ -272,12 +272,6 @@ async fn add_x_feed(
             .map_err(parsers::x::XError::into_app_error)?;
 
     let conn = state.db.lock().await;
-    // Persist the caches next to the feed row. Not one atomic transaction —
-    // a cache write that commits before a failed insert is harmless for the
-    // queryId / rest_id accelerators, and the enriched-article marks match
-    // the page being ingested right below (the marks gate future
-    // re-enrichment, but the rows here already carry the full bodies).
-    parser_state.save(&conn);
     // 用户名 as both feed and article title, per the parser's contract. The
     // avatar doubles as the favicon (a favicon request to x.com would need
     // the same cookies anyway).
@@ -299,6 +293,14 @@ async fn add_x_feed(
         let article = parsers::x::tweet_to_article(tweet);
         db::upsert_article(&conn, feed_id, &article, dedup, &rules)?;
     }
+    // Persist the parser state only AFTER the feed and article rows landed.
+    // The enriched-article marks gate future re-enrichment — persisting them
+    // before the rows exist (an insert_feed failure mid-way, a deleted
+    // folder…) would leave ids marked with nothing stored, and the next
+    // subscribe would render bare title cards. queryId / rest_id caches are
+    // pure accelerators, but one save call after the rows keeps them all
+    // honest.
+    parser_state.save(&conn);
     // Count actual unread rows rather than tallying insertions — a filter
     // rule may pre-mark fetched tweets read, and the returned `unread_count`
     // must agree with the sidebar's `list_feeds` count (same reasoning as

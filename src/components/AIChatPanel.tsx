@@ -59,6 +59,11 @@ export default function AIChatPanel({
   const runRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Whether the thread should follow the newest message: tracked from the
+  // scroll events BEFORE the layout changes (the autoscroll effect below runs
+  // after the DOM already grew — deciding there would read the post-growth
+  // geometry and drop the follow the moment a delta adds enough height).
+  const stickToBottomRef = useRef(true);
 
   // Focus the composer when the pane opens (the closed pane keeps its
   // content, so the input follows the pane on reopen too).
@@ -66,16 +71,24 @@ export default function AIChatPanel({
     if (open) inputRef.current?.focus();
   }, [open]);
 
-  // Follow the newest message while it streams in — but only when the user
-  // is already at the bottom. Unconditional autoscroll would yank a reader
-  // scrolling up to re-check an earlier reply straight back down on every
-  // delta.
+  // Follow the newest message while it streams in — but only while the user
+  // hasn't scrolled up to re-read. Unconditional autoscroll would yank them
+  // straight back down on every delta; scrolling back to the bottom re-arms
+  // the follow.
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    if (nearBottom) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages, busy, failed]);
+
+  // Track the pre-update position from the user's own scrolls: near the
+  // bottom keeps the follow armed, scrolling up disarms it. (The autoscroll
+  // effect itself does not re-arm — it runs after layout grew.)
+  const onThreadScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
 
   const run = (
     history: ChatTurn[],
@@ -121,6 +134,8 @@ export default function AIChatPanel({
     const question = draft.trim();
     if (!question || busy) return;
     setDraft("");
+    // The user asked for this — follow the reply from its first token.
+    stickToBottomRef.current = true;
     // The prior turns (oldest first) ride along as context; the user's
     // question and an empty assistant reply land at once, the reply
     // accumulating deltas in place.
@@ -139,12 +154,22 @@ export default function AIChatPanel({
   const retry = () => {
     if (busy) return;
     // Resend the last user turn in place: everything before it is the
-    // history, its reply stub is patched as the new stream arrives.
+    // history, its reply stub is patched as the new stream arrives. The stub
+    // is emptied first — a failed request may have streamed a partial
+    // fragment before dying, and appending the new stream to it would splice
+    // the two answers together (and then send that concatenation as history).
     const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
     if (lastUserIdx < 0) return;
     const history: ChatTurn[] = messages
       .slice(0, lastUserIdx)
       .map((m) => ({ role: m.role, content: m.content }));
+    setMessages((m) => {
+      const next = [...m];
+      if (next.length > 0 && next[next.length - 1].role === "assistant") {
+        next[next.length - 1] = { role: "assistant", content: "" };
+      }
+      return next;
+    });
     run(history, messages[lastUserIdx].content);
   };
 
@@ -203,7 +228,13 @@ export default function AIChatPanel({
           <Icon name="x" size={14} />
         </button>
       </div>
-      <div className="ai-chat-thread" ref={scrollRef} aria-live="polite" aria-busy={busy}>
+      <div
+        className="ai-chat-thread"
+        ref={scrollRef}
+        onScroll={onThreadScroll}
+        aria-live="polite"
+        aria-busy={busy}
+      >
         {empty && (
           <div className="ai-chat-empty">
             <Icon name="chat" size={22} />

@@ -141,6 +141,48 @@ describe("AIChatPanel", () => {
     await waitFor(() => expect(container.textContent).toContain("现在好了"));
   });
 
+  it("clears a partial reply before retrying, so the new answer stands alone", async () => {
+    // First request streams a fragment, then dies mid-answer. The retry must
+    // NOT append the new stream to the fragment — that would splice two
+    // answers together, and the next question would send the concatenation
+    // as history.
+    h.aiArticleChat.mockImplementation(
+      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+        onToken({ type: "delta", data: "旧片段" });
+        onToken({ type: "error", data: "stream died" });
+        return Promise.resolve();
+      },
+    );
+    const { container } = renderPanel();
+    await ask("这个概念怎么理解？", container);
+    await waitFor(() => expect(container.textContent).toContain("旧片段"));
+    expect(container.querySelector(".ai-chat-failed")).not.toBeNull();
+
+    h.aiArticleChat.mockImplementation(
+      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+        onToken({ type: "delta", data: "完整新回答" });
+        onToken({ type: "done" });
+        return Promise.resolve();
+      },
+    );
+    const retry = container.querySelector(".ai-chat-failed .empty-retry") as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.click(retry);
+    });
+    await waitFor(() => expect(h.aiArticleChat).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(container.textContent).toContain("完整新回答"));
+    // The fragment is gone: the bubble shows ONLY the new answer.
+    expect(container.textContent).not.toContain("旧片段");
+    // And the next question must not send the concatenation as history.
+    h.aiArticleChat.mockImplementation(() => Promise.resolve());
+    await ask("下一问", container);
+    const [, history] = h.aiArticleChat.mock.calls[h.aiArticleChat.mock.calls.length - 1];
+    expect(history).toEqual([
+      { role: "user", content: "这个概念怎么理解？" },
+      { role: "assistant", content: "完整新回答" },
+    ]);
+  });
+
   it("parks the conversation off-screen while closed, inert", () => {
     const { container } = renderPanel(false);
     const pane = container.querySelector(".ai-chat") as HTMLElement;

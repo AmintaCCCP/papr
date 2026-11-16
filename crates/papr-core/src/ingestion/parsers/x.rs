@@ -32,7 +32,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use std::time::Duration;
 use url::Url;
@@ -328,33 +328,51 @@ pub struct QueryIds {
     pub tweet_detail: Option<String>,
 }
 
+/// Per followed handle: which article tweets already carry their full body,
+/// and where the next enrichment pass starts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HandleEnrichment {
+    /// Tweet ids whose timeline card was upgraded with the full article body
+    /// (`TweetDetail`).
+    pub done: BTreeSet<String>,
+    /// The rotation offset for the next enrichment pass. Persistently failing
+    /// article tweets stay candidates forever (transport failures are never
+    /// marked); without rotation they would consume the per-page budget every
+    /// cycle and starve the articles behind them. The offset walks forward by
+    /// the number of candidates examined each pass, so the tail gets its turn.
+    pub next_start: u32,
+}
+
 /// Parser runtime state persisted across refreshes under `parser.x.state`:
 /// queryIds (rotated per x.com release), the handle → rest_id map (the
 /// UserByScreenName round-trip is one request per new subscription only),
-/// and the per-handle sets of article tweet ids whose full body was already
-/// fetched (one TweetDetail round-trip per article, once).
+/// and the per-handle article enrichment state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct XState {
     pub query_ids: QueryIds,
     pub user_ids: BTreeMap<String, String>,
     /// Per followed handle: tweet ids whose timeline card was upgraded with
-    /// the full article body (`TweetDetail`). Scoped per handle because one
-    /// `XState` is shared across every X feed in a refresh run — a flat set
-    /// pruned to "the current page" would have each feed's fetch erase the
-    /// other feeds' marks. Each handle's set is pruned to the ids of its own
-    /// current timeline page on each fetch, so the blob stays tiny. A state
-    /// blob from the flat-set shape fails to deserialize and degrades to a
-    /// fresh state (the marks are accelerators; the stored bodies survive in
-    /// the article rows).
-    pub enriched_articles: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// the full article body (`TweetDetail`), plus the rotation offset.
+    /// Scoped per handle because one `XState` is shared across every X feed
+    /// in a refresh run — a flat set pruned to "the current page" would have
+    /// each feed's fetch erase the other feeds' marks. Each handle's entry is
+    /// pruned to the ids of its own current timeline page on each fetch, so
+    /// the blob stays tiny. A state blob from an older shape fails to
+    /// deserialize and degrades to a fresh state (the marks are accelerators;
+    /// the stored bodies survive in the article rows).
+    pub enriched_articles: BTreeMap<String, HandleEnrichment>,
 }
 
 impl XState {
     /// The set of article tweet ids already enriched for `handle` (empty when
     /// the handle has none yet).
-    pub fn enriched_for(&self, handle: &str) -> std::collections::BTreeSet<String> {
-        self.enriched_articles.get(handle).cloned().unwrap_or_default()
+    pub fn enriched_for(&self, handle: &str) -> BTreeSet<String> {
+        self.enriched_articles
+            .get(handle)
+            .map(|e| e.done.clone())
+            .unwrap_or_default()
     }
 
     /// Mark `tweet_id` as enriched for `handle`.
@@ -362,6 +380,7 @@ impl XState {
         self.enriched_articles
             .entry(handle.to_string())
             .or_default()
+            .done
             .insert(tweet_id.to_string());
     }
 
@@ -369,12 +388,33 @@ impl XState {
     /// the page never re-renders (the refresh leg only rewrites rows it just
     /// re-fetched), so keeping its id would only grow the blob.
     pub fn prune_enriched_to_page(&mut self, handle: &str, page_ids: &[&str]) {
-        if let Some(set) = self.enriched_articles.get_mut(handle) {
-            set.retain(|id| page_ids.contains(&id.as_str()));
-            if set.is_empty() {
+        if let Some(entry) = self.enriched_articles.get_mut(handle) {
+            entry.done.retain(|id| page_ids.contains(&id.as_str()));
+            if entry.done.is_empty() {
+                // Nothing left to remember — the rotation offset is
+                // meaningless without candidates to order.
                 self.enriched_articles.remove(handle);
             }
         }
+    }
+
+    /// The rotation offset the next enrichment pass starts at; the caller
+    /// wraps it into the candidate list length.
+    pub fn next_enrich_start(&self, handle: &str) -> u32 {
+        self.enriched_articles
+            .get(handle)
+            .map(|e| e.next_start)
+            .unwrap_or(0)
+    }
+
+    /// Advance the rotation offset by the number of candidates examined this
+    /// pass.
+    pub fn advance_enrich_start(&mut self, handle: &str, examined: u32) {
+        let current = self.enriched_articles.get(handle).map(|e| e.next_start);
+        self.enriched_articles
+            .entry(handle.to_string())
+            .or_default()
+            .next_start = current.unwrap_or(0).saturating_add(examined);
     }
 }
 
@@ -1683,7 +1723,13 @@ fn render_block_text(text: &str, ranges: Vec<(usize, usize, BlockRange)>, plain:
         .filter(|(s, e, _)| e > s)
         .collect();
     if ranges.is_empty() {
-        return escape_html_text(text);
+        // The plain form is a summary/full-text payload — raw characters, no
+        // HTML entities (`A & B` must not become `A &amp; B` there).
+        return if plain {
+            text.to_string()
+        } else {
+            escape_html_text(text)
+        };
     }
     ranges.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
 
@@ -1727,7 +1773,9 @@ fn render_block_text(text: &str, ranges: Vec<(usize, usize, BlockRange)>, plain:
                                 .iter()
                                 .any(|(_, _, k)| matches!(k, BlockRange::Link(_)));
                             if !covered {
-                                out.push_str(&escape_html_text(segment));
+                                // Plain text keeps its raw characters — the
+                                // HTML branch below is where escaping lives.
+                                out.push_str(segment);
                             }
                         }
                     }
@@ -1951,8 +1999,17 @@ fn render_content_state(article: &serde_json::Value) -> Option<(String, String)>
 }
 
 /// Parse a `TweetDetail` response and extract the article body of `tweet_id`.
-/// `Ok(None)` when the tweet resolved but carries no article (a false-positive
-/// flag, a deleted article…) — the caller keeps the timeline card.
+///
+/// Three outcomes, which the enrichment pass treats differently:
+/// - `Ok(Some(..))` — the article parsed in full.
+/// - `Ok(None)` — the tweet resolved and carries **no** article object (a
+///   false-positive flag, a deleted article…) — confirmed nothing to fetch;
+///   the caller marks it settled and keeps the timeline card.
+/// - `Err(..)` — the tweet looks like an article but the body did not arrive:
+///   no focal tweet in the response, or an article object without a usable
+///   content state. These are *retryable* — marking them settled would pin a
+///   body-less card forever — so the caller leaves them unmarked for the next
+///   cycle.
 pub fn parse_tweet_detail_json(body: &str, tweet_id: &str) -> XResult<Option<XArticleBody>> {
     let data: serde_json::Value =
         serde_json::from_str(body).map_err(|e| XError::Parse(e.to_string()))?;
@@ -1984,9 +2041,15 @@ pub fn parse_tweet_detail_json(body: &str, tweet_id: &str) -> XResult<Option<XAr
             }
         }
     }
+    // No focal tweet is an anomaly (the response should center on it), not
+    // evidence that there is no article — retryable.
     let Some(tweet_obj) = focal else {
-        return Ok(None);
+        return Err(XError::Parse(format!(
+            "TweetDetail: focal tweet {tweet_id} missing"
+        )));
     };
+    // No article object at all: the flag was wrong or the article was
+    // deleted — confirmed, settled.
     let Some(article) = tweet_obj.pointer("/article/article_results/result") else {
         return Ok(None);
     };
@@ -1997,8 +2060,13 @@ pub fn parse_tweet_detail_json(body: &str, tweet_id: &str) -> XResult<Option<XAr
         .filter(|s| !s.is_empty())
         .unwrap_or_default()
         .to_string();
+    // An article object without a usable content state: the body may arrive
+    // on a later fetch (a truncated/tiered response, a transient shape) —
+    // retryable, never "settled without a body".
     let Some((html, text)) = render_content_state(article) else {
-        return Ok(None);
+        return Err(XError::Parse(format!(
+            "article {tweet_id}: content state missing"
+        )));
     };
     let (cover_image_url, cover_video_url) = article_cover_urls(article);
     let first_body_image = first_article_image(article);
@@ -2401,7 +2469,24 @@ async fn enrich_article_tweets(
         .map(|(i, _)| i)
         .collect();
 
-    for (fetched, index) in candidates.into_iter().enumerate() {
+    // Rotate the pass start: the first `start` candidates were examined last
+    // pass (their failures re-queued at the front every cycle would starve
+    // the tail). Walking from the persisted offset gives the articles behind
+    // the failures their turn while the per-page cap still bounds the pass.
+    let start = if candidates.is_empty() {
+        0
+    } else {
+        (state.next_enrich_start(handle) as usize) % candidates.len()
+    };
+    let rotated: Vec<usize> = candidates[start..]
+        .iter()
+        .chain(candidates[..start].iter())
+        .copied()
+        .collect();
+    // Candidates examined this pass (the cap bounds it) drive the offset.
+    let examined = rotated.len().min(ARTICLE_DETAILS_PER_PAGE) as u32;
+
+    for (fetched, index) in rotated.into_iter().enumerate() {
         if fetched >= ARTICLE_DETAILS_PER_PAGE {
             break;
         }
@@ -2413,6 +2498,7 @@ async fn enrich_article_tweets(
             state.mark_enriched(handle, &tweet.id);
         }
     }
+    state.advance_enrich_start(handle, examined);
 }
 
 /// One `TweetDetail` round-trip for one article tweet. `true` when the tweet
@@ -3561,11 +3647,9 @@ mod tests {
         })
         .to_string();
         assert_eq!(parse_tweet_detail_json(&body, "1001").unwrap(), None);
-        // A foreign focal tweet id also resolves to None.
-        assert_eq!(
-            parse_tweet_detail_json(&tweet_detail_fixture(), "9999").unwrap(),
-            None
-        );
+        // A foreign focal tweet id is an anomaly — retryable, NOT "no article
+        // here" (settling it would pin a body-less card forever).
+        assert!(parse_tweet_detail_json(&tweet_detail_fixture(), "9999").is_err());
     }
 
     #[test]

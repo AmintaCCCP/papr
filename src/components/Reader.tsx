@@ -1195,7 +1195,14 @@ export default function Reader({ onToast }: Props) {
             title={t("reader.tbWebView")}
             aria-label={t("reader.tbWebView")}
             aria-pressed={readerView === "web"}
-            onClick={() => setReaderView(readerView === "web" ? "reader" : "web")}
+            onClick={() => {
+              const next = readerView === "web" ? "reader" : "web";
+              // Mirror the chat→web direction below: entering the original
+              // page view closes the chat pane, so the native child webview
+              // never overlaps a still-open conversation.
+              if (next === "web") setAiChatOpen(false);
+              setReaderView(next);
+            }}
           >
             <Icon name="eye" size={16} />
           </button>
