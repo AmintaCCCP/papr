@@ -386,13 +386,22 @@ impl XState {
 
     /// Prune `handle`'s enriched set down to `page_ids`: a tweet no longer on
     /// the page never re-renders (the refresh leg only rewrites rows it just
-    /// re-fetched), so keeping its id would only grow the blob.
-    pub fn prune_enriched_to_page(&mut self, handle: &str, page_ids: &[&str]) {
+    /// re-fetched), so keeping its id would only grow the blob. The rotation
+    /// offset survives while the page still carries pending article
+    /// candidates (`pending_candidates`) — dropping the entry together with
+    /// the offset would reset the rotation and re-starve the articles behind
+    /// persistently failing ones.
+    pub fn prune_enriched_to_page(
+        &mut self,
+        handle: &str,
+        page_ids: &[&str],
+        pending_candidates: bool,
+    ) {
         if let Some(entry) = self.enriched_articles.get_mut(handle) {
             entry.done.retain(|id| page_ids.contains(&id.as_str()));
-            if entry.done.is_empty() {
-                // Nothing left to remember — the rotation offset is
-                // meaningless without candidates to order.
+            if entry.done.is_empty() && !pending_candidates {
+                // Nothing left to remember — no article candidates on the
+                // page means no rotation to preserve.
                 self.enriched_articles.remove(handle);
             }
         }
@@ -1850,13 +1859,11 @@ fn content_entity_map(content_state: &serde_json::Value) -> BTreeMap<usize, &ser
                 .filter_map(|e| {
                     // X ships the key as a string; tolerate a bare number in
                     // case a payload drift puts it there.
-                    let key = e
-                        .get("key")
-                        .and_then(|k| {
-                            k.as_str().and_then(|s| s.parse().ok()).or_else(|| {
-                                k.as_u64().map(|n| n.min(u64::from(u32::MAX)) as usize)
-                            })
-                        })?;
+                    let key = e.get("key").and_then(|k| {
+                        k.as_str()
+                            .and_then(|s| s.parse().ok())
+                            .or_else(|| k.as_u64().map(|n| n.min(u64::from(u32::MAX)) as usize))
+                    })?;
                     Some((key, e.get("value")?))
                 })
                 .collect()
@@ -1881,7 +1888,11 @@ fn atomic_block_html(
     };
     // A missing or negative key is malformed — render nothing rather than
     // clamp onto entity 0.
-    let Some(key) = range.get("key").and_then(|k| k.as_i64()).filter(|k| *k >= 0) else {
+    let Some(key) = range
+        .get("key")
+        .and_then(|k| k.as_i64())
+        .filter(|k| *k >= 0)
+    else {
         return String::new();
     };
     let Some(value) = entity_map.get(&(key as usize)) else {
@@ -2450,6 +2461,42 @@ pub async fn fetch_user_tweets(
 /// article here" — are marked enriched so a periodic refresh never
 /// re-round-trips them; transport failures are not marked, so the next cycle
 /// retries.
+/// Pick this pass's article candidates for `handle` in rotation order, and
+/// report how many the pass will examine. Pure — the network pass consumes
+/// the selection and, whether or not the fetches succeed, advances the
+/// persisted offset by `examined` (failures are never marked, so the rotation
+/// is what keeps the articles behind persistent failures reachable).
+/// Returns an empty selection when there is nothing pending.
+fn select_enrichment_candidates(
+    state: &XState,
+    handle: &str,
+    tweets: &[XTweet],
+) -> (Vec<usize>, u32) {
+    let enriched = state.enriched_for(handle);
+    let candidates: Vec<usize> = tweets
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_article && !enriched.contains(&t.id))
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        return (Vec::new(), 0);
+    }
+    // Rotate the pass start: the first `start` candidates were examined last
+    // pass (their failures re-queued at the front every cycle would starve
+    // the tail). Walking from the persisted offset gives the articles behind
+    // the failures their turn while the per-page cap still bounds the pass.
+    let start = (state.next_enrich_start(handle) as usize) % candidates.len();
+    let mut rotated: Vec<usize> = candidates[start..]
+        .iter()
+        .chain(candidates[..start].iter())
+        .copied()
+        .collect();
+    rotated.truncate(ARTICLE_DETAILS_PER_PAGE);
+    let examined = rotated.len() as u32;
+    (rotated, examined)
+}
+
 async fn enrich_article_tweets(
     client: &Client,
     auth_token: &str,
@@ -2458,33 +2505,19 @@ async fn enrich_article_tweets(
     tweets: &mut [XTweet],
     state: &mut XState,
 ) {
+    // Pending candidates decide whether the rotation offset survives the
+    // prune: with article candidates still on the page (this pass's selection
+    // is computed below), the offset must outlive an all-failing pass.
     let page_ids: Vec<&str> = tweets.iter().map(|t| t.id.as_str()).collect();
-    state.prune_enriched_to_page(handle, &page_ids);
-    let enriched = state.enriched_for(handle);
-
-    let candidates: Vec<usize> = tweets
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.is_article && !enriched.contains(&t.id))
-        .map(|(i, _)| i)
-        .collect();
-
-    // Rotate the pass start: the first `start` candidates were examined last
-    // pass (their failures re-queued at the front every cycle would starve
-    // the tail). Walking from the persisted offset gives the articles behind
-    // the failures their turn while the per-page cap still bounds the pass.
-    let start = if candidates.is_empty() {
-        0
-    } else {
-        (state.next_enrich_start(handle) as usize) % candidates.len()
+    let pending_before_prune = {
+        let done_before = state.enriched_for(handle);
+        tweets
+            .iter()
+            .any(|t| t.is_article && !done_before.contains(&t.id))
     };
-    let rotated: Vec<usize> = candidates[start..]
-        .iter()
-        .chain(candidates[..start].iter())
-        .copied()
-        .collect();
-    // Candidates examined this pass (the cap bounds it) drive the offset.
-    let examined = rotated.len().min(ARTICLE_DETAILS_PER_PAGE) as u32;
+    state.prune_enriched_to_page(handle, &page_ids, pending_before_prune);
+
+    let (rotated, examined) = select_enrichment_candidates(state, handle, tweets);
 
     for (fetched, index) in rotated.into_iter().enumerate() {
         if fetched >= ARTICLE_DETAILS_PER_PAGE {
@@ -3370,6 +3403,66 @@ mod tests {
         assert_eq!(best_video_variant(&serde_json::json!([])), None);
     }
 
+    /// Minimal article-flagged tweet for the selection tests.
+    fn article_tweet(id: &str) -> XTweet {
+        XTweet {
+            id: id.to_string(),
+            handle: "jack".into(),
+            author_name: None,
+            content_html: String::new(),
+            text: String::new(),
+            url: format!("https://x.com/jack/status/{id}"),
+            published_at: None,
+            image_url: None,
+            video_url: None,
+            retweeted: None,
+            quoted: None,
+            is_article: true,
+        }
+    }
+
+    #[test]
+    fn enrichment_rotation_reaches_the_tail_across_passes() {
+        // Nine article tweets, cap of eight: pass 1 examines 0..8 and every
+        // fetch fails (nothing marked). The offset still advances by the
+        // examined count, so pass 2 leads with the ninth article — the
+        // persistent failures must not starve it.
+        let mut state = XState::default();
+        let tweets: Vec<XTweet> = (0..9).map(|i| article_tweet(&i.to_string())).collect();
+        let page_ids: Vec<&str> = tweets.iter().map(|t| t.id.as_str()).collect();
+
+        // Pass 1: nothing marked, offset advances past the examined window.
+        let (rotated, examined) = select_enrichment_candidates(&state, "jack", &tweets);
+        assert_eq!(rotated, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(examined, 8);
+        state.advance_enrich_start("jack", examined);
+        // The all-failing pass left the set empty, but pending candidates
+        // keep the entry — and with it the rotation offset — alive.
+        state.prune_enriched_to_page("jack", &page_ids, true);
+        assert_eq!(state.next_enrich_start("jack"), 8);
+
+        // Pass 2: the ninth article is first in line, then the failed eight.
+        let (rotated, examined) = select_enrichment_candidates(&state, "jack", &tweets);
+        assert_eq!(rotated[0], 8);
+        assert_eq!(rotated[1..], [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(examined, 8);
+
+        // A pass under the cap advances by what it examined.
+        let mut state = XState::default();
+        let tweets: Vec<XTweet> = (0..3).map(|i| article_tweet(&i.to_string())).collect();
+        let (rotated, examined) = select_enrichment_candidates(&state, "jack", &tweets);
+        assert_eq!(rotated, vec![0, 1, 2]);
+        assert_eq!(examined, 3);
+        state.advance_enrich_start("jack", examined);
+        // All settled: the selection is empty.
+        for t in &tweets {
+            state.mark_enriched("jack", &t.id);
+        }
+        let (rotated, examined) = select_enrichment_candidates(&state, "jack", &tweets);
+        assert!(rotated.is_empty());
+        assert_eq!(examined, 0);
+    }
+
     #[test]
     fn state_round_trips_through_the_settings_table() {
         let conn = crate::db::test_conn();
@@ -3397,23 +3490,46 @@ mod tests {
         state.mark_enriched("dick", "903");
 
         // One handle's set is untouched by the other's presence…
-        assert_eq!(state.enriched_for("jack"), std::collections::BTreeSet::from(["902".to_string()]));
-        assert_eq!(state.enriched_for("dick"), std::collections::BTreeSet::from(["903".to_string()]));
+        assert_eq!(
+            state.enriched_for("jack"),
+            std::collections::BTreeSet::from(["902".to_string()])
+        );
+        assert_eq!(
+            state.enriched_for("dick"),
+            std::collections::BTreeSet::from(["903".to_string()])
+        );
         // …and an unknown handle has none.
         assert!(state.enriched_for("nope").is_empty());
 
         // Pruning one handle's set down to its current page leaves the other
         // handle's marks alone — a flat set pruned per fetch would have each
         // feed erase the others' marks.
-        state.prune_enriched_to_page("jack", &["902"]);
-        state.prune_enriched_to_page("dick", &[]);
-        assert_eq!(state.enriched_for("jack"), std::collections::BTreeSet::from(["902".to_string()]));
+        state.prune_enriched_to_page("jack", &["902"], false);
+        state.prune_enriched_to_page("dick", &[], false);
+        assert_eq!(
+            state.enriched_for("jack"),
+            std::collections::BTreeSet::from(["902".to_string()])
+        );
         assert!(state.enriched_for("dick").is_empty());
-        // The emptied entry disappears from the blob.
+        // The emptied entry disappears from the blob (no pending candidates).
         assert!(state.enriched_articles.get("dick").is_none());
         // Pruning an unknown handle is a no-op.
-        state.prune_enriched_to_page("nope", &["x"]);
+        state.prune_enriched_to_page("nope", &["x"], false);
         assert!(state.enriched_for("nope").is_empty());
+
+        // With pending candidates on the page, an emptied set survives WITH
+        // its rotation offset — dropping it would reset the rotation and
+        // re-starve the articles behind persistently failing fetches.
+        let mut state = XState::default();
+        state.mark_enriched("jack", "gone");
+        state.advance_enrich_start("jack", 8);
+        assert_eq!(state.next_enrich_start("jack"), 8);
+        state.prune_enriched_to_page("jack", &["902"], true);
+        assert!(state.enriched_for("jack").is_empty());
+        assert_eq!(state.next_enrich_start("jack"), 8);
+        // Without pending candidates the entry is dropped together with it.
+        state.prune_enriched_to_page("jack", &["902"], false);
+        assert_eq!(state.next_enrich_start("jack"), 0);
     }
 
     #[test]

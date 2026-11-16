@@ -12,8 +12,8 @@ use crate::ingestion::rsshub;
 use crate::ingestion::sources::{self, Normalized};
 use crate::ingestion::{fetch, parse};
 
-use crate::models::*;
 use crate::folo;
+use crate::models::*;
 use crate::opml;
 use crate::sanitize;
 use crate::scheduler;
@@ -22,7 +22,7 @@ use crate::translate;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, ipc::Channel};
 use tauri_plugin_dialog::DialogExt;
 use url::Url;
 
@@ -272,11 +272,20 @@ async fn add_x_feed(
             .map_err(parsers::x::XError::into_app_error)?;
 
     let conn = state.db.lock().await;
+    // The whole ingest is one transaction: the feed row, the article rows and
+    // the parser state (with its enriched-article marks) land together or not
+    // at all. An article-row failure mid-way with only the feed row committed
+    // would leave a half-subscribed feed — re-subscribing it hits
+    // `alreadySubscribed` with zero articles. The state rides in the same
+    // transaction so the marks can never outlive the rows they were made
+    // for; queryId / rest_id caches are pure accelerators but cost nothing to
+    // keep honest here.
+    let tx = conn.unchecked_transaction()?;
     // 用户名 as both feed and article title, per the parser's contract. The
     // avatar doubles as the favicon (a favicon request to x.com would need
     // the same cookies anyway).
     let feed_id = db::insert_feed(
-        &conn,
+        &tx,
         feed_url,
         Some(feed_url),
         &handle,
@@ -285,22 +294,16 @@ async fn add_x_feed(
         folder_id,
     )?;
     if let Some(avatar) = &page.profile.avatar {
-        db::update_feed_meta(&conn, feed_id, None, None, None, Some(avatar))?;
+        db::update_feed_meta(&tx, feed_id, None, None, None, Some(avatar))?;
     }
-    let dedup = db::setting_flag(&conn, "dedup_enabled", false);
-    let rules = db::active_rules(&conn).unwrap_or_default();
+    let dedup = db::setting_flag(&tx, "dedup_enabled", false);
+    let rules = db::active_rules(&tx).unwrap_or_default();
     for tweet in &page.tweets {
         let article = parsers::x::tweet_to_article(tweet);
-        db::upsert_article(&conn, feed_id, &article, dedup, &rules)?;
+        db::upsert_article(&tx, feed_id, &article, dedup, &rules)?;
     }
-    // Persist the parser state only AFTER the feed and article rows landed.
-    // The enriched-article marks gate future re-enrichment — persisting them
-    // before the rows exist (an insert_feed failure mid-way, a deleted
-    // folder…) would leave ids marked with nothing stored, and the next
-    // subscribe would render bare title cards. queryId / rest_id caches are
-    // pure accelerators, but one save call after the rows keeps them all
-    // honest.
-    parser_state.save(&conn);
+    parser_state.save(&tx);
+    tx.commit()?;
     // Count actual unread rows rather than tallying insertions — a filter
     // rule may pre-mark fetched tweets read, and the returned `unread_count`
     // must agree with the sidebar's `list_feeds` count (same reasoning as
@@ -348,22 +351,19 @@ async fn resolve_kuaishou_short_url(
     state: &State<'_, AppState>,
     short_url: &str,
 ) -> AppResult<String> {
-    let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+    let client = {
+        let conn = state.read().await;
+        fetch::build_parser_client(&conn)
+    };
     let mut url = short_url.to_string();
     for _ in 0..3 {
         // The next hop must be a kuaishou.com URL before anything is sent.
         let next = Url::parse(&url)?;
-        if !crate::ingestion::parsers::transport::is_host_or_subdomain(
-            &next,
-            "kuaishou.com",
-        ) {
+        if !crate::ingestion::parsers::transport::is_host_or_subdomain(&next, "kuaishou.com") {
             return Err(AppError::code("kuaishouHandleInvalid"));
         }
         let resp = client.get(next).send().await?;
-        if !crate::ingestion::parsers::transport::is_host_or_subdomain(
-            resp.url(),
-            "kuaishou.com",
-        ) {
+        if !crate::ingestion::parsers::transport::is_host_or_subdomain(resp.url(), "kuaishou.com") {
             return Err(AppError::code("kuaishouHandleInvalid"));
         }
         if !resp.status().is_redirection() {
@@ -413,7 +413,10 @@ async fn add_xiaohongshu_feed(
     let profile_id = parsers::xiaohongshu::profile_id_from_feed_url(feed_url)
         .ok_or_else(|| AppError::code(parsers::xiaohongshu::CODE_HANDLE_INVALID))?;
 
-    let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+    let client = {
+        let conn = state.read().await;
+        fetch::build_parser_client(&conn)
+    };
     let page = parsers::xiaohongshu::fetch_user_notes(&client, &profile_id, cookie.as_deref())
         .await
         .map_err(parsers::xiaohongshu::XhsError::into_app_error)?;
@@ -541,7 +544,10 @@ async fn add_kuaishou_feed(
     let user_id = parsers::kuaishou::profile_id_from_feed_url(feed_url)
         .ok_or_else(|| AppError::code(parsers::kuaishou::CODE_HANDLE_INVALID))?;
 
-    let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+    let client = {
+        let conn = state.read().await;
+        fetch::build_parser_client(&conn)
+    };
     let page = parsers::kuaishou::fetch_creator_page(&client, &user_id, cookie.as_deref())
         .await
         .map_err(parsers::kuaishou::KsError::into_app_error)?;
@@ -963,10 +969,15 @@ pub async fn test_parser(
             // mutation is rolled back before the save; queryId / rest_id
             // caches (pure accelerators) still persist.
             let enriched_before = parser_state.enriched_articles.clone();
-            let page =
-                parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
-                    .await
-                    .map_err(parsers::x::XError::into_app_error)?;
+            let page = parsers::x::fetch_user_tweets(
+                &client,
+                &auth_token,
+                &ct0,
+                &handle,
+                &mut parser_state,
+            )
+            .await
+            .map_err(parsers::x::XError::into_app_error)?;
             parser_state.enriched_articles = enriched_before;
             {
                 let conn = state.db.lock().await;
@@ -983,10 +994,14 @@ pub async fn test_parser(
                 let conn = state.read().await;
                 parsers::cookie_credentials(&conn, parsers::XIAOHONGSHU)
             };
-            let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
-            let page = parsers::xiaohongshu::fetch_user_notes(&client, &profile_id, cookie.as_deref())
-                .await
-                .map_err(parsers::xiaohongshu::XhsError::into_app_error)?;
+            let client = {
+                let conn = state.read().await;
+                fetch::build_parser_client(&conn)
+            };
+            let page =
+                parsers::xiaohongshu::fetch_user_notes(&client, &profile_id, cookie.as_deref())
+                    .await
+                    .map_err(parsers::xiaohongshu::XhsError::into_app_error)?;
             Ok(ParserTestResult {
                 article_count: page.notes.len(),
             })
@@ -998,7 +1013,10 @@ pub async fn test_parser(
                 let conn = state.read().await;
                 parsers::cookie_credentials(&conn, parsers::KUAISHOU)
             };
-            let client = { let conn = state.read().await; fetch::build_parser_client(&conn) };
+            let client = {
+                let conn = state.read().await;
+                fetch::build_parser_client(&conn)
+            };
             let page = parsers::kuaishou::fetch_creator_page(&client, &user_id, cookie.as_deref())
                 .await
                 .map_err(parsers::kuaishou::KsError::into_app_error)?;
@@ -1198,8 +1216,8 @@ pub async fn edit_feed_url(state: State<'_, AppState>, id: i64, url: String) -> 
         // write lock against the one this command saw when it started, and
         // refuse to let a stale edit overwrite a newer one. Same lock held
         // through the transaction below, so nothing can slip in between.
-        let now_url = db::feed_url_by_id(&conn, id)?
-            .ok_or_else(|| AppError::code("noFeedFound"))?;
+        let now_url =
+            db::feed_url_by_id(&conn, id)?.ok_or_else(|| AppError::code("noFeedFound"))?;
         if now_url != current.feed_url {
             return Err(AppError::code("feedUrlChanged"));
         }
@@ -1871,8 +1889,7 @@ pub async fn configure_ai_provider(
 /// The built-in article-summary system prompt. Settings shows it as the
 /// prompt editor's placeholder; `ai_summarize` uses it whenever the user
 /// hasn't saved a custom `ai_summary_prompt`.
-pub(crate) const DEFAULT_SUMMARY_PROMPT: &str =
-    "You are a sharp news editor. Summarize the article so a reader can \
+pub(crate) const DEFAULT_SUMMARY_PROMPT: &str = "You are a sharp news editor. Summarize the article so a reader can \
      decide whether to read it in full.\n\n\
      Format the response in markdown using exactly this shape:\n\
      **TL;DR** — One sentence capturing the single most important point.\n\n\
@@ -2168,10 +2185,17 @@ pub async fn ai_article_chat(
     };
     let mut user = String::new();
     for turn in recent_turns {
-        let speaker = if turn.role == "assistant" { "Assistant" } else { "User" };
+        let speaker = if turn.role == "assistant" {
+            "Assistant"
+        } else {
+            "User"
+        };
         user.push_str(&format!("{speaker}: {}\n\n", truncate(&turn.content, 2000)));
     }
-    user.push_str(&format!("User: {}", truncate(&question, CHAT_QUESTION_BUDGET)));
+    user.push_str(&format!(
+        "User: {}",
+        truncate(&question, CHAT_QUESTION_BUDGET)
+    ));
 
     let http = state.http();
     stream_to_channel(&http, &cfg, &system, &user, &on_token, ai::CHAT_MAX_TOKENS).await?;
@@ -2400,7 +2424,12 @@ pub async fn ai_translate(
         } else {
             lang
         };
-        (source, detail.title, build_translate_selection(&conn, &engine)?, target)
+        (
+            source,
+            detail.title,
+            build_translate_selection(&conn, &engine)?,
+            target,
+        )
     };
     if source_html.trim().is_empty() {
         return Err(AppError::code("noArticleBody"));
@@ -2459,7 +2488,9 @@ pub async fn ai_translate(
         }
     };
     if let Some(title) = &translated_title {
-        let _ = on_event.send(TranslateEvent::Title { title: title.clone() });
+        let _ = on_event.send(TranslateEvent::Title {
+            title: title.clone(),
+        });
     }
     let mut full = String::new();
     // Translated tweet bodies, in document order, for the splice below.

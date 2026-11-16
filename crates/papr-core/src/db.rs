@@ -5,8 +5,8 @@ use crate::error::{AppError, AppResult};
 use crate::ingestion::rsshub;
 use crate::models::*;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
-use rusqlite_migration::{Migrations, M};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite_migration::{M, Migrations};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1275,8 +1275,8 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     // summarized must not come back with the fresh full text next to a
     // translation/summary of the old card. URL-only backfills and extraction
     // clears keep the caches (the visible text did not change).
-    let body_changed = content_html.as_deref() != a.content_html.as_deref()
-        || body_text != effective_body;
+    let body_changed =
+        content_html.as_deref() != a.content_html.as_deref() || body_text != effective_body;
 
     let tx = conn.unchecked_transaction()?;
     // `url` follows when the incoming article carries one: an anonymous card
@@ -3816,10 +3816,12 @@ mod tests {
         let global = 30;
 
         // Never fetched → always due, whatever the interval.
-        assert!(feeds_due_for_refresh(&conn, global)
-            .unwrap()
-            .iter()
-            .any(|(id, ..)| *id == feed_id));
+        assert!(
+            feeds_due_for_refresh(&conn, global)
+                .unwrap()
+                .iter()
+                .any(|(id, ..)| *id == feed_id)
+        );
 
         // Just fetched → not due under the 30-minute global interval.
         set_feed_fetch_state(&conn, feed_id, None, None, None).unwrap();
@@ -4199,7 +4201,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_deref(),
-            Some("https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token=ABz9token=")
+            Some(
+                "https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token=ABz9token="
+            )
         );
         // The body was genuinely untouched.
         assert_eq!(
@@ -4871,9 +4875,11 @@ mod tests {
         let (conn, _aid) = test_db();
         // An all-stopword / punctuation-only question must not error and must
         // return nothing (the match-nothing `""` expression).
-        assert!(search_articles_for_rag(&conn, "??? !!!", 6)
-            .unwrap()
-            .is_empty());
+        assert!(
+            search_articles_for_rag(&conn, "??? !!!", 6)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5561,14 +5567,16 @@ mod tests {
         create_rule(&conn, "combo", None, &conditions, "skip", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
         // AND-group hit: rust + Bob → skipped.
-        assert!(!upsert_article(
-            &conn,
-            feed_id,
-            &mk("c4", "rust news", Some("Bob")),
-            false,
-            &rules
-        )
-        .unwrap());
+        assert!(
+            !upsert_article(
+                &conn,
+                feed_id,
+                &mk("c4", "rust news", Some("Bob")),
+                false,
+                &rules
+            )
+            .unwrap()
+        );
         // OR-group hit: spam alone → skipped.
         assert!(
             !upsert_article(&conn, feed_id, &mk("c5", "spam alert", None), false, &rules).unwrap()
@@ -7285,9 +7293,11 @@ mod tests {
         assert_eq!(row.env_json, r#"{"BILIBILI_COOKIE_1":"x"}"#);
 
         rsshub_route_delete(&conn, "/github/activity/:user").unwrap();
-        assert!(rsshub_route_get(&conn, "/github/activity/:user")
-            .unwrap()
-            .is_none());
+        assert!(
+            rsshub_route_get(&conn, "/github/activity/:user")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7419,9 +7429,11 @@ mod tests {
         assert_eq!(rsshub_feeds_for_feed(&conn, hub).unwrap().len(), 1);
         // OPML export and sync never leak rsshub:// URLs.
         let export = feeds_for_export(&conn).unwrap();
-        assert!(export
-            .iter()
-            .all(|(_, url, _)| !url.starts_with("rsshub://")));
+        assert!(
+            export
+                .iter()
+                .all(|(_, url, _)| !url.starts_with("rsshub://"))
+        );
         assert_eq!(export.len(), 1, "only the plain rss feed exports");
         let sync = feed_urls_for_sync(&conn).unwrap();
         assert!(sync.iter().all(|u| !u.starts_with("rsshub://")));
