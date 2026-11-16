@@ -26,7 +26,10 @@
 //! Anti-ban posture: read-only, first page only, strictly serial per feed
 //! leg, jittered pacing between detail fetches, hard cap on details per
 //! refresh, cookies only in an explicit header, and every response's final
-//! URL must still belong to xiaohongshu.com.
+//! URL must still belong to xiaohongshu.com. Anonymous access runs on a
+//! per-visitor allowance behind the edge's risk control — the parser client
+//! deliberately advertises no `Accept-Encoding` (see `build_parser_client`),
+//! and a pasted logged-in cookie is the stable path.
 
 use crate::db;
 use crate::error::AppError;
@@ -834,13 +837,22 @@ async fn get_document(client: &Client, url: &str, cookie: Option<&str>) -> XhsRe
     }
     // The parser client does not follow redirects (cookies must never ride a
     // redirect). The edge's only redirect here is the risk-control login
-    // bounce — anonymous profile access is throttled per IP/visitor, so a
-    // cold visitor gets the SSR page and a hot one a 302 onto /login,
-    // exactly what the real browser sees. Surface that gate (and a genuinely
-    // gated profile) as `Blocked`; 401 with a pasted cookie means the session
-    // is rejected; only an explicit 404/410 means gone.
+    // bounce. Verified live (2026-11): anonymous visitors get a small request
+    // allowance, and inside it the verdict is decided by the request's
+    // compression advertisement — advertising `Accept-Encoding: gzip …` bounces
+    // to /login while the same request without the header is served (which is
+    // why `build_parser_client` suppresses it); once the allowance is spent,
+    // every anonymous request bounces until the cooldown lapses. A logged-in
+    // cookie sidesteps the gate entirely. So: with a pasted cookie the bounce
+    // means the session was refused (`Auth`); without one it is the anonymous
+    // gate — wait it out or paste a cookie (`Blocked`). 403/461 stay
+    // risk-control; only an explicit 404/410 means gone.
     if resp.status().is_redirection() {
-        return Err(XhsError::Blocked);
+        return Err(if cookie.is_some() {
+            XhsError::Auth
+        } else {
+            XhsError::Blocked
+        });
     }
     match resp.status() {
         StatusCode::UNAUTHORIZED => return Err(XhsError::Auth),

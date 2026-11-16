@@ -5,6 +5,7 @@ import * as api from "../api";
 import { useArticleActions } from "../hooks/articleActions";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { errorText } from "../lib/errors";
+import { useBackdropClose } from "../hooks/useBackdropClose";
 import { isComposingKey } from "../lib/ime";
 import { NO_AUTOCORRECT } from "../lib/inputProps";
 import type { Feed } from "../types";
@@ -141,7 +142,7 @@ export default function EditFeedDialog({ feed, onToast, onClose }: Props) {
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="modal"
         ref={dialogRef}

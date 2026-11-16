@@ -384,8 +384,7 @@ fn register_functions(conn: &Connection) -> AppResult<()> {
             let (Some(pattern), Some(text)) = (pattern, text) else {
                 return Ok(false);
             };
-            Ok(RuleCondition::compile(&pattern)
-                .is_some_and(|re| re.is_match(&text)))
+            Ok(RuleCondition::compile(&pattern).is_some_and(|re| re.is_match(&text)))
         },
     )?;
     Ok(())
@@ -1185,22 +1184,65 @@ pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult
 /// video media along; an empty list never clears what is stored.
 pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
     /// The stored renderer-owned columns of one parser article row.
-    type StoredRow = (i64, Option<String>, Option<String>, String, Option<String>);
+    type StoredRow = (
+        i64,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
     let existing: Option<StoredRow> = conn
         .query_row(
-            "SELECT id, content_html, extracted_html, body_text, url
+            "SELECT id, content_html, extracted_html, body_text, url, title, summary
              FROM articles WHERE feed_id = ?1 AND guid = ?2",
             params![feed_id, a.guid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((id, content_html, extracted_html, body_text, stored_url)) = existing else {
+    let Some((
+        id,
+        content_html,
+        extracted_html,
+        body_text,
+        stored_url,
+        stored_title,
+        stored_summary,
+    )) = existing
+    else {
         return Ok(false);
     };
     // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
     // and rewriting identical bytes would churn WAL pages and re-index FTS.
-    let rendered_differs =
-        content_html.as_deref() != a.content_html.as_deref() || body_text != a.body_text;
+    // An empty incoming body carries no information (the kuaishou live-api
+    // ships no captions): keep what is stored rather than blanking it — the
+    // same contract as the COALESCE on url/published_at below. The equality
+    // check compares the effective body so an always-empty incoming body
+    // does not read as a change on every refresh.
+    let effective_body = if a.body_text.is_empty() {
+        body_text.clone()
+    } else {
+        a.body_text.clone()
+    };
+    let rendered_differs = content_html.as_deref() != a.content_html.as_deref()
+        || body_text != effective_body
+        // Title and summary are rewritten by the UPDATE below but nothing
+        // else forces the early-return path open when only they change —
+        // compare them too (e.g. a kuaishou work card whose label follows a
+        // payload change while the markup stays identical).
+        || stored_title != a.title
+        || stored_summary != a.summary;
     let stale_extraction = extracted_html.is_some();
     // A URL the stored row lacks counts as a change too: the permalink
     // backfill must land even when the body is byte-identical (an anonymous
@@ -1228,7 +1270,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             a.title,
             a.summary,
             a.content_html,
-            a.body_text,
+            effective_body,
             a.image_url,
             a.published_at,
             a.url
@@ -1250,7 +1292,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     }
     tx.execute(
         "UPDATE articles_fts SET title = ?2, body = ?3 WHERE rowid = ?1",
-        params![id, a.title, a.body_text],
+        params![id, a.title, effective_body],
     )?;
     tx.commit()?;
     Ok(true)
@@ -1719,10 +1761,7 @@ pub fn apply_rewrites(a: &mut NewArticle, rewrites: &[RuleRewrite]) {
         }
         a.title = a.title.replace(&rw.from, &rw.to);
         a.summary = a.summary.take().map(|s| s.replace(&rw.from, &rw.to));
-        a.content_html = a
-            .content_html
-            .take()
-            .map(|s| s.replace(&rw.from, &rw.to));
+        a.content_html = a.content_html.take().map(|s| s.replace(&rw.from, &rw.to));
         a.body_text = a.body_text.replace(&rw.from, &rw.to);
     }
 }
@@ -2793,7 +2832,11 @@ fn condition_where(c: &RuleCondition, binds: &mut Vec<Value>) -> String {
                 .replace('_', "\\_");
             for col in cols {
                 binds.push(Value::Text(format!("%{escaped}%")));
-                let neg = if c.operator == "not_contains" { "NOT " } else { "" };
+                let neg = if c.operator == "not_contains" {
+                    "NOT "
+                } else {
+                    ""
+                };
                 parts.push(format!(
                     "unicode_lower(COALESCE({col},'')) {neg}LIKE ? ESCAPE '\\'"
                 ));
@@ -2929,10 +2972,12 @@ pub fn apply_rule_to_existing(
             Ok(conn.execute(&sql, params_from_iter(binds))?)
         }
         "read" | "star" => {
-            let flag = if action == "read" { "is_read" } else { "is_starred" };
-            let sql = format!(
-                "UPDATE articles SET {flag} = 1 WHERE ({where_sql}) AND {flag} = 0"
-            );
+            let flag = if action == "read" {
+                "is_read"
+            } else {
+                "is_starred"
+            };
+            let sql = format!("UPDATE articles SET {flag} = 1 WHERE ({where_sql}) AND {flag} = 0");
             Ok(conn.execute(&sql, params_from_iter(binds))?)
         }
         "rewrite" => {
@@ -4135,6 +4180,125 @@ mod tests {
     }
 
     #[test]
+    fn refresh_parser_article_keeps_the_stored_body_when_incoming_is_empty() {
+        // The kuaishou live-api ships no captions: its refresh results carry
+        // an empty body_text, which must never blank the caption a
+        // pre-migration row stored. An empty incoming body is "no
+        // information", the same contract as the url/published_at COALESCE.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4",
+            None,
+            "创作者昵称",
+            None,
+            SourceType::Kuaishou,
+            None,
+        )
+        .unwrap();
+        let stored = NewArticle {
+            guid: "3xphoto00001".into(),
+            url: Some("https://www.kuaishou.com/short-video/3xphoto00001".into()),
+            title: "第一条作品".into(),
+            author: None,
+            summary: Some("第一条作品".into()),
+            content_html: Some("<p>旧文案</p>".into()),
+            body_text: "旧文案".into(),
+            image_url: None,
+            published_at: Some("2026-11-12T05:52:51+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+
+        // The new parse re-renders the row to a media card with no caption.
+        let refreshed = NewArticle {
+            title: "视频作品".into(),
+            summary: Some("视频作品".into()),
+            content_html: Some("<p><video controls preload=\"metadata\"></video></p>".into()),
+            body_text: String::new(),
+            ..stored.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
+        let (body, fts_body): (String, String) = conn
+            .query_row(
+                "SELECT a.body_text, f.body FROM articles a
+                 JOIN articles_fts f ON f.rowid = a.id
+                 WHERE a.feed_id = ?1 AND a.guid = ?2",
+                params![feed_id, stored.guid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "旧文案");
+        assert_eq!(fts_body, "旧文案");
+        // Title/summary follow the new parse as intended.
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, stored.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "视频作品");
+    }
+
+    #[test]
+    fn refresh_parser_article_updates_the_title_even_when_only_it_changes() {
+        // The kuaishou refresh body is empty, so the body comparison uses the
+        // stored text — with identical markup and URL a title-only change
+        // (e.g. the work-type label following a payload change) must still
+        // trigger the update instead of early-returning and pinning the old
+        // title forever.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://www.kuaishou.com/profile/3x4kuwfd24jzzf4",
+            None,
+            "创作者昵称",
+            None,
+            SourceType::Kuaishou,
+            None,
+        )
+        .unwrap();
+        let stored = NewArticle {
+            guid: "3xphoto00042".into(),
+            url: Some("https://www.kuaishou.com/short-video/3xphoto00042".into()),
+            title: "作品".into(),
+            author: None,
+            summary: Some("作品".into()),
+            content_html: Some("<p><video controls preload=\"metadata\"></video></p>".into()),
+            body_text: "旧文案".into(),
+            image_url: None,
+            published_at: Some("2026-11-12T05:52:51+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+
+        // Same markup, same URL, empty body, but the title moved to the
+        // work-type label: the refresh must report a change and store it.
+        let refreshed = NewArticle {
+            title: "视频作品".into(),
+            summary: Some("视频作品".into()),
+            body_text: String::new(),
+            ..stored.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
+        let (title, summary, body): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT title, summary, body_text FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, stored.guid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "视频作品");
+        assert_eq!(summary.as_deref(), Some("视频作品"));
+        // The stored caption survives the body-preservation contract.
+        assert_eq!(body, "旧文案");
+
+        // Idempotent: a second identical refresh reports no change.
+        assert!(!refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
+    }
+
+    #[test]
     fn refresh_parser_article_ignores_unknown_rows() {
         let conn = test_conn();
         let feed_id = insert_feed(
@@ -5007,7 +5171,8 @@ mod tests {
         // share `rule_match_where`, so the user is never surprised.
         let (preview, _) = preview_rule(&conn, None, &kw("title", "sponsored")).unwrap();
         assert_eq!(preview, 2);
-        let n = apply_rule_to_existing(&conn, None, &kw("title", "sponsored"), "skip", &[]).unwrap();
+        let n =
+            apply_rule_to_existing(&conn, None, &kw("title", "sponsored"), "skip", &[]).unwrap();
         assert_eq!(n, 2);
 
         let remaining: i64 = conn
@@ -5053,7 +5218,8 @@ mod tests {
         seed(&conn, feed_b, "x2", "Deals galore");
 
         // Scoped to feed B only: feed A's match is left untouched.
-        let n = apply_rule_to_existing(&conn, Some(feed_b), &kw("title", "deals"), "star", &[]).unwrap();
+        let n = apply_rule_to_existing(&conn, Some(feed_b), &kw("title", "deals"), "star", &[])
+            .unwrap();
         assert_eq!(n, 1);
         let starred_in_a: i64 = conn
             .query_row(
@@ -5067,7 +5233,6 @@ mod tests {
             "a feed-scoped rule must not touch other feeds"
         );
     }
-
 
     // ── advanced rules (conditions document + rewrite) ───────────────
 
@@ -5120,7 +5285,10 @@ mod tests {
             .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
             .unwrap();
         let conditions = vec![
-            vec![cond("title", "contains", "rust"), cond("author", "eq", "bob")],
+            vec![
+                cond("title", "contains", "rust"),
+                cond("author", "eq", "bob"),
+            ],
             vec![cond("title", "contains", "spam")],
         ];
         let mk = |guid: &str, title: &str, author: Option<&str>| NewArticle {
@@ -5137,9 +5305,23 @@ mod tests {
         };
         // Seed the backlog *before* the skip rule exists, so the preview counts
         // rows that are actually stored (a skip rule never stores its hits).
-        upsert_article(&conn, feed_id, &mk("c1", "rust news", Some("Bob")), false, &[]).unwrap();
+        upsert_article(
+            &conn,
+            feed_id,
+            &mk("c1", "rust news", Some("Bob")),
+            false,
+            &[],
+        )
+        .unwrap();
         upsert_article(&conn, feed_id, &mk("c2", "spam alert", None), false, &[]).unwrap();
-        upsert_article(&conn, feed_id, &mk("c3", "rust news", Some("Alice")), false, &[]).unwrap();
+        upsert_article(
+            &conn,
+            feed_id,
+            &mk("c3", "rust news", Some("Alice")),
+            false,
+            &[],
+        )
+        .unwrap();
         // The SQL preview must count exactly the same two shapes ingestion
         // would act on.
         let (n, _) = preview_rule(&conn, None, &conditions).unwrap();
@@ -5148,15 +5330,28 @@ mod tests {
         create_rule(&conn, "combo", None, &conditions, "skip", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
         // AND-group hit: rust + Bob → skipped.
-        assert!(!upsert_article(&conn, feed_id, &mk("c4", "rust news", Some("Bob")), false, &rules)
-            .unwrap());
+        assert!(!upsert_article(
+            &conn,
+            feed_id,
+            &mk("c4", "rust news", Some("Bob")),
+            false,
+            &rules
+        )
+        .unwrap());
         // OR-group hit: spam alone → skipped.
-        assert!(!upsert_article(&conn, feed_id, &mk("c5", "spam alert", None), false, &rules)
-            .unwrap());
+        assert!(
+            !upsert_article(&conn, feed_id, &mk("c5", "spam alert", None), false, &rules).unwrap()
+        );
         // Only half of the AND group → no match, article inserts.
         assert!(
-            upsert_article(&conn, feed_id, &mk("c6", "rust news", Some("Alice")), false, &rules)
-                .unwrap(),
+            upsert_article(
+                &conn,
+                feed_id,
+                &mk("c6", "rust news", Some("Alice")),
+                false,
+                &rules
+            )
+            .unwrap(),
             "one matching condition of an AND group must not fire the rule"
         );
     }
@@ -5300,7 +5495,10 @@ mod tests {
             "an invalid regex row must be inert, not fatal"
         );
         let (n, _) = preview_rule(&conn, None, &one("title", "regex", "([")).unwrap();
-        assert_eq!(n, 0, "the SQL regexp() helper treats an invalid pattern as no-match");
+        assert_eq!(
+            n, 0,
+            "the SQL regexp() helper treats an invalid pattern as no-match"
+        );
     }
 
     #[test]
@@ -5354,10 +5552,7 @@ mod tests {
         let feed_id: i64 = conn
             .query_row("SELECT feed_id FROM articles LIMIT 1", [], |r| r.get(0))
             .unwrap();
-        let doc = vec![
-            vec![cond("title", "contains", "zzz_nomatch")],
-            Vec::new(),
-        ];
+        let doc = vec![vec![cond("title", "contains", "zzz_nomatch")], Vec::new()];
         assert_eq!(
             crate::models::validate_conditions(&doc),
             Err("emptyRuleCondition"),
@@ -5501,12 +5696,17 @@ mod tests {
         }];
 
         let x1: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'x1'", [], |r| r.get(0))
+            .query_row("SELECT id FROM articles WHERE guid = 'x1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let x2: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'x2'", [], |r| r.get(0))
+            .query_row("SELECT id FROM articles WHERE guid = 'x2'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        conn.execute("UPDATE articles SET author = 'bob' WHERE id = ?1", [x2]).unwrap();
+        conn.execute("UPDATE articles SET author = 'bob' WHERE id = ?1", [x2])
+            .unwrap();
         // x1: extracted full text (its FTS body is that text) + cached derivatives.
         set_extracted_html(&conn, x1, "<p>quasar deep text</p>", None).unwrap();
         set_translation(&conn, x1, "<p>old body</p>", "zh", Some("old title")).unwrap();
@@ -5543,7 +5743,11 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((t1, s1), (None, None), "changed rows lose stale derivatives");
+        assert_eq!(
+            (t1, s1),
+            (None, None),
+            "changed rows lose stale derivatives"
+        );
         let (t2, s2): (Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT translated_html, ai_summary FROM articles WHERE id = ?1",
@@ -5558,7 +5762,9 @@ mod tests {
         );
         // The rewritten title landed too.
         let title: String = conn
-            .query_row("SELECT title FROM articles WHERE id = ?1", [x1], |r| r.get(0))
+            .query_row("SELECT title FROM articles WHERE id = ?1", [x1], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(title, "Rust Letter #1");
     }
@@ -5609,7 +5815,14 @@ mod tests {
         // inertness keeps it safe; and the not_contains rule must not turn
         // into match-everything either.
         assert!(
-            upsert_article(&conn, feed_id, &mk("z2", "ordinary headline"), false, &rules).unwrap(),
+            upsert_article(
+                &conn,
+                feed_id,
+                &mk("z2", "ordinary headline"),
+                false,
+                &rules
+            )
+            .unwrap(),
             "a NUL-bearing not_contains needle must never fire"
         );
         // The SQL side agrees on both documents.
@@ -5649,8 +5862,7 @@ mod tests {
         for (id, guid) in &ids {
             set_translation(&conn, *id, "<p>old</p>", "zh", Some("old")).unwrap();
             set_ai_summary(&conn, *id, "old summary").unwrap();
-            set_preview_translation(&conn, *id, "old title", "old snippet", "zh", "test")
-                .unwrap();
+            set_preview_translation(&conn, *id, "old title", "old snippet", "zh", "test").unwrap();
             let _ = guid;
         }
         let changed = apply_rule_to_existing(&conn, None, &doc, "rewrite", &rewrites).unwrap();
@@ -5669,7 +5881,11 @@ mod tests {
                 .unwrap();
             if guid == "n1" {
                 assert_eq!(title, "Weekly meeting");
-                assert_eq!((th, ai, pt), (None, None, 0), "changed row: derivatives dropped");
+                assert_eq!(
+                    (th, ai, pt),
+                    (None, None, 0),
+                    "changed row: derivatives dropped"
+                );
             } else {
                 assert_eq!(title, "Weekly recap");
                 assert_eq!(
@@ -5692,7 +5908,9 @@ mod tests {
             .unwrap();
         seed(&conn, feed_id, "p1", "Weekly roundup");
         let id: i64 = conn
-            .query_row("SELECT id FROM articles WHERE guid = 'p1'", [], |r| r.get(0))
+            .query_row("SELECT id FROM articles WHERE guid = 'p1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         set_translation(&conn, id, "<p>old</p>", "zh", Some("old")).unwrap();
         set_ai_summary(&conn, id, "old summary").unwrap();
@@ -5734,8 +5952,15 @@ mod tests {
             from: "Sponsored: ".into(),
             to: String::new(),
         }];
-        create_rule(&conn, "fix", None, &one("title", "contains", "Sponsored"), "rewrite", &rewrites)
-            .unwrap();
+        create_rule(
+            &conn,
+            "fix",
+            None,
+            &one("title", "contains", "Sponsored"),
+            "rewrite",
+            &rewrites,
+        )
+        .unwrap();
         let rules = active_rules(&conn).unwrap();
 
         let a = NewArticle {
@@ -5789,7 +6014,10 @@ mod tests {
             None,
             &one("title", "contains", "alpha"),
             "rewrite",
-            &[RuleRewrite { from: "alpha".into(), to: "beta".into() }],
+            &[RuleRewrite {
+                from: "alpha".into(),
+                to: "beta".into(),
+            }],
         )
         .unwrap();
         create_rule(
@@ -5798,7 +6026,10 @@ mod tests {
             None,
             &one("title", "contains", "alpha"),
             "rewrite",
-            &[RuleRewrite { from: "beta".into(), to: "gamma".into() }],
+            &[RuleRewrite {
+                from: "beta".into(),
+                to: "gamma".into(),
+            }],
         )
         .unwrap();
         let rules = active_rules(&conn).unwrap();
@@ -5841,9 +6072,14 @@ mod tests {
         }];
         let (n, _) = preview_rule(&conn, None, &kw("title", "Rust Weekly")).unwrap();
         assert_eq!(n, 2);
-        let changed =
-            apply_rule_to_existing(&conn, None, &kw("title", "Rust Weekly"), "rewrite", &rewrites)
-                .unwrap();
+        let changed = apply_rule_to_existing(
+            &conn,
+            None,
+            &kw("title", "Rust Weekly"),
+            "rewrite",
+            &rewrites,
+        )
+        .unwrap();
         assert_eq!(changed, 2);
 
         let titles: Vec<String> = {
@@ -5855,7 +6091,10 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
         };
-        assert_eq!(titles, vec!["Rust Newsletter #1", "Rust Newsletter #2", "Go Letter"]);
+        assert_eq!(
+            titles,
+            vec!["Rust Newsletter #1", "Rust Newsletter #2", "Go Letter"]
+        );
 
         // No UPDATE trigger keeps FTS fresh, so the backfill rebuilt the
         // matched rows: the new text is searchable, the old text is gone.
@@ -5890,24 +6129,23 @@ mod tests {
         seed(&conn, feed_id, "s1", "advert quiet launch");
 
         let rewrites = vec![
-            RuleRewrite { from: "advert".into(), to: String::new() },
-            RuleRewrite { from: "quiet".into(), to: "loud".into() },
+            RuleRewrite {
+                from: "advert".into(),
+                to: String::new(),
+            },
+            RuleRewrite {
+                from: "quiet".into(),
+                to: "loud".into(),
+            },
         ];
-        let changed = apply_rule_to_existing(
-            &conn,
-            None,
-            &kw("title", "advert"),
-            "rewrite",
-            &rewrites,
-        )
-        .unwrap();
+        let changed =
+            apply_rule_to_existing(&conn, None, &kw("title", "advert"), "rewrite", &rewrites)
+                .unwrap();
         assert_eq!(changed, 1);
         let title: String = conn
-            .query_row(
-                "SELECT title FROM articles WHERE guid = 's1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT title FROM articles WHERE guid = 's1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         // The second pair still applied even though the first already removed
         // "advert" from the title (SQLite would otherwise re-evaluate the
@@ -5921,27 +6159,26 @@ mod tests {
         // one field when the document uses a single field, `any` when mixed.
         let (conn, _aid) = test_db();
         let conditions = vec![
-            vec![cond("title", "contains", "rust"), cond("author", "eq", "bob")],
+            vec![
+                cond("title", "contains", "rust"),
+                cond("author", "eq", "bob"),
+            ],
             vec![cond("title", "contains", "spam")],
         ];
         let id = create_rule(&conn, "mix", None, &conditions, "skip", &[]).unwrap();
         let (field, query): (String, String) = conn
-            .query_row(
-                "SELECT field, query FROM rules WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT field, query FROM rules WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(field, "any", "mixed fields summarise to `any`");
         assert_eq!(query, "rust,bob,spam");
 
         let id2 = create_rule(&conn, "single", None, &one("url", "eq", "x"), "read", &[]).unwrap();
         let (field, query): (String, String) = conn
-            .query_row(
-                "SELECT field, query FROM rules WHERE id = ?1",
-                [id2],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT field, query FROM rules WHERE id = ?1", [id2], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(field, "url");
         assert_eq!(query, "x");

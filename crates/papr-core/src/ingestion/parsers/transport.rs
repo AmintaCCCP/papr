@@ -64,21 +64,18 @@ pub fn browser_document_headers(host: &str, cookie: Option<&str>) -> Vec<(String
     headers
 }
 
-/// The Chrome XHR/fetch header group for JSON API calls (kuaishou's GraphQL
-/// endpoint). Same UA family, but `sec-fetch-*` describe a same-origin CORS
-/// request rather than a navigation.
-pub fn browser_api_headers(
-    host: &str,
-    referer: &str,
-    cookie: Option<&str>,
-) -> Vec<(String, String)> {
+/// The Chrome XHR/fetch header group for same-origin JSON API GETs (the
+/// kuaishou live-api endpoints). Same UA family; `sec-fetch-*` describe a
+/// same-origin request, and — exactly as Chrome sends them — no
+/// `Content-Type` (there is no request body) and no `Origin` (same-origin
+/// GETs carry none; those appear only on CORS or non-GET requests).
+pub fn browser_api_headers(host: &str, cookie: Option<&str>) -> Vec<(String, String)> {
     let profile = &PROFILES[0];
     let v = profile.brand_version;
     let mut headers: Vec<(String, String)> = vec![
         ("User-Agent".into(), profile.ua.into()),
         ("Accept".into(), "application/json, text/plain, */*".into()),
         ("Accept-Language".into(), "zh-CN,zh;q=0.9,en;q=0.8".into()),
-        ("Content-Type".into(), "application/json".into()),
         (
             "sec-ch-ua".into(),
             format!(r#""Chromium";v="{v}", "Not(A:Brand";v="24", "Google Chrome";v="{v}""#),
@@ -88,8 +85,7 @@ pub fn browser_api_headers(
         ("Sec-Fetch-Dest".into(), "empty".into()),
         ("Sec-Fetch-Mode".into(), "cors".into()),
         ("Sec-Fetch-Site".into(), "same-origin".into()),
-        ("Referer".into(), referer.to_string()),
-        ("Origin".into(), format!("https://{host}")),
+        ("Referer".into(), format!("https://{host}/")),
     ];
     if let Some(cookie) = cookie {
         headers.push(("Cookie".into(), cookie.to_string()));
@@ -154,15 +150,18 @@ mod tests {
     }
 
     #[test]
-    fn api_headers_set_cors_shape() {
-        let headers = browser_api_headers(
-            "www.kuaishou.com",
-            "https://www.kuaishou.com/profile/x",
-            None,
-        );
+    fn api_headers_set_same_origin_get_shape() {
+        let headers = browser_api_headers("live.kuaishou.com", None);
         let get = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
         assert_eq!(get("Sec-Fetch-Mode").as_deref(), Some("cors"));
-        assert_eq!(get("Origin").as_deref(), Some("https://www.kuaishou.com"));
+        assert_eq!(get("Sec-Fetch-Site").as_deref(), Some("same-origin"));
+        // Chrome sends neither on a same-origin GET: no body, no CORS.
+        assert!(get("Content-Type").is_none());
+        assert!(get("Origin").is_none());
+        assert_eq!(
+            get("Referer").as_deref(),
+            Some("https://live.kuaishou.com/")
+        );
         assert!(get("Cookie").is_none());
     }
 

@@ -61,6 +61,7 @@ import type {
 import { RULE_ACTIONS, RULE_FIELDS, RULE_OPEN_ACTIONS, RULE_OPERATORS } from "../types";
 import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
+import { useBackdropClose } from "../hooks/useBackdropClose";
 import FeedAvatar from "./FeedAvatar";
 
 interface Props {
@@ -160,7 +161,7 @@ export default function SettingsDialog({
   };
 
   return (
-    <div className="settings-backdrop" onClick={onClose}>
+    <div className="settings-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="settings-window"
         ref={windowRef}
@@ -2037,7 +2038,7 @@ function ParserSettingsModal({
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...useBackdropClose(onClose)}>
       <div
         className="modal"
         ref={dialogRef}

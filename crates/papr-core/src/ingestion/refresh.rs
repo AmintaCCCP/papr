@@ -871,9 +871,14 @@ async fn poll_kuaishou_feeds(
         };
         match kuaishou::fetch_creator_page(client, &user_id, cookie.as_deref()).await {
             Ok(page) => {
+                // The page lists newest-first, and the works carry no
+                // publish time: writing oldest-first gives the newest work
+                // the highest id, so the fetched_at/id ordering keeps it on
+                // top within one batch.
                 let articles: Vec<db::NewArticle> = page
                     .photos
                     .iter()
+                    .rev()
                     .map(|photo| kuaishou::photo_to_article(photo, feed_url))
                     .collect();
                 let inserted =
