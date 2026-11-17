@@ -49,6 +49,11 @@ pub const MAX_TOKENS: u32 = 1024;
 /// summary. Paired with [`TRANSLATE_CHUNK_BUDGET`] so a batch fits under it.
 pub const TRANSLATE_MAX_TOKENS: u32 = 4096;
 
+/// Output token cap for one article-chat answer: between the summary cap and
+/// the translation cap — chat answers quote passages and can run long, but
+/// stay conversational.
+pub const CHAT_MAX_TOKENS: u32 = 2048;
+
 /// Input character budget for one translation batch, used by
 /// `translate::chunk_blocks`. Chosen alongside [`TRANSLATE_MAX_TOKENS`] so the
 /// translated output of a full batch stays under the output cap.

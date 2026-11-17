@@ -47,14 +47,13 @@ jobs:
         run: |
           set -euo pipefail
           all='[
-            {"platform":"macos-latest","target":"aarch64-apple-darwin"},
-            {"platform":"macos-latest","target":"x86_64-apple-darwin"},
+            {"platform":"macos-15","target":"macos"},
             {"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"},
             {"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}
           ]'
           case "$PLATFORMS" in
             macos)
-              matrix=$(echo "$all" | jq -c '[.[] | select(.platform | startswith("macos"))]')
+              matrix='[{"platform":"macos-15","target":"macos"}]'
               ;;
             linux)
               matrix='[{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]'
@@ -107,7 +106,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.target == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -171,22 +170,60 @@ jobs:
       # No tagName / releaseName — tauri-action builds the bundles and stops
       # there; no GitHub release is created or touched. When the updater key
       # is configured, test builds sign exactly like release builds do.
-      - name: Build desktop bundles
+      # Build both macOS architectures sequentially on a single runner so they
+      # do not compete for limited hosted macOS runner capacity.
+      - name: Build desktop bundles (aarch64-apple-darwin)
+        if: matrix.target == 'macos'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: ${{ (matrix.platform == 'macos-latest' && format('--target {0} ', matrix.target) || '') }}${{ env.EXTRA_BUILD_ARGS }}
+          args: --target aarch64-apple-darwin ${{ env.EXTRA_BUILD_ARGS }}
+
+      - name: Build desktop bundles (x86_64-apple-darwin)
+        if: matrix.target == 'macos'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target x86_64-apple-darwin ${{ env.EXTRA_BUILD_ARGS }}
+
+      - name: Build desktop bundles
+        if: matrix.target != 'macos'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ env.EXTRA_BUILD_ARGS }}
 
       # upload-artifact can't consume tauri-action's artifactPaths output —
       # it is a JSON-array string, which v4 treats as one literal glob and
       # finds nothing. Glob the bundle outputs directly instead; cargo puts
       # them under the root target dir on every platform, with cross-target
       # mac builds adding the triple as an extra path segment.
+      - name: Upload bundles (aarch64-apple-darwin)
+        if: matrix.target == 'macos'
+        uses: actions/upload-artifact@v6
+        with:
+          name: papr-desktop-aarch64-apple-darwin
+          path: |
+            target/aarch64-apple-darwin/release/bundle/**
+          if-no-files-found: error
+
+      - name: Upload bundles (x86_64-apple-darwin)
+        if: matrix.target == 'macos'
+        uses: actions/upload-artifact@v6
+        with:
+          name: papr-desktop-x86_64-apple-darwin
+          path: |
+            target/x86_64-apple-darwin/release/bundle/**
+          if-no-files-found: error
+
       - name: Upload bundles
+        if: matrix.target != 'macos'
         uses: actions/upload-artifact@v6
         with:
           name: papr-desktop-${{ matrix.target }}
           path: |
-            target/${{ matrix.platform == 'macos-latest' && format('{0}/', matrix.target) || '' }}release/bundle/**
+            target/release/bundle/**
           if-no-files-found: error

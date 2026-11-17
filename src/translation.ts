@@ -89,6 +89,7 @@ export const useTranslationJobs = create<TranslationState>((set, get) => {
         },
       }));
 
+      let settled = false;
       api
         .aiTranslate(articleId, lang, engine, (e) => {
           if (e.type === "start") {
@@ -102,15 +103,29 @@ export const useTranslationJobs = create<TranslationState>((set, get) => {
               html: j.html + e.data.html,
             }));
           } else if (e.type === "done") {
+            settled = true;
             patchIfCurrent(articleId, token, (j) => ({ ...j, html: e.data.html, status: "done" }));
+          } else if (e.type === "discarded") {
+            settled = true;
+            patchIfCurrent(articleId, token, (j) => ({
+              ...j,
+              html: "",
+              title: "",
+              status: "error",
+            }));
           }
         })
         .then(() => {
-          // The `done` event normally flips the status; guard against it being
-          // missed so a finished job never sticks on "translating".
-          patchIfCurrent(articleId, token, (j) =>
-            j.status === "translating" ? { ...j, status: "done" } : j,
-          );
+          // Only a `done` event marks the translation complete. If the command
+          // returned without emitting `done` (e.g. discarded or aborted), clear
+          // any partial buffers instead of marking stale fragments as done.
+          if (!settled) {
+            patchIfCurrent(articleId, token, (j) =>
+              j.status === "translating"
+                ? { ...j, html: "", title: "", status: "error" }
+                : j,
+            );
+          }
         })
         .catch((err) => {
           patchIfCurrent(articleId, token, (j) => ({ ...j, status: "error" }));

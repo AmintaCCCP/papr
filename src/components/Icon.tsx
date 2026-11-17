@@ -15,7 +15,9 @@ export type IconName =
   | "play" | "pause" | "skip-back" | "skip-fwd" | "headphones"
   // integrations
   | "box" | "book" | "book-open" | "doc" | "info" | "flask" | "gem"
-  | "link" | "terminal";
+  | "link" | "terminal"
+  // AI chat
+  | "chat" | "send-fill";
 
 interface Props {
   name: IconName;
@@ -169,6 +171,11 @@ export default function Icon({
       return <svg {...p}><path d="M10.2 13.8a4 4 0 0 0 5.6.4l3-3a4 4 0 0 0-5.6-5.7l-1.6 1.6" /><path d="M13.8 10.2a4 4 0 0 0-5.6-.4l-3 3a4 4 0 0 0 5.6 5.7l1.6-1.6" /></svg>;
     case "terminal":
       return <svg {...p}><path d="m4.5 17 6-5-6-5" /><path d="M12.5 19h7" /></svg>;
+    // ── AI chat ──
+    case "chat":
+      return <svg {...p}><path d="M21 12a8 8 0 0 1-8 8H5.5a2.5 2.5 0 0 1-2.4-1.8L2.6 15A8 8 0 1 1 21 12z" /><path d="M8.5 11h7M8.5 14.5h4" /></svg>;
+    case "send-fill":
+      return <svg {...filled}><path d="M21.5 2.5 10.5 13.5M21.5 2.5l-7 19-4-8.5-8.5-4z" /></svg>;
     default:
       return null;
   }

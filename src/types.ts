@@ -389,7 +389,8 @@ export type TranslateEvent =
   | { type: "start"; data: { total: number } }
   | { type: "title"; data: { title: string } }
   | { type: "batch"; data: { html: string; done: number } }
-  | { type: "done"; data: { html: string } };
+  | { type: "done"; data: { html: string } }
+  | { type: "discarded" };
 
 export type RefreshProgress =
   | { event: "started"; data: { total: number } }

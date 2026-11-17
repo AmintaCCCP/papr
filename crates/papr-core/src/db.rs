@@ -5,8 +5,8 @@ use crate::error::{AppError, AppResult};
 use crate::ingestion::rsshub;
 use crate::models::*;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
-use rusqlite_migration::{Migrations, M};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
+use rusqlite_migration::{M, Migrations};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1182,7 +1182,29 @@ pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult
 /// AI summary are deliberately left alone. A non-empty incoming enclosure
 /// list replaces the stored one, so a card-to-fulltext upgrade carries its
 /// video media along; an empty list never clears what is stored.
+/// Outcome of refreshing an existing parser-owned article row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserRefreshOutcome {
+    /// The row existed and at least one column changed.
+    Updated,
+    /// The row existed and already matched (or was protected by the downgrade guard).
+    Unchanged,
+    /// No row matched `(feed_id, guid)` (e.g. skipped by dedup or retention tombstone).
+    NotFound,
+}
+
 pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
+    Ok(matches!(
+        refresh_parser_article_with_status(conn, feed_id, a)?,
+        ParserRefreshOutcome::Updated
+    ))
+}
+
+pub fn refresh_parser_article_with_status(
+    conn: &Connection,
+    feed_id: i64,
+    a: &NewArticle,
+) -> AppResult<ParserRefreshOutcome> {
     /// The stored renderer-owned columns of one parser article row.
     type StoredRow = (
         i64,
@@ -1221,7 +1243,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
         stored_summary,
     )) = existing
     else {
-        return Ok(false);
+        return Ok(ParserRefreshOutcome::NotFound);
     };
     // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
     // and rewriting identical bytes would churn WAL pages and re-index FTS.
@@ -1230,6 +1252,25 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     // same contract as the COALESCE on url/published_at below. The equality
     // check compares the effective body so an always-empty incoming body
     // does not read as a change on every refresh.
+    // Downgrade guard, X-article specific: a row whose stored card carries the
+    // full article body must never be rewritten by an incoming card that only
+    // renders the bare title link — that is exactly what a cycle whose
+    // TweetDetail fetch failed produces. The stored body survives until a
+    // fetch succeeds again (then the incoming markup carries the body
+    // container and the normal diff path applies). Matching the class
+    // ATTRIBUTE (not any substring) so prose that merely mentions the marker
+    // — an article whose title contains "x-article-body" — cannot impersonate
+    // a body container.
+    if content_html
+        .as_deref()
+        .is_some_and(|h| h.contains(r#"class="x-article-body""#))
+        && !a
+            .content_html
+            .as_deref()
+            .is_some_and(|h| h.contains(r#"class="x-article-body""#))
+    {
+        return Ok(ParserRefreshOutcome::Unchanged);
+    }
     let effective_body = if a.body_text.is_empty() {
         body_text.clone()
     } else {
@@ -1249,21 +1290,41 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     // card row whose detail upgrade re-renders to the same markup).
     let url_backfill = a.url.is_some() && stored_url.as_deref() != a.url.as_deref();
     if !rendered_differs && !stale_extraction && !url_backfill {
-        return Ok(false);
+        return Ok(ParserRefreshOutcome::Unchanged);
     }
+    // When the body itself changed — including when clearing `extracted_html`
+    // switches the effective body source back to `content_html` — every
+    // rendering derived from the OLD body is stale too. A title change clears
+    // the title translation specifically; URL-only backfills (with no
+    // effective-body change) keep the caches.
+    let title_changed = stored_title != a.title;
+    let prev_effective_html = extracted_html
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(content_html.as_deref());
+    let body_changed = content_html.as_deref() != a.content_html.as_deref()
+        || prev_effective_html != a.content_html.as_deref()
+        || body_text != effective_body
+        || stored_summary != a.summary;
 
     let tx = conn.unchecked_transaction()?;
     // `url` follows when the incoming article carries one: an anonymous card
     // row stored without a permalink gains the real explore URL when its
     // detail is fetched later. `COALESCE` keeps an absent incoming URL from
-    // clearing a stored one.
+    // clearing a stored one. The derived caches follow `body_changed` and
+    // `title_changed` — `CASE WHEN` on bound flags, so a URL-only backfill
+    // keeps them.
     tx.execute(
         "UPDATE articles
             SET title = ?2, summary = ?3, content_html = ?4, body_text = ?5,
                 image_url = COALESCE(?6, image_url),
                 published_at = COALESCE(?7, published_at),
                 url = COALESCE(?8, url),
-                extracted_html = NULL
+                extracted_html = NULL,
+                translated_html = CASE WHEN ?9 THEN NULL ELSE translated_html END,
+                translated_lang = CASE WHEN ?9 THEN NULL ELSE translated_lang END,
+                translated_title = CASE WHEN ?10 THEN NULL ELSE translated_title END,
+                ai_summary = CASE WHEN ?9 THEN NULL ELSE ai_summary END
           WHERE id = ?1",
         params![
             id,
@@ -1273,7 +1334,9 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             effective_body,
             a.image_url,
             a.published_at,
-            a.url
+            a.url,
+            body_changed,
+            title_changed
         ],
     )?;
     // Enclosures must follow the markup: the xiaohongshu pending-retry path
@@ -1295,7 +1358,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
         params![id, a.title, effective_body],
     )?;
     tx.commit()?;
-    Ok(true)
+    Ok(ParserRefreshOutcome::Updated)
 }
 
 /// One parser feed handed to the refresh leg: the row id, the parser that
@@ -3784,10 +3847,12 @@ mod tests {
         let global = 30;
 
         // Never fetched → always due, whatever the interval.
-        assert!(feeds_due_for_refresh(&conn, global)
-            .unwrap()
-            .iter()
-            .any(|(id, ..)| *id == feed_id));
+        assert!(
+            feeds_due_for_refresh(&conn, global)
+                .unwrap()
+                .iter()
+                .any(|(id, ..)| *id == feed_id)
+        );
 
         // Just fetched → not due under the 30-minute global interval.
         set_feed_fetch_state(&conn, feed_id, None, None, None).unwrap();
@@ -4167,7 +4232,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             url.as_deref(),
-            Some("https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token=ABz9token=")
+            Some(
+                "https://www.xiaohongshu.com/explore/66f00a22000000001e01c0e4?xsec_token=ABz9token="
+            )
         );
         // The body was genuinely untouched.
         assert_eq!(
@@ -4177,6 +4244,75 @@ mod tests {
 
         // And the next refresh with the same article is a no-op again.
         assert!(!refresh_parser_article(&conn, feed_id, &upgraded).unwrap());
+    }
+
+    #[test]
+    fn refresh_parser_article_never_downgrades_a_stored_article_body() {
+        // A cycle whose X-article TweetDetail fetch failed re-renders the
+        // bare title card. Rewriting would replace the stored full body with
+        // that stub until a fetch succeeded again — the guard keeps the body.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let full = NewArticle {
+            guid: "902".into(),
+            url: Some("https://x.com/jack/status/902".into()),
+            title: "jack".into(),
+            author: None,
+            summary: Some("标题\n\n正文".into()),
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a class="x-article-title" href="https://x.com/jack/status/902">标题</a><div class="x-article-body"><p>正文</p></div></div></div>"#.into(),
+            ),
+            body_text: "标题\n\n正文".into(),
+            image_url: Some("https://pbs.twimg.com/media/cover.jpg".into()),
+            published_at: Some("2026-09-13T07:20:00+00:00".into()),
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &full, false, &[]).unwrap());
+
+        // The degraded card (title link only) is refused.
+        let degraded = NewArticle {
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a href="https://x.com/jack/status/902">标题</a></div></div>"#.into(),
+            ),
+            ..full.clone()
+        };
+        assert!(!refresh_parser_article(&conn, feed_id, &degraded).unwrap());
+        let stored: String = conn
+            .query_row(
+                "SELECT content_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, full.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("x-article-body"));
+
+        // A genuinely new render that carries the body still upgrades (the
+        // diff path applies, e.g. the article was edited on X).
+        let edited = NewArticle {
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a class="x-article-title" href="https://x.com/jack/status/902">标题</a><div class="x-article-body"><p>新正文</p></div></div></div>"#.into(),
+            ),
+            body_text: "标题\n\n新正文".into(),
+            ..full.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &edited).unwrap());
+        let stored: String = conn
+            .query_row(
+                "SELECT content_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, full.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("新正文"));
     }
 
     #[test]
@@ -4242,6 +4378,137 @@ mod tests {
     }
 
     #[test]
+    fn refresh_parser_article_downgrade_guard_ignores_prose_mentions() {
+        // The guard matches the class ATTRIBUTE: prose that merely mentions
+        // the marker (an article titled "x-article-body") must not read as a
+        // body container, or a title-card refresh could overwrite it.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let stored = NewArticle {
+            guid: "910".into(),
+            url: Some("https://x.com/jack/status/910".into()),
+            title: "jack".into(),
+            author: None,
+            summary: Some("x-article-body".into()),
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a href="https://x.com/jack/status/910">x-article-body</a></div></div>"#.into(),
+            ),
+            body_text: "x-article-body".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+        // Neither card carries a real `class="x-article-body"` container, so
+        // the guard is inert: the changed markup rewrites as usual.
+        let refresh = NewArticle {
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a href="https://x.com/jack/status/910">新标题</a></div></div>"#.into(),
+            ),
+            ..stored.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &refresh).unwrap());
+        let content: String = conn
+            .query_row(
+                "SELECT content_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, stored.guid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(content.contains("新标题"));
+    }
+
+    #[test]
+    fn refresh_parser_article_clears_derived_caches_only_when_the_body_changed() {
+        // A title-card row the user already summarized: the upgrade to the
+        // full article body must drop the summary derived from the old card
+        // — new text beside an old-card summary is exactly the staleness the
+        // parser article refresh exists to avoid. A URL-only backfill (same
+        // body) keeps the caches.
+        let conn = test_conn();
+        let feed_id = insert_feed(
+            &conn,
+            "https://x.com/jack",
+            None,
+            "jack",
+            None,
+            SourceType::X,
+            None,
+        )
+        .unwrap();
+        let stored = NewArticle {
+            guid: "911".into(),
+            url: None,
+            title: "jack".into(),
+            author: None,
+            summary: Some("旧卡片".into()),
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a href="https://x.com/jack/status/911">旧卡片</a></div></div>"#.into(),
+            ),
+            body_text: "旧卡片".into(),
+            image_url: None,
+            published_at: None,
+            enclosures: Vec::new(),
+        };
+        assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+        conn.execute(
+            "UPDATE articles SET ai_summary = '旧卡片摘要', translated_html = '<p>旧译文</p>',
+                    translated_lang = 'zh', translated_title = '旧标题译文' WHERE feed_id = ?1",
+            params![feed_id],
+        )
+        .unwrap();
+
+        // URL-only backfill: the body is byte-identical, the caches stay.
+        let backfill = NewArticle {
+            url: Some("https://x.com/jack/status/911".into()),
+            ..stored.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &backfill).unwrap());
+        let caches: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT ai_summary, translated_html, translated_title FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, stored.guid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(caches.0.as_deref(), Some("旧卡片摘要"));
+        assert_eq!(caches.1.as_deref(), Some("<p>旧译文</p>"));
+        assert_eq!(caches.2.as_deref(), Some("旧标题译文"));
+
+        // The body itself changes (detail upgrade to the full article): the
+        // derived caches are cleared.
+        let upgraded = NewArticle {
+            content_html: Some(
+                r#"<div class="x-tweet"><div class="x-tweet-body"><a class="x-article-title" href="https://x.com/jack/status/911">标题</a><div class="x-article-body"><p>全文正文</p></div></div></div>"#.into(),
+            ),
+            body_text: "标题\n\n全文正文".into(),
+            summary: Some("标题\n\n全文正文".into()),
+            ..stored.clone()
+        };
+        assert!(refresh_parser_article(&conn, feed_id, &upgraded).unwrap());
+        let caches: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT ai_summary, translated_html, translated_lang FROM articles
+                 WHERE feed_id = ?1 AND guid = ?2",
+                params![feed_id, stored.guid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(caches.0, None);
+        assert_eq!(caches.1, None);
+        assert_eq!(caches.2, None);
+    }
+
+    #[test]
     fn refresh_parser_article_updates_the_title_even_when_only_it_changes() {
         // The kuaishou refresh body is empty, so the body comparison uses the
         // stored text — with identical markup and URL a title-only change
@@ -4272,27 +4539,36 @@ mod tests {
             enclosures: Vec::new(),
         };
         assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+        conn.execute(
+            "UPDATE articles SET translated_title = '作品译文', translated_html = '<p>译文</p>' WHERE feed_id = ?1",
+            params![feed_id],
+        )
+        .unwrap();
 
         // Same markup, same URL, empty body, but the title moved to the
         // work-type label: the refresh must report a change and store it.
+        // A title change invalidates the title translation cache specifically,
+        // while the unaffected body translation survives.
         let refreshed = NewArticle {
             title: "视频作品".into(),
-            summary: Some("视频作品".into()),
+            summary: Some("作品".into()),
             body_text: String::new(),
             ..stored.clone()
         };
         assert!(refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
-        let (title, summary, body): (String, Option<String>, String) = conn
+        let (title, summary, body, trans_title, trans_html): (String, Option<String>, String, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT title, summary, body_text FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                "SELECT title, summary, body_text, translated_title, translated_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
                 params![feed_id, stored.guid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(title, "视频作品");
-        assert_eq!(summary.as_deref(), Some("视频作品"));
+        assert_eq!(summary.as_deref(), Some("作品"));
         // The stored caption survives the body-preservation contract.
         assert_eq!(body, "旧文案");
+        assert_eq!(trans_title, None);
+        assert_eq!(trans_html.as_deref(), Some("<p>译文</p>"));
 
         // Idempotent: a second identical refresh reports no change.
         assert!(!refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
@@ -4640,9 +4916,11 @@ mod tests {
         let (conn, _aid) = test_db();
         // An all-stopword / punctuation-only question must not error and must
         // return nothing (the match-nothing `""` expression).
-        assert!(search_articles_for_rag(&conn, "??? !!!", 6)
-            .unwrap()
-            .is_empty());
+        assert!(
+            search_articles_for_rag(&conn, "??? !!!", 6)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5330,14 +5608,16 @@ mod tests {
         create_rule(&conn, "combo", None, &conditions, "skip", &[]).unwrap();
         let rules = active_rules(&conn).unwrap();
         // AND-group hit: rust + Bob → skipped.
-        assert!(!upsert_article(
-            &conn,
-            feed_id,
-            &mk("c4", "rust news", Some("Bob")),
-            false,
-            &rules
-        )
-        .unwrap());
+        assert!(
+            !upsert_article(
+                &conn,
+                feed_id,
+                &mk("c4", "rust news", Some("Bob")),
+                false,
+                &rules
+            )
+            .unwrap()
+        );
         // OR-group hit: spam alone → skipped.
         assert!(
             !upsert_article(&conn, feed_id, &mk("c5", "spam alert", None), false, &rules).unwrap()
@@ -7054,9 +7334,11 @@ mod tests {
         assert_eq!(row.env_json, r#"{"BILIBILI_COOKIE_1":"x"}"#);
 
         rsshub_route_delete(&conn, "/github/activity/:user").unwrap();
-        assert!(rsshub_route_get(&conn, "/github/activity/:user")
-            .unwrap()
-            .is_none());
+        assert!(
+            rsshub_route_get(&conn, "/github/activity/:user")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -7188,9 +7470,11 @@ mod tests {
         assert_eq!(rsshub_feeds_for_feed(&conn, hub).unwrap().len(), 1);
         // OPML export and sync never leak rsshub:// URLs.
         let export = feeds_for_export(&conn).unwrap();
-        assert!(export
-            .iter()
-            .all(|(_, url, _)| !url.starts_with("rsshub://")));
+        assert!(
+            export
+                .iter()
+                .all(|(_, url, _)| !url.starts_with("rsshub://"))
+        );
         assert_eq!(export.len(), 1, "only the plain rss feed exports");
         let sync = feed_urls_for_sync(&conn).unwrap();
         assert!(sync.iter().all(|u| !u.starts_with("rsshub://")));

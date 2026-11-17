@@ -565,22 +565,42 @@ async fn poll_x_feeds(
         };
         match x::fetch_user_tweets(client, &auth_token, &ct0, &handle, &mut state).await {
             Ok(page) => {
-                // Map to articles before taking the DB lock — the HTML
-                // sanitization is CPU-bound and must not starve queries.
-                let articles: Vec<db::NewArticle> =
-                    page.tweets.iter().map(x::tweet_to_article).collect();
-                let inserted = upsert_articles(db, *feed_id, &articles, dedup, rules, "x").await;
-                total_new += inserted;
                 let conn = db.lock().await;
-                // Re-render rows that already existed. Without this a tweet
-                // stored before a renderer change would keep its old markup
-                // forever: re-fetching the same guid is a dedup hit, never a
-                // rewrite. Same for the junk a previous web extraction may have
-                // stored (cleared by the same call).
-                // Idempotent: rows whose markup already matches are skipped
-                // inside the helper, so this is one cheap SELECT per tweet.
-                for article in &articles {
-                    let _ = db::refresh_parser_article(&conn, *feed_id, article);
+                for tweet in &page.tweets {
+                    let article = x::tweet_to_article(tweet);
+                    let mut write_ok = false;
+                    match db::upsert_article(&conn, *feed_id, &article, dedup, rules) {
+                        Ok(true) => {
+                            total_new += 1;
+                            write_ok = true;
+                        }
+                        Ok(false) => {
+                            // Re-render rows that already existed: without this a
+                            // tweet stored before a renderer change or before its
+                            // full article was fetched keeps the old markup.
+                            match db::refresh_parser_article_with_status(&conn, *feed_id, &article) {
+                                Ok(
+                                    db::ParserRefreshOutcome::Updated
+                                    | db::ParserRefreshOutcome::Unchanged,
+                                ) => write_ok = true,
+                                Ok(db::ParserRefreshOutcome::NotFound) => {}
+                                Err(e) => {
+                                    log::warn!(
+                                        "x parser: refresh_parser_article failed (feed {feed_id}, guid {}): {e}",
+                                        article.guid
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("x parser: upsert failed (feed {feed_id}, guid {}): {e}", article.guid);
+                        }
+                    }
+                    // If inserting or updating an enriched article failed, drop
+                    // its mark before `state.save` so the next cycle can retry.
+                    if !write_ok && tweet.is_article {
+                        state.unmark_enriched(&handle, &tweet.id);
+                    }
                 }
                 let _ = db::touch_feed(&conn, *feed_id);
             }

@@ -293,6 +293,7 @@ pub fn run() {
             commands::ai_summarize,
             commands::default_summary_prompt,
             commands::ai_ask,
+            commands::ai_article_chat,
             commands::ai_digest,
             commands::ai_translate,
             commands::translate_article_preview,

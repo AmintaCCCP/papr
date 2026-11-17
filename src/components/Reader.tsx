@@ -28,6 +28,7 @@ import TagPicker from "./TagPicker";
 import HighlightLayer from "./HighlightLayer";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import Lightbox from "./Lightbox";
+import AIChatPanel from "./AIChatPanel";
 
 interface Props {
   onToast: (msg: string) => void;
@@ -190,6 +191,8 @@ export default function Reader({ onToast }: Props) {
   const setFocusMode = useUi((s) => s.setFocusMode);
   const aiOpen = useUi((s) => s.aiOpen);
   const setAiOpen = useUi((s) => s.setAiOpen);
+  const aiChatOpen = useUi((s) => s.aiChatOpen);
+  const setAiChatOpen = useUi((s) => s.setAiChatOpen);
   const autoSummarize = useUi((s) => s.prefs.autoSummarize);
   const markReadOnOpen = useUi((s) => s.prefs.markReadOnOpen);
   const markReadOnScroll = useUi((s) => s.prefs.markReadOnScroll);
@@ -369,6 +372,9 @@ export default function Reader({ onToast }: Props) {
     // The summary card is per-article: close it so the next article starts
     // fresh (the auto-summarize preference re-opens it below when enabled).
     setAiOpen(false);
+    // The AI-chat sidebar is per-article too — its conversation is grounded
+    // in this article, so a switch remounts the pane closed and empty.
+    setAiChatOpen(false);
     autoSummarizedRef.current = null;
     // The open-mode marker resets with the view it books: the reset above
     // already put the reader back on the default body, so the next open of
@@ -1114,6 +1120,25 @@ export default function Reader({ onToast }: Props) {
           <Icon name={aiOpen ? "sparkle-fill" : "sparkle"} size={16} />
         </button>
         <button
+          className={`tb-btn ${aiChatOpen ? "on" : ""}`}
+          title={t("reader.tbAiChat")}
+          aria-label={t("reader.tbAiChat")}
+          aria-pressed={aiChatOpen}
+          onClick={() => {
+            // The chat sidebar slides over the reading view — leave the
+            // original page view when the button is pressed from there, the
+            // native child webview would otherwise float above the pane.
+            if (readerView === "web") {
+              setReaderView("reader");
+              setAiChatOpen(true);
+              return;
+            }
+            setAiChatOpen(!aiChatOpen);
+          }}
+        >
+          <Icon name="chat" size={16} />
+        </button>
+        <button
           className="tb-btn"
           title={t("reader.tbShare")}
           aria-label={t("reader.tbShare")}
@@ -1170,7 +1195,14 @@ export default function Reader({ onToast }: Props) {
             title={t("reader.tbWebView")}
             aria-label={t("reader.tbWebView")}
             aria-pressed={readerView === "web"}
-            onClick={() => setReaderView(readerView === "web" ? "reader" : "web")}
+            onClick={() => {
+              const next = readerView === "web" ? "reader" : "web";
+              // Mirror the chat→web direction below: entering the original
+              // page view closes the chat pane, so the native child webview
+              // never overlaps a still-open conversation.
+              if (next === "web") setAiChatOpen(false);
+              setReaderView(next);
+            }}
           >
             <Icon name="eye" size={16} />
           </button>
@@ -1476,6 +1508,16 @@ export default function Reader({ onToast }: Props) {
         />
       )}
 
+      {/* The AI-chat sidebar: per-article Q&A over the reading view, opened
+          from the toolbar or the article context menu. Keyed by article id so
+          a switch remounts the pane with an empty conversation. */}
+      <AIChatPanel
+        key={a.id}
+        article={a}
+        open={aiChatOpen}
+        onClose={() => setAiChatOpen(false)}
+      />
+
       {ctxMenu && (
         <ContextMenu
           x={ctxMenu.x}
@@ -1512,6 +1554,11 @@ export default function Reader({ onToast }: Props) {
               icon: aiOpen ? "sparkle-fill" : "sparkle",
               label: t("reader.tbAiSummary"),
               onClick: () => setAiOpen(!aiOpen),
+            },
+            {
+              icon: "chat",
+              label: t("reader.tbAiChat"),
+              onClick: () => setAiChatOpen(!aiChatOpen),
             },
             ...(canTranslate
               ? [
