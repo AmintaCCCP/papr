@@ -578,8 +578,12 @@ async fn poll_x_feeds(
                             // Re-render rows that already existed: without this a
                             // tweet stored before a renderer change or before its
                             // full article was fetched keeps the old markup.
-                            match db::refresh_parser_article(&conn, *feed_id, &article) {
-                                Ok(_) => write_ok = true,
+                            match db::refresh_parser_article_with_status(&conn, *feed_id, &article) {
+                                Ok(
+                                    db::ParserRefreshOutcome::Updated
+                                    | db::ParserRefreshOutcome::Unchanged,
+                                ) => write_ok = true,
+                                Ok(db::ParserRefreshOutcome::NotFound) => {}
                                 Err(e) => {
                                     log::warn!(
                                         "x parser: refresh_parser_article failed (feed {feed_id}, guid {}): {e}",

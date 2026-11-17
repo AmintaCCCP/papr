@@ -1014,14 +1014,25 @@ fn text_source(
 ) -> (String, Vec<TextEntity>, Vec<XMedia>) {
     if let Some((note_text, entity_set)) = note_body(result) {
         let mut entities = Vec::new();
-        // Anchors: `entity_set.urls` entries carry the legacy shape
-        // (t.co url, expanded_url, UTF-16 indices into the *full* text).
+        let u16_b = utf16_boundaries(note_text);
+        let char_b = char_boundaries(note_text);
+        let u16_range_to_char = |s16: usize, e16: usize| -> Option<(usize, usize)> {
+            let bs = utf16_to_byte(&u16_b, s16)?;
+            let be = utf16_to_byte(&u16_b, e16)?;
+            Some((byte_to_char(&char_b, bs)?, byte_to_char(&char_b, be)?))
+        };
+        // Anchors: `entity_set.urls` entries carry UTF-16 indices into the
+        // *full* text; normalize them to Unicode code-point indices so the
+        // entire `entities` vec shares one unit with `split_on_entities`.
         if let Some(urls) = entity_set
             .and_then(|es| es.get("urls"))
             .and_then(|u| u.as_array())
         {
             for url in urls {
-                let Some((start, end)) = entity_indices(url) else {
+                let Some((s16, e16)) = entity_indices(url) else {
+                    continue;
+                };
+                let Some((start, end)) = u16_range_to_char(s16, e16) else {
                     continue;
                 };
                 entities.push(TextEntity {
@@ -1043,12 +1054,14 @@ fn text_source(
             .and_then(|m| m.as_array());
         if let Some(list) = note_media {
             for m in list {
-                if let Some((start, end)) = entity_indices(m) {
-                    entities.push(TextEntity {
-                        start,
-                        end,
-                        href: None,
-                    });
+                if let Some((s16, e16)) = entity_indices(m) {
+                    if let Some((start, end)) = u16_range_to_char(s16, e16) {
+                        entities.push(TextEntity {
+                            start,
+                            end,
+                            href: None,
+                        });
+                    }
                 }
             }
         } else {
@@ -2319,21 +2332,47 @@ pub fn extract_query_ids_from_bundle(bundle: &str) -> Option<QueryIds> {
 /// both argument shapes are searched.
 fn find_query_id_in_bundle(bundle: &str, operation: &str) -> Option<String> {
     let forward_suffix = format!("\",operationName:\"{operation}\"");
-    if let Some(id) = find_between(bundle, "queryId:\"", &forward_suffix) {
-        return Some(id);
+    for (op_pos, _) in bundle.match_indices(&forward_suffix) {
+        let prefix = &bundle[..op_pos];
+        let mut win_start = op_pos.saturating_sub(400);
+        while !bundle.is_char_boundary(win_start) {
+            win_start += 1;
+        }
+        let local = &prefix[win_start..];
+        let obj_start = local.rfind(['{', '}']).map_or(0, |i| i + 1);
+        let obj = &local[obj_start..];
+        if let Some(qid_pos) = obj.rfind("queryId:\"") {
+            let captured = &obj[qid_pos + "queryId:\"".len()..];
+            if !captured.is_empty()
+                && captured
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Some(captured.to_string());
+            }
+        }
     }
     // Reversed order: anchor at the operation name, then look ahead only
     // within the same registration object — crossing a brace would read the
     // next operation's queryId, and a deterministic wrong id fails forever
     // (404 → re-extract → same wrong id), so the brace guard matters.
     let anchor = format!("operationName:\"{operation}\"");
-    let anchor_start = bundle.find(&anchor)?;
-    let window = &bundle[anchor_start..(anchor_start + 400).min(bundle.len())];
-    let window = match window.find(['{', '}']) {
-        Some(brace) => &window[..brace],
-        None => window,
-    };
-    find_between(window, "queryId:\"", "\"")
+    for (anchor_start, _) in bundle.match_indices(&anchor) {
+        let rest = &bundle[anchor_start..];
+        let mut win_end = 400.min(rest.len());
+        while !rest.is_char_boundary(win_end) {
+            win_end -= 1;
+        }
+        let window = &rest[..win_end];
+        let window = match window.find(['{', '}']) {
+            Some(brace) => &window[..brace],
+            None => window,
+        };
+        if let Some(id) = find_between(window, "queryId:\"", "\"") {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// First `prefix<capture>suffix` occurrence where the capture is limited to
@@ -2802,6 +2841,15 @@ mod tests {
             ids.user_by_screen_name.as_deref(),
             Some(FALLBACK_USER_BY_SCREEN_NAME_ID)
         );
+        // Target operation is NOT the first registration in forward order, and
+        // multi-byte UTF-8 characters near the 400-byte window boundary do not panic.
+        let pad = "中".repeat(150);
+        let later_bundle = format!(
+            r#"register({{queryId:"OTHER000",operationName:"OtherOp"}});register({{queryId:"TARGET111",operationName:"UserTweets"}});register({{operationName:"TweetDetail",queryId:"TARGET222",extra:"{pad}"}})"#
+        );
+        let ids2 = extract_query_ids_from_bundle(&later_bundle).unwrap();
+        assert_eq!(ids2.user_tweets.as_deref(), Some("TARGET111"));
+        assert_eq!(ids2.tweet_detail.as_deref(), Some("TARGET222"));
     }
 
     #[test]
@@ -3056,8 +3104,10 @@ mod tests {
                 .contains(r#"<a href="https://example.com/long">https://t.co/long</a>"#)
         );
         // The trailing t.co media placeholder is dropped from the text and
-        // the photo renders below instead — once.
+        // the photo renders below instead — once, with no leftover leading char.
         assert!(!t.content_html.contains("t.co/pic"));
+        assert!(!t.content_html.contains("在其中 h"));
+        assert!(!t.text.contains("在其中 h"));
         assert_eq!(
             t.content_html
                 .matches(r#"<img src="https://pbs.twimg.com/media/note.jpg""#)

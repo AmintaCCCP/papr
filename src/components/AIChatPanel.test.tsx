@@ -67,11 +67,8 @@ vi.mock("../api", async (importOriginal) => {
   };
 });
 
-vi.mock("sonner", () => ({
+vi.mock("../toast", () => ({
   toast: { error: (...args: unknown[]) => h.toastError(...args) },
-}));
-
-vi.mock("../lib/error", () => ({
   reportError: (...args: unknown[]) => h.reportError(...args),
 }));
 

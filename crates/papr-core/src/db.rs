@@ -1182,7 +1182,29 @@ pub fn article_feed_source_type(conn: &Connection, article_id: i64) -> AppResult
 /// AI summary are deliberately left alone. A non-empty incoming enclosure
 /// list replaces the stored one, so a card-to-fulltext upgrade carries its
 /// video media along; an empty list never clears what is stored.
+/// Outcome of refreshing an existing parser-owned article row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserRefreshOutcome {
+    /// The row existed and at least one column changed.
+    Updated,
+    /// The row existed and already matched (or was protected by the downgrade guard).
+    Unchanged,
+    /// No row matched `(feed_id, guid)` (e.g. skipped by dedup or retention tombstone).
+    NotFound,
+}
+
 pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -> AppResult<bool> {
+    Ok(matches!(
+        refresh_parser_article_with_status(conn, feed_id, a)?,
+        ParserRefreshOutcome::Updated
+    ))
+}
+
+pub fn refresh_parser_article_with_status(
+    conn: &Connection,
+    feed_id: i64,
+    a: &NewArticle,
+) -> AppResult<ParserRefreshOutcome> {
     /// The stored renderer-owned columns of one parser article row.
     type StoredRow = (
         i64,
@@ -1221,7 +1243,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
         stored_summary,
     )) = existing
     else {
-        return Ok(false);
+        return Ok(ParserRefreshOutcome::NotFound);
     };
     // Idempotent: a refresh usually re-renders the same tweet to the same HTML,
     // and rewriting identical bytes would churn WAL pages and re-index FTS.
@@ -1247,7 +1269,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             .as_deref()
             .is_some_and(|h| h.contains(r#"class="x-article-body""#))
     {
-        return Ok(false);
+        return Ok(ParserRefreshOutcome::Unchanged);
     }
     let effective_body = if a.body_text.is_empty() {
         body_text.clone()
@@ -1268,16 +1290,20 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     // card row whose detail upgrade re-renders to the same markup).
     let url_backfill = a.url.is_some() && stored_url.as_deref() != a.url.as_deref();
     if !rendered_differs && !stale_extraction && !url_backfill {
-        return Ok(false);
+        return Ok(ParserRefreshOutcome::Unchanged);
     }
-    // When the body itself changed, every rendering derived from the OLD body
-    // is stale too: a title-card row the user already had translated or
-    // summarized must not come back with the fresh full text next to a
-    // translation/summary of the old card. A title change clears the title
-    // translation specifically; URL-only backfills and extraction clears keep
-    // the caches (the visible text did not change).
+    // When the body itself changed — including when clearing `extracted_html`
+    // switches the effective body source back to `content_html` — every
+    // rendering derived from the OLD body is stale too. A title change clears
+    // the title translation specifically; URL-only backfills (with no
+    // effective-body change) keep the caches.
     let title_changed = stored_title != a.title;
+    let prev_effective_html = extracted_html
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(content_html.as_deref());
     let body_changed = content_html.as_deref() != a.content_html.as_deref()
+        || prev_effective_html != a.content_html.as_deref()
         || body_text != effective_body
         || stored_summary != a.summary;
 
@@ -1332,7 +1358,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
         params![id, a.title, effective_body],
     )?;
     tx.commit()?;
-    Ok(true)
+    Ok(ParserRefreshOutcome::Updated)
 }
 
 /// One parser feed handed to the refresh leg: the row id, the parser that

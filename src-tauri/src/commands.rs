@@ -304,7 +304,16 @@ async fn add_x_feed(
     let rules = db::active_rules(&tx).unwrap_or_default();
     for tweet in &page.tweets {
         let article = parsers::x::tweet_to_article(tweet);
-        db::upsert_article(&tx, feed_id, &article, dedup, &rules)?;
+        let Some(effects) = db::article_precheck(&tx, feed_id, &article, dedup, &rules)? else {
+            continue;
+        };
+        if effects.rewrites.is_empty() {
+            db::insert_article_row(&tx, feed_id, &article, effects.read, effects.starred)?;
+        } else {
+            let mut rewritten = article.clone();
+            db::apply_rewrites(&mut rewritten, &effects.rewrites);
+            db::insert_article_row(&tx, feed_id, &rewritten, effects.read, effects.starred)?;
+        }
     }
     parser_state.save(&tx);
     tx.commit()?;
@@ -2280,6 +2289,9 @@ pub enum TranslateEvent {
     Batch { html: String, done: usize },
     /// The full sanitized translation, sent once on completion.
     Done { html: String },
+    /// The article's source text or title changed while translation was in
+    /// flight, so the stale result was discarded.
+    Discarded,
 }
 
 #[derive(Debug, Serialize)]
@@ -2555,18 +2567,20 @@ pub async fn ai_translate(
     };
     if !final_html.is_empty() {
         let conn = state.db.lock().await;
-        // Verify the original source text has not changed (e.g. upgraded from
-        // a title card to full text by a background refresh) while translation
-        // was in flight. If the source changed, discard the stale translation.
-        let current_source = db::get_article(&conn, article_id)
-            .ok()
-            .and_then(|d| {
+        // Verify neither the original source text nor the title changed (e.g.
+        // upgraded from a title card to full text or edited by a background
+        // refresh) while translation was in flight.
+        let (current_source, current_title) = match db::get_article(&conn, article_id) {
+            Ok(d) => (
                 d.extracted_html
                     .filter(|s| !s.trim().is_empty())
                     .or(d.content_html)
-            })
-            .unwrap_or_default();
-        if current_source == source_html {
+                    .unwrap_or_default(),
+                d.title,
+            ),
+            Err(_) => (String::new(), String::new()),
+        };
+        if current_source == source_html && current_title == article_title {
             db::set_translation(
                 &conn,
                 article_id,
@@ -2577,8 +2591,9 @@ pub async fn ai_translate(
             let _ = on_event.send(TranslateEvent::Done { html: final_html });
         } else {
             log::info!(
-                "ai_translate: original text for article {article_id} changed in background; discarding stale translation"
+                "ai_translate: original text or title for article {article_id} changed in background; discarding stale translation"
             );
+            let _ = on_event.send(TranslateEvent::Discarded);
         }
     } else {
         let _ = on_event.send(TranslateEvent::Done { html: final_html });
