@@ -290,11 +290,10 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<ChallengeHop> 
             cookies: Vec::new(),
         });
     }
-    if rest.starts_with("location.href") {
-        // The identifier must end here: `location.hrefs` or
-        // `location.href.split('?')[0]` is a different expression the
-        // evaluator does not model.
-        let tail = &rest["location.href".len()..];
+    // The identifier must end here: `location.hrefs` or
+    // `location.href.split('?')[0]` is a different expression the evaluator
+    // does not model.
+    if let Some(tail) = rest.strip_prefix("location.href") {
         let delimited = tail
             .chars()
             .next()
