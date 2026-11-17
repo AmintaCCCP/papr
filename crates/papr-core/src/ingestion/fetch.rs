@@ -290,15 +290,14 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<ChallengeHop> 
             cookies: Vec::new(),
         });
     }
-    // The identifier must end here: `location.hrefs` or
-    // `location.href.split('?')[0]` is a different expression the evaluator
-    // does not model.
+    // The call's argument must end at the identifier: after optional
+    // whitespace the closing `)` has to follow. `location.hrefs`,
+    // `location.href.split('?')[0]`, `location.href + "?x"` and friends are
+    // expressions the evaluator does not model — navigating to the bare URL
+    // on their behalf would request an address the browser never visits.
     if let Some(tail) = rest.strip_prefix("location.href") {
-        let delimited = tail
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '.' && c != '[');
-        if delimited {
+        let ends_the_call = tail.trim_start().starts_with(')');
+        if ends_the_call {
             // Cookie reload: the browser re-fetches the same URL, now
             // carrying the cookie the script computed. Without a computable
             // cookie the reload is a loop — reject.
@@ -433,14 +432,28 @@ fn cookie_assignments(scripts: &[&str], scheme_https: bool) -> Vec<(String, Stri
                 continue;
             }
             // A computed string: evaluate and remember, so a later
-            // `document.cookie="x="+NAME` reads the final value.
-            if let Some(value) = eval_cookie_expr(after, &vars, scheme_https) {
-                vars.insert(name, JsVal::Str(value));
+            // `document.cookie="x="+NAME` reads the final value. A failed
+            // re-declaration invalidates the previous binding, matching the
+            // browser where the throwing statement aborts the script and
+            // leaves nothing for later assignments to read.
+            match eval_cookie_expr(after, &vars, scheme_https) {
+                Some(value) => {
+                    vars.insert(name, JsVal::Str(value));
+                }
+                None => {
+                    vars.remove(&name);
+                }
             }
         }
     }
     cookies
 }
+
+/// Length ceiling for any string the challenge evaluator produces or caches:
+/// the real pass cookies are tens of bytes, so 4 KiB is generous, while a
+/// doubling chain (`var v="x";var v=v+v;…` ×32) inside a 2 KiB page would
+/// otherwise build multi-GiB intermediates from tiny input.
+const MAX_EVALUATED_STRING_BYTES: usize = 4 * 1024;
 
 /// Evaluate a JS string-valued *concatenation expression* — the RHS of a
 /// `document.cookie=` assignment or a computed `var` declaration, starting
@@ -483,6 +496,11 @@ fn eval_cookie_expr(
             }
             _ => return None,
         };
+        // The doubling-chain budget: refuse the expression before building a
+        // string that would blow memory (see [`MAX_EVALUATED_STRING_BYTES`]).
+        if out.len() + value.len() > MAX_EVALUATED_STRING_BYTES {
+            return None;
+        }
         out.push_str(&value);
         rest = rest[len..].trim_start();
         match rest.chars().next() {
@@ -988,9 +1006,10 @@ location.replace(location.href)</script></html>";
 
     #[test]
     fn location_href_must_end_at_the_identifier() {
-        // `location.hrefs`, `location.href.split('?')[0]` and friends are
-        // different expressions the evaluator does not model — navigating to
-        // base_url on their behalf would guess wrong.
+        // `location.hrefs`, `location.href.split('?')[0]`, `location.href +
+        // "?token=1"` (even across whitespace) are different expressions the
+        // evaluator does not model — navigating to base_url on their behalf
+        // would request an address the browser never visits.
         let with_method = b"<html><script>var p=[\"x\"];\
 document.cookie=\"a=\"+p[0]+\"; path=/\";\
 location.replace(location.href.split('?')[0])</script></html>";
@@ -998,6 +1017,50 @@ location.replace(location.href.split('?')[0])</script></html>";
         let typo = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
 location.replace(location.hrefs)</script></html>";
         assert_eq!(js_redirect_target(typo, "https://example.com/feed"), None);
+        let concat = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href + \"?token=1\")</script></html>";
+        assert_eq!(js_redirect_target(concat, "https://example.com/feed"), None);
+        // Whitespace between the identifier and the closing paren is fine.
+        let spaced = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href )</script></html>";
+        assert!(js_redirect_target(spaced, "https://example.com/feed").is_some());
+    }
+
+    #[test]
+    fn failed_redeclaration_invalidates_the_previous_binding() {
+        // `var v=unknown()` throws in a browser and aborts the script — the
+        // earlier `v` must not leak into the cookie assignment.
+        let stale = b"<html><script>var v=\"old\";var v=unknown();\
+document.cookie=\"a=\"+v+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(stale, "https://example.com/feed"), None);
+    }
+
+    #[test]
+    fn doubling_chains_hit_the_length_budget() {
+        // 32 doublings from one byte would build a multi-GiB string in a
+        // 2 KiB page; the evaluator's budget refuses the expression, the
+        // binding dies with it, and the reload is rejected — bounded memory.
+        let mut script = String::from("<html><script>var v=\"x\";");
+        for _ in 0..32 {
+            script.push_str("var v=v+v;");
+        }
+        script.push_str(
+            "document.cookie=\"a=\"+v+\"; path=/\";location.replace(location.href)</script></html>",
+        );
+        let page = script.into_bytes();
+        assert_eq!(js_redirect_target(&page, "https://example.com/feed"), None);
+        // A modest chain still evaluates (the budget is a ceiling, not a ban).
+        let mut script = String::from("<html><script>var v=\"abcd\";");
+        for _ in 0..4 {
+            script.push_str("var v=v+v;");
+        }
+        script.push_str(
+            "document.cookie=\"a=\"+v+\"; path=/\";location.replace(location.href)</script></html>",
+        );
+        let page = script.into_bytes();
+        let hop = js_redirect_target(&page, "https://example.com/feed").expect("challenge");
+        assert_eq!(hop.cookies, vec![("a".to_string(), "abcd".repeat(16))]);
     }
 
     #[test]

@@ -649,8 +649,10 @@ fn build_child_env(
     // the system keychain (Surge's generated CA, a corporate inspector) makes
     // every route fetch to an intercepted host fail with `self-signed
     // certificate in certificate chain`. `NODE_USE_SYSTEM_CA` adds the OS
-    // store alongside the bundled one (Node ≥ 22.15), so routes reach those
-    // hosts exactly like the desktop app's own client does.
+    // store alongside the bundled one (supported from Node 22.19.0 and
+    // 24.6.0; on older engines the variable is simply ignored and the
+    // behaviour is unchanged), so routes reach those hosts exactly like the
+    // desktop app's own client does.
     env.insert("NODE_USE_SYSTEM_CA".into(), "1".into());
     let bundled_browser = version_dir.join("browser");
     if bundled_browser.is_dir() {
