@@ -6,21 +6,24 @@ on:
 
 jobs:
   claude-review:
-    if: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
       issues: read
       id-token: write
+    env:
+      TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
     steps:
       - name: Checkout repository
+        if: env.TOKEN != ''
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Run Claude Code Review
+        if: env.TOKEN != ''
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
