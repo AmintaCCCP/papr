@@ -1216,8 +1216,8 @@ button { font-family: inherit; }
 .article-body .x-quote {
   margin: 12px 0 0;
   padding: 11px 13px 12px;
-  border-left: 2px solid var(--hair);
-  border-radius: 0 10px 10px 0;
+  border: 1px solid var(--hair);
+  border-radius: 10px;
   background: var(--hover);
   color: var(--ink);
   font-style: normal;

@@ -650,11 +650,35 @@ struct TextEntity {
     href: Option<String>,
 }
 
-/// Convert UTF-16 code-unit offsets (the API's `indices` contract) to byte
-/// offsets. An offset that lands inside an astral char (emoji) maps to that
-/// char's start boundary; an offset at/past the text's end maps to the text
-/// end (the terminal entry), so an over-long entity range clamps instead of
-/// leaking the last character past the cut.
+/// Convert Unicode code-point (char) offsets (X's `entities[].indices`
+/// contract) to byte offsets. An offset at/past the text's end maps to the
+/// text end (the terminal entry).
+fn char_boundaries(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(text.len() + 1);
+    for (chars, (byte_idx, _)) in text.char_indices().enumerate() {
+        out.push((chars, byte_idx));
+    }
+    out.push((text.chars().count(), text.len()));
+    out
+}
+
+fn char_to_byte(boundaries: &[(usize, usize)], offset: usize) -> Option<usize> {
+    boundaries
+        .iter()
+        .rev()
+        .find(|(c, _)| *c <= offset)
+        .map(|(_, b)| *b)
+}
+
+fn byte_to_char(boundaries: &[(usize, usize)], byte: usize) -> Option<usize> {
+    boundaries
+        .iter()
+        .find(|(_, b)| *b == byte)
+        .map(|(c, _)| *c)
+}
+
+/// Convert UTF-16 code-unit offsets (DraftJS `content_state` `entityRanges` /
+/// `inlineStyleRanges` contract) to byte offsets.
 fn utf16_boundaries(text: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(text.len() + 1);
     let mut utf16 = 0usize;
@@ -674,14 +698,14 @@ fn utf16_to_byte(boundaries: &[(usize, usize)], offset: usize) -> Option<usize> 
         .map(|(_, b)| *b)
 }
 
-/// Split `full_text` on `entities` (sorted by start, UTF-16 indices) into
-/// segments. `render` turns each entity into its replacement fragment.
+/// Split `full_text` on `entities` (sorted by start, Unicode code-point indices)
+/// into segments. `render` turns each entity into its replacement fragment.
 fn split_on_entities(
     full_text: &str,
     entities: &[TextEntity],
     render: impl Fn(&TextEntity, &str) -> String,
 ) -> String {
-    let boundaries = utf16_boundaries(full_text);
+    let boundaries = char_boundaries(full_text);
     let mut sorted: Vec<&TextEntity> = entities.iter().collect();
     sorted.sort_by_key(|e| e.start);
 
@@ -689,8 +713,8 @@ fn split_on_entities(
     let mut pos = 0usize; // byte offset
     for entity in sorted {
         let (Some(start), Some(end)) = (
-            utf16_to_byte(&boundaries, entity.start),
-            utf16_to_byte(&boundaries, entity.end),
+            char_to_byte(&boundaries, entity.start),
+            char_to_byte(&boundaries, entity.end),
         ) else {
             continue;
         };
@@ -980,12 +1004,6 @@ fn entity_indices(entry: &serde_json::Value) -> Option<(usize, usize)> {
     ))
 }
 
-/// The UTF-16 offset of a byte offset inside `text` (a text-boundary map
-/// lookup — `find` yields bytes, the entity contract is UTF-16).
-fn byte_to_utf16(boundaries: &[(usize, usize)], byte: usize) -> Option<usize> {
-    boundaries.iter().find(|(_, b)| *b == byte).map(|(u, _)| *u)
-}
-
 /// The text source for one tweet result: the full note body when the payload
 /// carries a long-form note, otherwise the legacy `full_text`. Returns
 /// `(text, entities, media)` — the entities are indices into `text`, and the
@@ -1043,7 +1061,7 @@ fn text_source(
                 .or_else(|| legacy.pointer("/entities/media"))
                 .and_then(|m| m.as_array());
             if let Some(legacy_media) = legacy_media {
-                let boundaries = utf16_boundaries(note_text);
+                let boundaries = char_boundaries(note_text);
                 for m in legacy_media {
                     // An empty `url` would make `find("")` match forever without
                     // advancing — skip it.
@@ -1058,8 +1076,8 @@ fn text_source(
                     while let Some(rel) = note_text[from..].find(tco) {
                         let at = from + rel;
                         if let (Some(start), Some(end)) = (
-                            byte_to_utf16(&boundaries, at),
-                            byte_to_utf16(&boundaries, at + tco.len()),
+                            byte_to_char(&boundaries, at),
+                            byte_to_char(&boundaries, at + tco.len()),
                         ) {
                             entities.push(TextEntity {
                                 start,
@@ -3399,21 +3417,34 @@ mod tests {
     }
 
     #[test]
-    fn utf16_indices_survive_emoji() {
-        // 😀 is an astral char: 2 UTF-16 units, 4 UTF-8 bytes. The entity's
-        // indices are UTF-16 — a byte-based slicer would garble the tweet.
-        // UTF-16 map of "😀 hi there": 😀=0..2, ' '=2, h=3, i=4, ' '=5, …
+    fn char_indices_survive_emoji() {
+        // X's `entities.urls[].indices` are Unicode code-point (char) offsets:
+        // 😀 is 1 code point (4 UTF-8 bytes, 2 UTF-16 units).
+        // Code-point map of "😀 hi there": 😀=0, ' '=1, h=2, i=3, ' '=4, …
         let full_text = "😀 hi there";
         let entities = vec![TextEntity {
-            start: 3,
-            end: 4,
+            start: 2,
+            end: 3,
             href: Some("https://example.com".into()),
         }];
-        // Only a UTF-16-aware mapping slices the 'h' of "hi" (byte offset 5).
         let html = render_tweet_html(full_text, &entities, &[]);
         assert!(html.starts_with("😀 <a href=\"https://example.com\">h</a>i there"));
         let text = tweet_plain_text(full_text, &entities);
         assert_eq!(text, "😀 https://example.comi there");
+
+        // Regression from live payload: multiple astral emojis before a t.co
+        // link must slice the exact t.co range rather than shifting left by the
+        // extra UTF-16 surrogate units.
+        let live_text = "感谢 @quanruzhuoxiu   ，我们持续发货🚢\n\n关注我们 👉 https://t.co/WtckFYQ20q";
+        let live_entities = vec![TextEntity {
+            start: 37,
+            end: 60,
+            href: Some("https://github.com/nexu-io/openmotion".into()),
+        }];
+        let live_html = render_tweet_html(live_text, &live_entities, &[]);
+        assert!(live_html.contains(
+            r#"关注我们 👉 <a href="https://github.com/nexu-io/openmotion">https://t.co/WtckFYQ20q</a>"#
+        ));
     }
 
     #[test]
