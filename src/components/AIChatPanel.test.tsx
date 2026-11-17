@@ -9,31 +9,55 @@ import { useUi } from "../store";
 // assistant bubble, and a failed send offering a retry that re-asks the same
 // question with the prior turns as history.
 
-const h = vi.hoisted(() => ({
-  article: {
-    id: 7,
-    feedId: 1,
-    feedTitle: "Example Feed",
-    sourceType: "rss" as const,
-    title: "An Article",
-    author: null,
-    url: "https://example.com/a1",
-    contentHtml: "<p>hello world</p>",
-    extractedHtml: null,
-    imageUrl: null,
-    publishedAt: null,
-    isRead: true,
-    isStarred: false,
-    readLater: false,
-    aiSummary: null,
-    translatedHtml: null,
-    translatedLang: null,
-    translatedTitle: null,
-    enclosures: [],
-    tags: [],
-  },
-  aiArticleChat: vi.fn(),
-}));
+const h = vi.hoisted(() => {
+  if (
+    typeof globalThis.localStorage === "undefined" ||
+    typeof globalThis.localStorage?.getItem !== "function"
+  ) {
+    const store = new Map<string, string>();
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          store.set(k, String(v));
+        },
+        removeItem: (k: string) => {
+          store.delete(k);
+        },
+        clear: () => store.clear(),
+      },
+    });
+  }
+
+  return {
+    article: {
+      id: 7,
+      feedId: 1,
+      feedTitle: "Example Feed",
+      sourceType: "rss" as const,
+      title: "An Article",
+      author: null,
+      url: "https://example.com/a1",
+      contentHtml: "<p>hello world</p>",
+      extractedHtml: null,
+      imageUrl: null,
+      publishedAt: null,
+      isRead: true,
+      isStarred: false,
+      readLater: false,
+      aiSummary: null,
+      translatedHtml: null,
+      translatedLang: null,
+      translatedTitle: null,
+      enclosures: [],
+      tags: [],
+    },
+    aiArticleChat: vi.fn(),
+    toastError: vi.fn(),
+    reportError: vi.fn(),
+  };
+});
 
 vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
@@ -42,6 +66,14 @@ vi.mock("../api", async (importOriginal) => {
     aiArticleChat: h.aiArticleChat,
   };
 });
+
+vi.mock("sonner", () => ({
+  toast: { error: (...args: unknown[]) => h.toastError(...args) },
+}));
+
+vi.mock("../lib/error", () => ({
+  reportError: (...args: unknown[]) => h.reportError(...args),
+}));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }));
 
@@ -62,6 +94,8 @@ async function ask(question: string, container: HTMLElement) {
 describe("AIChatPanel", () => {
   beforeEach(() => {
     h.aiArticleChat.mockReset();
+    h.toastError.mockReset();
+    h.reportError.mockReset();
     useUi.setState({ aiChatWidth: 360 });
   });
   afterEach(() => cleanup());
@@ -191,5 +225,34 @@ describe("AIChatPanel", () => {
     const opened = render(<AIChatPanel article={h.article} open={true} onClose={() => {}} />);
     const openPane = opened.container.querySelector(".ai-chat") as HTMLElement;
     expect(openPane.className).toContain("open");
+  });
+
+  it("invalidates in-flight requests on unmount so errors do not surface globally", async () => {
+    let rejectPromise!: (err: unknown) => void;
+    let onTokenCallback!: (e: { type: string; data?: string }) => void;
+    h.aiArticleChat.mockImplementation(
+      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+        onTokenCallback = onToken;
+        return new Promise((_, reject) => {
+          rejectPromise = reject;
+        });
+      },
+    );
+
+    const { container, unmount } = renderPanel();
+    await ask("测试卸载请求", container);
+    expect(h.aiArticleChat).toHaveBeenCalledTimes(1);
+
+    // Unmount before the network response or stream failure settles
+    unmount();
+
+    // Emitting error event or rejecting promise after unmount must be ignored
+    await act(async () => {
+      onTokenCallback({ type: "error", data: "network aborted" });
+      rejectPromise(new Error("aborted"));
+    });
+
+    expect(h.toastError).not.toHaveBeenCalled();
+    expect(h.reportError).not.toHaveBeenCalled();
   });
 });

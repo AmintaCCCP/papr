@@ -1273,17 +1273,21 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
     // When the body itself changed, every rendering derived from the OLD body
     // is stale too: a title-card row the user already had translated or
     // summarized must not come back with the fresh full text next to a
-    // translation/summary of the old card. URL-only backfills and extraction
-    // clears keep the caches (the visible text did not change).
-    let body_changed =
-        content_html.as_deref() != a.content_html.as_deref() || body_text != effective_body;
+    // translation/summary of the old card. A title change clears the title
+    // translation specifically; URL-only backfills and extraction clears keep
+    // the caches (the visible text did not change).
+    let title_changed = stored_title != a.title;
+    let body_changed = content_html.as_deref() != a.content_html.as_deref()
+        || body_text != effective_body
+        || stored_summary != a.summary;
 
     let tx = conn.unchecked_transaction()?;
     // `url` follows when the incoming article carries one: an anonymous card
     // row stored without a permalink gains the real explore URL when its
     // detail is fetched later. `COALESCE` keeps an absent incoming URL from
-    // clearing a stored one. The derived caches follow `body_changed` —
-    // `CASE WHEN` on a bound flag, so a URL-only backfill can keep them.
+    // clearing a stored one. The derived caches follow `body_changed` and
+    // `title_changed` — `CASE WHEN` on bound flags, so a URL-only backfill
+    // keeps them.
     tx.execute(
         "UPDATE articles
             SET title = ?2, summary = ?3, content_html = ?4, body_text = ?5,
@@ -1293,7 +1297,7 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
                 extracted_html = NULL,
                 translated_html = CASE WHEN ?9 THEN NULL ELSE translated_html END,
                 translated_lang = CASE WHEN ?9 THEN NULL ELSE translated_lang END,
-                translated_title = CASE WHEN ?9 THEN NULL ELSE translated_title END,
+                translated_title = CASE WHEN ?10 THEN NULL ELSE translated_title END,
                 ai_summary = CASE WHEN ?9 THEN NULL ELSE ai_summary END
           WHERE id = ?1",
         params![
@@ -1305,7 +1309,8 @@ pub fn refresh_parser_article(conn: &Connection, feed_id: i64, a: &NewArticle) -
             a.image_url,
             a.published_at,
             a.url,
-            body_changed
+            body_changed,
+            title_changed
         ],
     )?;
     // Enclosures must follow the markup: the xiaohongshu pending-retry path
@@ -4442,15 +4447,16 @@ mod tests {
             ..stored.clone()
         };
         assert!(refresh_parser_article(&conn, feed_id, &backfill).unwrap());
-        let caches: (Option<String>, Option<String>) = conn
+        let caches: (Option<String>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT ai_summary, translated_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                "SELECT ai_summary, translated_html, translated_title FROM articles WHERE feed_id = ?1 AND guid = ?2",
                 params![feed_id, stored.guid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(caches.0.as_deref(), Some("旧卡片摘要"));
         assert_eq!(caches.1.as_deref(), Some("<p>旧译文</p>"));
+        assert_eq!(caches.2.as_deref(), Some("旧标题译文"));
 
         // The body itself changes (detail upgrade to the full article): the
         // derived caches are cleared.
@@ -4507,27 +4513,36 @@ mod tests {
             enclosures: Vec::new(),
         };
         assert!(upsert_article(&conn, feed_id, &stored, false, &[]).unwrap());
+        conn.execute(
+            "UPDATE articles SET translated_title = '作品译文', translated_html = '<p>译文</p>' WHERE feed_id = ?1",
+            params![feed_id],
+        )
+        .unwrap();
 
         // Same markup, same URL, empty body, but the title moved to the
         // work-type label: the refresh must report a change and store it.
+        // A title change invalidates the title translation cache specifically,
+        // while the unaffected body translation survives.
         let refreshed = NewArticle {
             title: "视频作品".into(),
-            summary: Some("视频作品".into()),
+            summary: Some("作品".into()),
             body_text: String::new(),
             ..stored.clone()
         };
         assert!(refresh_parser_article(&conn, feed_id, &refreshed).unwrap());
-        let (title, summary, body): (String, Option<String>, String) = conn
+        let (title, summary, body, trans_title, trans_html): (String, Option<String>, String, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT title, summary, body_text FROM articles WHERE feed_id = ?1 AND guid = ?2",
+                "SELECT title, summary, body_text, translated_title, translated_html FROM articles WHERE feed_id = ?1 AND guid = ?2",
                 params![feed_id, stored.guid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(title, "视频作品");
-        assert_eq!(summary.as_deref(), Some("视频作品"));
+        assert_eq!(summary.as_deref(), Some("作品"));
         // The stored caption survives the body-preservation contract.
         assert_eq!(body, "旧文案");
+        assert_eq!(trans_title, None);
+        assert_eq!(trans_html.as_deref(), Some("<p>译文</p>"));
 
         // Idempotent: a second identical refresh reports no change.
         assert!(!refresh_parser_article(&conn, feed_id, &refreshed).unwrap());

@@ -266,6 +266,10 @@ async fn add_x_feed(
         let conn = state.read().await;
         parsers::x::XState::load(&conn)
     };
+    // Subscribing anew to `handle`: clear any stale enrichment marks left over
+    // from a previously deleted subscription so newly ingested articles are
+    // enriched to their full text rather than skipped as already done.
+    parser_state.clear_enrichment(&handle);
     let page =
         parsers::x::fetch_user_tweets(&client, &auth_token, &ct0, &handle, &mut parser_state)
             .await
@@ -1078,8 +1082,22 @@ pub async fn search_feed_directory(
 
 #[tauri::command]
 pub async fn delete_feed(state: State<'_, AppState>, id: i64) -> AppResult<()> {
+    let feed_opt = {
+        let conn = state.read().await;
+        db::feed_by_id(&conn, id)?
+    };
     let conn = state.db.lock().await;
-    db::delete_feed(&conn, id)
+    db::delete_feed(&conn, id)?;
+    if let Some(feed) = feed_opt {
+        if feed.source_type == SourceType::X.as_str() {
+            if let Some(handle) = parsers::x::handle_from_feed_url(&feed.feed_url) {
+                let mut parser_state = parsers::x::XState::load(&conn);
+                parser_state.clear_enrichment(&handle);
+                parser_state.save(&conn);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2537,15 +2555,34 @@ pub async fn ai_translate(
     };
     if !final_html.is_empty() {
         let conn = state.db.lock().await;
-        db::set_translation(
-            &conn,
-            article_id,
-            &final_html,
-            &target,
-            translated_title.as_deref(),
-        )?;
+        // Verify the original source text has not changed (e.g. upgraded from
+        // a title card to full text by a background refresh) while translation
+        // was in flight. If the source changed, discard the stale translation.
+        let current_source = db::get_article(&conn, article_id)
+            .ok()
+            .and_then(|d| {
+                d.extracted_html
+                    .filter(|s| !s.trim().is_empty())
+                    .or(d.content_html)
+            })
+            .unwrap_or_default();
+        if current_source == source_html {
+            db::set_translation(
+                &conn,
+                article_id,
+                &final_html,
+                &target,
+                translated_title.as_deref(),
+            )?;
+            let _ = on_event.send(TranslateEvent::Done { html: final_html });
+        } else {
+            log::info!(
+                "ai_translate: original text for article {article_id} changed in background; discarding stale translation"
+            );
+        }
+    } else {
+        let _ = on_event.send(TranslateEvent::Done { html: final_html });
     }
-    let _ = on_event.send(TranslateEvent::Done { html: final_html });
     Ok(())
 }
 

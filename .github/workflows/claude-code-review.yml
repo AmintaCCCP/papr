@@ -6,6 +6,7 @@ on:
 
 jobs:
   claude-review:
+    if: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

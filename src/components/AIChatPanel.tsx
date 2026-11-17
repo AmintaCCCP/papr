@@ -71,6 +71,15 @@ export default function AIChatPanel({
     if (open) inputRef.current?.focus();
   }, [open]);
 
+  // Invalidate any in-flight run on unmount so delayed stream events or promise
+  // rejections from this panel cannot update state or show global error toasts
+  // after the user has navigated to another article.
+  useEffect(() => {
+    return () => {
+      runRef.current = 0;
+    };
+  }, []);
+
   // Follow the newest message while it streams in — but only while the user
   // hasn't scrolled up to re-read. Unconditional autoscroll would yank them
   // straight back down on every delta; scrolling back to the bottom re-arms

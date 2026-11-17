@@ -384,6 +384,22 @@ impl XState {
             .insert(tweet_id.to_string());
     }
 
+    /// Clear any previous enrichment marks and rotation for `handle`
+    /// (e.g. when subscribing to a handle anew, so stale marks from a
+    /// previously deleted subscription cannot cause newly ingested articles
+    /// to skip full-text enrichment).
+    pub fn clear_enrichment(&mut self, handle: &str) {
+        self.enriched_articles.remove(handle);
+    }
+
+    /// Remove the enriched mark for `tweet_id` under `handle` (e.g. if the
+    /// article write/refresh failed so the next cycle can retry).
+    pub fn unmark_enriched(&mut self, handle: &str, tweet_id: &str) {
+        if let Some(entry) = self.enriched_articles.get_mut(handle) {
+            entry.done.remove(tweet_id);
+        }
+    }
+
     /// Prune `handle`'s enriched set down to `page_ids`: a tweet no longer on
     /// the page never re-renders (the refresh leg only rewrites rows it just
     /// re-fetched), so keeping its id would only grow the blob. The rotation
@@ -1721,7 +1737,16 @@ fn v_url(entity_map: &BTreeMap<usize, &serde_json::Value>, key: i64) -> Option<S
 /// so the output always nests correctly — even where ranges merely overlap
 /// (a bold span crossing a link), which DraftJS allows and HTML cannot
 /// express directly: the split anchors simply render as two anchors.
-fn render_block_text(text: &str, ranges: Vec<(usize, usize, BlockRange)>, plain: bool) -> String {
+///
+/// In non-code-block HTML (`!plain && !is_code`), explicit newlines (`\n`)
+/// are converted to `<br/>` tags so multi-line text blocks, list items and
+/// quotes preserve line breaks in the reader without relying on pre-wrap styles.
+fn render_block_text(
+    text: &str,
+    ranges: Vec<(usize, usize, BlockRange)>,
+    plain: bool,
+    is_code: bool,
+) -> String {
     // Clamp every range into the text; sort so longer ranges open first and
     // open order is stable.
     let total16 = text.chars().map(char::len_utf16).sum::<usize>();
@@ -1736,8 +1761,10 @@ fn render_block_text(text: &str, ranges: Vec<(usize, usize, BlockRange)>, plain:
         // HTML entities (`A & B` must not become `A &amp; B` there).
         return if plain {
             text.to_string()
-        } else {
+        } else if is_code {
             escape_html_text(text)
+        } else {
+            escape_html_text(text).replace("\r\n", "<br/>").replace('\n', "<br/>")
         };
     }
     ranges.sort_by_key(|(s, e, _)| (*s, std::cmp::Reverse(*e)));
@@ -1800,7 +1827,12 @@ fn render_block_text(text: &str, ranges: Vec<(usize, usize, BlockRange)>, plain:
                         BlockRange::Drop => {}
                     }
                 }
-                out.push_str(&escape_html_text(segment));
+                let escaped = escape_html_text(segment);
+                if is_code {
+                    out.push_str(&escaped);
+                } else {
+                    out.push_str(&escaped.replace("\r\n", "<br/>").replace('\n', "<br/>"));
+                }
                 for (_, _, k) in active.iter().rev() {
                     match k {
                         BlockRange::Bold => out.push_str("</strong>"),
@@ -1980,8 +2012,9 @@ fn render_content_state(article: &serde_json::Value) -> Option<(String, String)>
         if raw.trim().is_empty() && ranges.is_empty() {
             continue;
         }
-        let inner = render_block_text(raw, ranges.clone(), false);
-        let plain = render_block_text(raw, ranges, true);
+        let is_code = block_type == "code-block";
+        let inner = render_block_text(raw, ranges.clone(), false, is_code);
+        let plain = render_block_text(raw, ranges, true, is_code);
         // List items buffer; every other block type flushes the run first.
         if block_type == "unordered-list-item" || block_type == "ordered-list-item" {
             let ordered = block_type == "ordered-list-item";
@@ -3859,7 +3892,7 @@ mod tests {
             (0, 10, BlockRange::Bold),
             (5, 15, BlockRange::Link("https://example.com".to_string())),
         ];
-        let html = render_block_text(text, ranges, false);
+        let html = render_block_text(text, ranges, false, false);
         assert!(html.contains("<strong>01234</strong>"));
         assert!(html.contains("<strong><a href=\"https://example.com\">56789</a></strong>"));
         assert!(html.contains("<a href=\"https://example.com\">abcde</a>fghij"));
@@ -3878,7 +3911,34 @@ mod tests {
                 (5, 15, BlockRange::Link("https://example.com".to_string())),
             ],
             true,
+            false,
         );
         assert_eq!(plain, "01234https://example.comfghij");
+    }
+
+    #[test]
+    fn render_block_text_converts_newlines_in_html_except_code() {
+        let text = "第一行\n第二行\r\n第三行";
+        // Plain text retains raw newlines.
+        let plain = render_block_text(text, vec![], true, false);
+        assert_eq!(plain, text);
+
+        // Standard HTML converts explicit newlines to <br/>.
+        let html_normal = render_block_text(text, vec![], false, false);
+        assert_eq!(html_normal, "第一行<br/>第二行<br/>第三行");
+
+        // Code block HTML keeps literal newlines for <pre><code>.
+        let html_code = render_block_text(text, vec![], false, true);
+        assert_eq!(html_code, "第一行\n第二行\r\n第三行");
+
+        // With styling ranges:
+        let styled = "第一行\n第二行";
+        let html_styled = render_block_text(
+            styled,
+            vec![(0, styled.chars().map(char::len_utf16).sum(), BlockRange::Bold)],
+            false,
+            false,
+        );
+        assert_eq!(html_styled, "<strong>第一行<br/>第二行</strong>");
     }
 }

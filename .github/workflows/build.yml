@@ -7,10 +7,13 @@ name: Build
 # platforms or to grab an installable build of a specific branch.
 
 on:
-  # Every commit, on every branch (`**` covers branch names with slashes).
-  # Tag pushes are excluded — the Release workflow owns those.
+  # Desktop packaging: builds the Tauri bundles (dmg/app, msi/nsis, AppImage/
+  # deb) for every platform and uploads them as workflow artifacts. Push builds
+  # run on main to provide fresh artifacts without starving hosted runner
+  # capacity across feature branches; PR checks are handled by CI (ci.yml).
+  # Can still be dispatched manually to package any branch on demand.
   push:
-    branches: ["**"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       platforms:
