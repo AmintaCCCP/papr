@@ -275,25 +275,44 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<ChallengeHop> 
         if raw.is_empty() {
             return None;
         }
-        let target = base.join(&raw.replace("\\/", "/")).ok()?.into();
+        let target = base.join(&raw.replace("\\/", "/")).ok()?;
+        // WAF pass-throughs hand back the real document from the same site:
+        // bound the hop to the challenge's own origin so a hostile page
+        // cannot point the follow-up fetch anywhere else.
+        let same_origin = target.scheme() == base.scheme()
+            && target.host_str() == base.host_str()
+            && target.port_or_known_default() == base.port_or_known_default();
+        if !same_origin {
+            return None;
+        }
         return Some(ChallengeHop {
-            target,
+            target: target.into(),
             cookies: Vec::new(),
         });
     }
     if rest.starts_with("location.href") {
-        // Cookie reload: the browser re-fetches the same URL, now carrying
-        // the cookie the script computed. Without a computable cookie the
-        // reload is a loop — reject.
-        let https = base.scheme() == "https";
-        let cookies = cookie_assignments(&scripts, https);
-        if cookies.is_empty() {
-            return None;
+        // The identifier must end here: `location.hrefs` or
+        // `location.href.split('?')[0]` is a different expression the
+        // evaluator does not model.
+        let tail = &rest["location.href".len()..];
+        let delimited = tail
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '.' && c != '[');
+        if delimited {
+            // Cookie reload: the browser re-fetches the same URL, now
+            // carrying the cookie the script computed. Without a computable
+            // cookie the reload is a loop — reject.
+            let https = base.scheme() == "https";
+            let cookies = cookie_assignments(&scripts, https);
+            if cookies.is_empty() {
+                return None;
+            }
+            return Some(ChallengeHop {
+                target: base_url.to_string(),
+                cookies,
+            });
         }
-        return Some(ChallengeHop {
-            target: base_url.to_string(),
-            cookies,
-        });
     }
     None
 }
@@ -355,19 +374,28 @@ fn cookie_assignments(scripts: &[&str], scheme_https: bool) -> Vec<(String, Stri
                 let Some(cookie_string) = eval_cookie_expr(assign, &vars, scheme_https) else {
                     continue;
                 };
-                // `name=value; attributes` — the first `;` ends the pair,
-                // the first `=` inside it names it.
-                let Some((name_part, _attrs)) = cookie_string.split_once(';') else {
+                // `name=value; attributes` — the pair ends at the first `;`
+                // (a page may set bare `name=value` with no attributes), the
+                // `=` inside it names it.
+                let pair = cookie_string.split(';').next().unwrap_or(&cookie_string);
+                let Some((name, value)) = pair.split_once('=') else {
                     continue;
                 };
-                let Some((name, value)) = name_part.split_once('=') else {
-                    continue;
-                };
-                let name = name.trim().to_string();
-                if name.is_empty() {
+                let (name, value) = (name.trim(), value.trim());
+                // Cookie values travel in a header: only printable ASCII is
+                // sendable — a decoded `\n`/`\t` escape would be rejected by
+                // reqwest at send time and fail the whole fetch.
+                let printable =
+                    |s: &str| s.chars().all(|c| (' '..='~').contains(&c)) && !s.is_empty();
+                if !printable(name) || !printable(value) {
                     continue;
                 }
-                cookies.push((name, value.to_string()));
+                // A browser keeps the last value set for a name; the follow-up
+                // header must too, so a re-set name replaces its earlier pair.
+                match cookies.iter_mut().find(|(n, _)| n == name) {
+                    Some(slot) => slot.1 = value.to_string(),
+                    None => cookies.push((name.to_string(), value.to_string())),
+                }
                 continue;
             }
             // A `var/let/const NAME = …` declaration. The array shape holds
@@ -601,6 +629,15 @@ fn js_string_literal(s: &str) -> Option<String> {
     s[end..].trim().is_empty().then_some(value)
 }
 
+/// Is `idx` — the byte offset of a `location.replace(` / `document.cookie` /
+/// `var` candidate inside the script source `script` — inside a JS string
+/// literal or comment? A tiny lexer tracks line/block comments and the three
+/// quote styles (with `\` escapes, backticks included) from the start of the
+/// script: a call mentioned inside `"…"` or `// …` is sample content, not a
+/// redirect the browser would run. JS regex literals are not modelled — at
+/// worst a regex containing `//` hides a real call, which fails safe (the
+/// page is simply not followed, as before the challenge handling existed).
+/// An unterminated string or comment fails safe the same way.
 fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
     #[derive(PartialEq)]
     enum Js {
@@ -888,6 +925,34 @@ mod tests {
     }
 
     #[test]
+    fn challenge_redirect_absolute_target_and_single_quotes() {
+        let page =
+            b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
+        assert_eq!(
+            js_redirect_target(page, "https://example.com/"),
+            Some(ChallengeHop {
+                target: "https://example.com/feed?x=1".into(),
+                cookies: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn challenge_redirect_cross_origin_target_is_rejected() {
+        // A pass-through hop is a same-site round trip; a page pointing the
+        // follow-up fetch elsewhere (or at a loopback admin port) is not a
+        // challenge to follow.
+        let cross = b"<html><script>location.replace('https://evil.example/steal')</script></html>";
+        assert_eq!(js_redirect_target(cross, "https://example.com/feed"), None);
+        let loopback =
+            b"<html><script>location.replace('http://127.0.0.1:9222/admin')</script></html>";
+        assert_eq!(js_redirect_target(loopback, "https://example.com/feed"), None);
+        let downgraded =
+            b"<html><script>location.replace('http://example.com/feed')</script></html>";
+        assert_eq!(js_redirect_target(downgraded, "https://example.com/feed"), None);
+    }
+
+    #[test]
     fn challenge_cookie_reload_evaluates_the_computed_cookie() {
         // The exact page freedidi.com's openresty WAF served 2026-11: compute
         // `hg_pass` from two reversed string pieces, set the cookie, then
@@ -920,6 +985,55 @@ location.replace(location.href)})()</script></body></html>";
         let opaque = b"<html><script>document.cookie=\"a=\"+crypto.randomUUID();\
 location.replace(location.href)</script></html>";
         assert_eq!(js_redirect_target(opaque, "https://example.com/feed"), None);
+    }
+
+    #[test]
+    fn location_href_must_end_at_the_identifier() {
+        // `location.hrefs`, `location.href.split('?')[0]` and friends are
+        // different expressions the evaluator does not model — navigating to
+        // base_url on their behalf would guess wrong.
+        let with_method = b"<html><script>var p=[\"x\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href.split('?')[0])</script></html>";
+        assert_eq!(js_redirect_target(with_method, "https://example.com/feed"), None);
+        let typo = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.hrefs)</script></html>";
+        assert_eq!(js_redirect_target(typo, "https://example.com/feed"), None);
+    }
+
+    #[test]
+    fn cookie_shapes_beyond_the_freedidi_page() {
+        // Bare `name=value` with no `; attributes` is a valid assignment.
+        let bare = b"<html><script>var p=[\"5394971.f72a355dec38a9b4s\"];\
+document.cookie=\"hg_pass=\"+p[0].split(\"\").reverse().join(\"\");\
+location.replace(location.href)</script></html>";
+        let hop = js_redirect_target(bare, "https://example.com/feed").expect("challenge");
+        assert_eq!(
+            hop.cookies,
+            vec![("hg_pass".to_string(), "s4b9a83ced553a27f.1794935".to_string())]
+        );
+        // A name re-set by a later assignment keeps the last value, in
+        // first-seen order.
+        let twice = b"<html><script>var p=[\"one\",\"two\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+document.cookie=\"b=\"+p[1]+\"; path=/\";\
+document.cookie=\"a=\"+p[1]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        let hop = js_redirect_target(twice, "https://example.com/feed").expect("challenge");
+        assert_eq!(
+            hop.cookies,
+            vec![
+                ("a".to_string(), "two".to_string()),
+                ("b".to_string(), "two".to_string()),
+            ]
+        );
+        // A value with a control character (decoded \n) is not sendable in a
+        // header — the assignment is skipped, and with nothing left to
+        // present the reload is rejected.
+        let control = b"<html><script>var p=[\"1\\n2\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(control, "https://example.com/feed"), None);
     }
 
     #[test]

@@ -1559,13 +1559,17 @@ pub fn rsshub_route_delete(conn: &Connection, route_path: &str) -> AppResult<()>
 /// the spawn and stall every RSSHub subscription).
 pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
     let mut merged = BTreeMap::new();
-    // Routes the user enabled whose catalog entry *requires* the
-    // unsafe-domain opt-in (the `/rsshub/transform/*` family). RSSHub refuses
-    // to serve them unless `ALLOW_USER_SUPPLY_UNSAFE_DOMAIN=true` is set —
-    // the flag exists to protect shared instances from SSRF-by-subscription,
-    // but papr's engine is loopback-only and the user enabling the route in
-    // the marketplace is the informed consent, so the required value is
-    // defaulted here. An explicit user configuration always wins.
+    // Routes the user enabled whose bundled catalog entry *requires* the
+    // unsafe-domain opt-in — the `/rsshub/transform/*` family plus every
+    // route that takes a user-supplied URL/community (`/rss/:url{.+}`,
+    // `/lemmy/…`, `/discuz/…` — ten catalog routes today). RSSHub refuses to
+    // serve any of them unless `ALLOW_USER_SUPPLY_UNSAFE_DOMAIN=true` is set
+    // — the flag exists to protect shared instances from SSRF-by-subscription,
+    // but papr's engine is loopback-only and the user enabling such a route
+    // in the marketplace is the informed consent, so the required value is
+    // defaulted here. The variable is engine-wide (one spawn environment):
+    // enabling any requiring route opts the whole engine in, and an explicit
+    // user configuration always wins.
     let mut needs_unsafe_domain = false;
     for row in rsshub_routes_list(conn).unwrap_or_default() {
         if !row.enabled {
