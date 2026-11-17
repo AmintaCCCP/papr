@@ -1559,9 +1559,28 @@ pub fn rsshub_route_delete(conn: &Connection, route_path: &str) -> AppResult<()>
 /// the spawn and stall every RSSHub subscription).
 pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
     let mut merged = BTreeMap::new();
+    // Routes the user enabled whose catalog entry *requires* the
+    // unsafe-domain opt-in (the `/rsshub/transform/*` family). RSSHub refuses
+    // to serve them unless `ALLOW_USER_SUPPLY_UNSAFE_DOMAIN=true` is set —
+    // the flag exists to protect shared instances from SSRF-by-subscription,
+    // but papr's engine is loopback-only and the user enabling the route in
+    // the marketplace is the informed consent, so the required value is
+    // defaulted here. An explicit user configuration always wins.
+    let mut needs_unsafe_domain = false;
     for row in rsshub_routes_list(conn).unwrap_or_default() {
         if !row.enabled {
             continue;
+        }
+        if !needs_unsafe_domain {
+            if let Some((_, route)) = rsshub::catalog::route_lookup(&row.route_path) {
+                if let rsshub::catalog::RequireConfig::Items(items) =
+                    &route.features.require_config
+                {
+                    needs_unsafe_domain = items
+                        .iter()
+                        .any(|c| !c.optional && c.name == "ALLOW_USER_SUPPLY_UNSAFE_DOMAIN");
+                }
+            }
         }
         let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(&row.env_json)
@@ -1576,6 +1595,9 @@ pub fn rsshub_enabled_env(conn: &Connection) -> BTreeMap<String, String> {
                 merged.insert(k, s.to_string());
             }
         }
+    }
+    if needs_unsafe_domain && !merged.contains_key("ALLOW_USER_SUPPLY_UNSAFE_DOMAIN") {
+        merged.insert("ALLOW_USER_SUPPLY_UNSAFE_DOMAIN".to_string(), "true".to_string());
     }
     merged
 }
@@ -7359,6 +7381,49 @@ mod tests {
         assert_eq!(env.get("ONLY_B").map(String::as_str), Some("2"));
         assert!(!env.contains_key("ONLY_C"));
         assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn rsshub_enabled_env_defaults_the_unsafe_domain_opt_in() {
+        // An enabled route whose catalog entry requires the unsafe-domain
+        // opt-in (the /rsshub/transform/* family) gets the value the engine
+        // needs by default — the user enabling the route is the consent, and
+        // without it RSSHub refuses every fetch with a bare error page.
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/rsshub/transform/html/:url/:routeParams").unwrap();
+        let env = rsshub_enabled_env(&conn);
+        assert_eq!(
+            env.get("ALLOW_USER_SUPPLY_UNSAFE_DOMAIN").map(String::as_str),
+            Some("true")
+        );
+        // A route without that requirement contributes nothing.
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/a/plain/:id").unwrap();
+        let env = rsshub_enabled_env(&conn);
+        assert!(!env.contains_key("ALLOW_USER_SUPPLY_UNSAFE_DOMAIN"));
+        // A disabled transform route neither injects the value nor keeps it.
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/rsshub/transform/html/:url/:routeParams").unwrap();
+        rsshub_route_set_enabled(&conn, "/rsshub/transform/html/:url/:routeParams", false)
+            .unwrap();
+        let env = rsshub_enabled_env(&conn);
+        assert!(!env.contains_key("ALLOW_USER_SUPPLY_UNSAFE_DOMAIN"));
+    }
+
+    #[test]
+    fn rsshub_enabled_env_user_config_beats_the_unsafe_domain_default() {
+        // An explicit user value — including a deliberate `false` — wins over
+        // the default injection.
+        let conn = test_conn();
+        rsshub_route_upsert(&conn, "/rsshub/transform/html/:url/:routeParams").unwrap();
+        rsshub_route_set_env(&conn, "/rsshub/transform/html/:url/:routeParams",
+            r#"{"ALLOW_USER_SUPPLY_UNSAFE_DOMAIN":"false"}"#)
+            .unwrap();
+        let env = rsshub_enabled_env(&conn);
+        assert_eq!(
+            env.get("ALLOW_USER_SUPPLY_UNSAFE_DOMAIN").map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
