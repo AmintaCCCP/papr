@@ -428,6 +428,12 @@ fn cookie_assignments(scripts: &[&str], scheme_https: bool) -> Vec<(String, Stri
                 }
                 if ok && !elements.is_empty() {
                     vars.insert(name, JsVal::Arr(elements));
+                } else {
+                    // A failed array re-declaration invalidates the previous
+                    // binding, same as the computed-string path below: the
+                    // browser's throwing statement aborts the script, so a
+                    // stale element can never feed a later cookie assignment.
+                    vars.remove(&name);
                 }
                 continue;
             }
@@ -1034,6 +1040,18 @@ location.replace(location.href )</script></html>";
 document.cookie=\"a=\"+v+\"; path=/\";\
 location.replace(location.href)</script></html>";
         assert_eq!(js_redirect_target(stale, "https://example.com/feed"), None);
+        // The array path: a failed re-declaration of a pieces array leaves
+        // nothing for later `NAME[n]` reads either.
+        let stale_array = b"<html><script>var p=[\"old\"];var p=[unknown()];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(stale_array, "https://example.com/feed"), None);
+        // A successful re-declaration still overwrites.
+        let redone = b"<html><script>var p=[\"old\"];var p=[\"new\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        let hop = js_redirect_target(redone, "https://example.com/feed").expect("challenge");
+        assert_eq!(hop.cookies, vec![("a".to_string(), "new".to_string())]);
     }
 
     #[test]
