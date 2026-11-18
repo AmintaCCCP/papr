@@ -22,7 +22,6 @@ use toon::Doc;
 
 const APP_IDENTIFIER: &str = "com.thomas.papr";
 const DESCRIPTION: &str = "Read, search and triage your Papr RSS feeds from the shell.";
-const USER_AGENT: &str = concat!("papr-cli/", env!("CARGO_PKG_VERSION"));
 
 /// Body truncation budget for a single `read`, and the tighter one when reading
 /// several articles at once (keeping a batch affordable in tokens).
@@ -2138,7 +2137,15 @@ fn short_date(published: Option<&str>) -> String {
 fn http_client() -> Result<reqwest::Client, AxiError> {
     use std::time::Duration;
     reqwest::Client::builder()
-        .user_agent(USER_AGENT)
+        // The same browser UA the desktop feed client sends (`fetch::USER_AGENT`):
+        // feed hosts gate automated clients on the UA alone — feed.xyzfm.space's
+        // Tengine edge denies product-name UAs outright — so the CLI's own
+        // product string would fail where the app succeeds.
+        .user_agent(fetch::USER_AGENT)
+        // rustls for the same TLS-reachability reasons as the feed client (see
+        // `fetch::build_client_inner`): hosts that drop or reject the platform
+        // TLS stack's handshake.
+        .use_rustls_tls()
         // Bound network waits so a stalled connection or unresponsive server
         // can't hang the CLI forever. The total budget stays generous for a slow
         // feed or article fetch while still failing eventually.

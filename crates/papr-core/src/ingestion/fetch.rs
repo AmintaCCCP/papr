@@ -8,7 +8,14 @@ use reqwest::{Client, StatusCode};
 use rusqlite::Connection;
 use std::time::Duration;
 
-pub const USER_AGENT: &str = "Papr/0.1 (+https://github.com/papr-reader)";
+/// The feed client's User-Agent. A plain browser string, deliberately:
+/// several feed hosts gate automated clients on the UA alone — Tengine CDN
+/// edge rules blacklist product-name UAs (`Papr/0.1 …` was denied outright by
+/// feed.xyzfm.space's `denied by UA ACL = blacklist`) and Cloudflare serves
+/// "Just a moment…" 403s to them (`macked.app`). A recognizable browser UA
+/// passes both without touching their challenge flows. Mirrors what the
+/// built-in X parser already sends (see `parsers::x::X_USER_AGENT`).
+pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// Hard cap on a fetched body. Feeds and article pages are text — a few
 /// hundred KB at most — so 16 MiB is generous while still stopping a
@@ -48,6 +55,15 @@ fn build_client_inner(timeout_secs: u64, proxy: &str) -> Client {
     let mut builder = Client::builder()
         .user_agent(USER_AGENT)
         .cookie_store(true)
+        // rustls, not the platform TLS stack (native-tls → Security.framework
+        // on macOS): several feed hosts drop or reject Security.framework's
+        // handshake while every other client connects — sindresorhus.com
+        // (Vercel) fails with a native-tls `bad protocol version` and
+        // www.torrentmac.net times out mid-handshake. rustls negotiates
+        // cleanly with both (verified live 2026-11). `rustls-tls-native-roots`
+        // keeps system-trusted CAs — a local MITM proxy's root (e.g. Surge's
+        // generated CA, installed into the macOS keychain) still verifies.
+        .use_rustls_tls()
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10));
 
@@ -144,14 +160,39 @@ pub enum Fetched {
     },
 }
 
+/// A detected anti-bot challenge and what a browser would do about it: the
+/// URL to fetch next, plus any cookies the page's script computes before
+/// navigating (`document.cookie="name="+<computed value>`).
+#[derive(Debug, PartialEq)]
+pub struct ChallengeHop {
+    /// Where the browser would navigate. For the self-reload shape
+    /// (`location.replace(location.href)`) this is the original request URL.
+    pub target: String,
+    /// `name → value` cookies the page's script computes before navigating,
+    /// in assignment order — ready for a `Cookie` header on the follow-up.
+    pub cookies: Vec<(String, String)>,
+}
+
 /// Detect a JavaScript-redirect anti-bot challenge in a fetched body and
-/// return the URL it points at.
+/// return what a browser would do next.
 ///
 /// Some hosts (openresty-style WAFs) answer automated clients with a tiny HTML
-/// page whose only content is `location.replace("/path?token=…")` — a browser
-/// follows it (with the cookie the response set) and gets the real document.
-/// A plain HTTP client stops there and reports "could not parse the feed" on
-/// what is actually a block page.
+/// page whose only content is `location.replace(…)` — a browser follows it
+/// and gets the real document. A plain HTTP client stops there and reports
+/// "could not parse the feed" on what is actually a block page.
+///
+/// Two challenge shapes are recognised:
+///
+/// * A **token redirect**: `location.replace("/path?token=…")` — the target
+///   is the argument, resolved against the document URL. The real page is
+///   served to a client that simply follows it.
+/// * A **cookie reload** (freedidi.com's openresty WAF, 2026-11): the script
+///   computes a pass cookie from string pieces (`var p=[…];
+///   v=p[1].split("").reverse().join("")+…; document.cookie="hg_pass="+v;`)
+///   and then navigates to `location.replace(location.href)` — the *same*
+///   URL, now expected to carry the computed cookie. The assignments are
+///   evaluated (see [`cookie_assignments`]) and returned so the follow-up
+///   request can present them.
 ///
 /// The recognisable shape is deliberately narrow, on two axes: the document
 /// must be small (challenges are a few hundred bytes; a real feed or article
@@ -162,9 +203,11 @@ pub enum Fetched {
 /// the call in a `<pre>` code sample keeps its prose visible and is rejected,
 /// so following it never fetches the quoted example URL.
 ///
-/// Returns the `location.replace` argument with JSON escapes (`\/`) decoded,
-/// resolved against `base_url` when it is relative. `None` for anything else.
-pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
+/// A self-reload with no computable cookie is rejected too: following it
+/// would just fetch the same challenge page again, forever.
+///
+/// `None` for anything else.
+pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<ChallengeHop> {
     // A challenge page is minimal HTML — anything large is real content.
     if bytes.len() > 2048 {
         return None;
@@ -184,6 +227,7 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
     }
     let dom = scraper::Html::parse_fragment(&text);
     let mut script_call: Option<String> = None;
+    let mut scripts: Vec<&str> = Vec::new();
     let mut visible_chars = 0usize;
     for node in dom.tree.nodes() {
         let scraper::Node::Text(t) = node.value() else {
@@ -193,6 +237,7 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
             .ancestors()
             .any(|a| a.value().as_element().is_some_and(|e| e.name() == "script"));
         if in_script {
+            scripts.push(t);
             if script_call.is_none() {
                 // Only a call the browser would actually run counts: a
                 // `location.replace` mentioned inside a JS string literal or
@@ -219,34 +264,403 @@ pub fn js_redirect_target(bytes: &[u8], base_url: &str) -> Option<String> {
     }
     let call = script_call?;
     let rest = call["location.replace(".len()..].trim_start();
-    // The argument is a single- or double-quoted string; take up to the
-    // matching quote (the pages we target never nest quotes inside).
-    let quote = rest.chars().next()?;
+    let base = reqwest::Url::parse(base_url).ok()?;
+    if rest.starts_with('"') || rest.starts_with('\'') {
+        // Token redirect: the argument is a quoted string; take up to the
+        // matching quote (the pages we target never nest quotes inside). The
+        // path comes back in a JS string literal, so `/` is escaped as `\/`.
+        let arg = &rest[1..];
+        let end = arg.find(rest[..1].chars().next()?)?;
+        let raw = &arg[..end];
+        if raw.is_empty() {
+            return None;
+        }
+        let target = base.join(&raw.replace("\\/", "/")).ok()?;
+        // WAF pass-throughs hand back the real document from the same site:
+        // bound the hop to the challenge's own origin so a hostile page
+        // cannot point the follow-up fetch anywhere else.
+        let same_origin = target.scheme() == base.scheme()
+            && target.host_str() == base.host_str()
+            && target.port_or_known_default() == base.port_or_known_default();
+        if !same_origin {
+            return None;
+        }
+        return Some(ChallengeHop {
+            target: target.into(),
+            cookies: Vec::new(),
+        });
+    }
+    // The call's argument must end at the identifier: after optional
+    // whitespace the closing `)` has to follow. `location.hrefs`,
+    // `location.href.split('?')[0]`, `location.href + "?x"` and friends are
+    // expressions the evaluator does not model — navigating to the bare URL
+    // on their behalf would request an address the browser never visits.
+    if let Some(tail) = rest.strip_prefix("location.href") {
+        let ends_the_call = tail.trim_start().starts_with(')');
+        if ends_the_call {
+            // Cookie reload: the browser re-fetches the same URL, now
+            // carrying the cookie the script computed. Without a computable
+            // cookie the reload is a loop — reject.
+            let https = base.scheme() == "https";
+            let cookies = cookie_assignments(&scripts, https);
+            if cookies.is_empty() {
+                return None;
+            }
+            return Some(ChallengeHop {
+                target: base_url.to_string(),
+                cookies,
+            });
+        }
+    }
+    None
+}
+
+/// One JS value the challenge evaluator understands: a string (a literal or
+/// a computed `var`) or a string array (the `var p=["…","…"]` pieces).
+#[derive(Clone)]
+enum JsVal {
+    Str(String),
+    Arr(Vec<String>),
+}
+
+/// Evaluate the `document.cookie=…` assignments (and the `var` declarations
+/// they read) in the challenge page's scripts — outside JS strings and
+/// comments — and return the `(name, value)` cookies they set.
+///
+/// Each assignment's RHS is a cookie *string* — `name=value; attributes` —
+/// built by concatenating string literals, pieces looked up from `var`
+/// declarations (with the `.split("").reverse().join("")` character-reversal
+/// chain the WAF pages use to obfuscate), and the
+/// `(location.protocol==="https:"?"A":"B")` scheme ternary. See
+/// [`eval_cookie_expr`] for the exact grammar; anything the evaluator cannot
+/// read makes that assignment (and with it, for the reload shape, the whole
+/// challenge) fail safe.
+fn cookie_assignments(scripts: &[&str], scheme_https: bool) -> Vec<(String, String)> {
+    let mut vars: std::collections::HashMap<String, JsVal> = std::collections::HashMap::new();
+    let mut cookies = Vec::new();
+    for script in scripts {
+        // Declarations and assignments are evaluated in document order, so
+        // `var v=p[1].…` sees `p`'s elements and the cookie assignment sees
+        // `v`.
+        let mut statements: Vec<(usize, bool)> = Vec::new(); // (offset, is_cookie)
+        for keyword in ["var ", "let ", "const "] {
+            let mut from = 0;
+            while let Some(rel) = script[from..].find(keyword) {
+                let idx = from + rel;
+                from = idx + keyword.len();
+                statements.push((idx, false));
+            }
+        }
+        let mut from = 0;
+        while let Some(rel) = script[from..].find("document.cookie") {
+            let idx = from + rel;
+            from = idx + "document.cookie".len();
+            statements.push((idx, true));
+        }
+        statements.sort_unstable();
+        for (idx, is_cookie) in statements {
+            // A mention inside a string literal or comment is sample content,
+            // not a run statement.
+            if inside_js_string_or_comment(script, idx) {
+                continue;
+            }
+            if is_cookie {
+                let rest = script[idx + "document.cookie".len()..].trim_start();
+                let Some(assign) = rest.strip_prefix('=') else {
+                    continue;
+                };
+                let Some(cookie_string) = eval_cookie_expr(assign, &vars, scheme_https) else {
+                    continue;
+                };
+                // `name=value; attributes` — the pair ends at the first `;`
+                // (a page may set bare `name=value` with no attributes), the
+                // `=` inside it names it.
+                let pair = cookie_string.split(';').next().unwrap_or(&cookie_string);
+                let Some((name, value)) = pair.split_once('=') else {
+                    continue;
+                };
+                let (name, value) = (name.trim(), value.trim());
+                // Cookie values travel in a header: only printable ASCII is
+                // sendable — a decoded `\n`/`\t` escape would be rejected by
+                // reqwest at send time and fail the whole fetch.
+                let printable =
+                    |s: &str| s.chars().all(|c| (' '..='~').contains(&c)) && !s.is_empty();
+                if !printable(name) || !printable(value) {
+                    continue;
+                }
+                // A browser keeps the last value set for a name; the follow-up
+                // header must too, so a re-set name replaces its earlier pair.
+                match cookies.iter_mut().find(|(n, _)| n == name) {
+                    Some(slot) => slot.1 = value.to_string(),
+                    None => cookies.push((name.to_string(), value.to_string())),
+                }
+                continue;
+            }
+            // A `var/let/const NAME = …` declaration. The array shape holds
+            // the string pieces; a string expression holds a computed value.
+            let rest = &script[idx..];
+            let keyword_len = rest.find(char::is_whitespace).unwrap_or(0);
+            let after_kw = rest[keyword_len..].trim_start();
+            let name: String = after_kw
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let Some(after) = after_kw[name.len()..].trim_start().strip_prefix('=') else {
+                continue;
+            };
+            if let Some(close) = after.trim_start().strip_prefix('[').and_then(|b| b.find(']')) {
+                // `NAME=["str","str",…]` — comma-separated string literals
+                // only; one non-literal fails the whole array.
+                let body = &after.trim_start()[1..1 + close];
+                let mut elements = Vec::new();
+                let mut ok = true;
+                for part in body.split(',') {
+                    match js_string_literal(part.trim()) {
+                        Some(s) => elements.push(s),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && !elements.is_empty() {
+                    vars.insert(name, JsVal::Arr(elements));
+                } else {
+                    // A failed array re-declaration invalidates the previous
+                    // binding, same as the computed-string path below: the
+                    // browser's throwing statement aborts the script, so a
+                    // stale element can never feed a later cookie assignment.
+                    vars.remove(&name);
+                }
+                continue;
+            }
+            // A computed string: evaluate and remember, so a later
+            // `document.cookie="x="+NAME` reads the final value. A failed
+            // re-declaration invalidates the previous binding, matching the
+            // browser where the throwing statement aborts the script and
+            // leaves nothing for later assignments to read.
+            match eval_cookie_expr(after, &vars, scheme_https) {
+                Some(value) => {
+                    vars.insert(name, JsVal::Str(value));
+                }
+                None => {
+                    vars.remove(&name);
+                }
+            }
+        }
+    }
+    cookies
+}
+
+/// Length ceiling for any string the challenge evaluator produces or caches:
+/// the real pass cookies are tens of bytes, so 4 KiB is generous, while a
+/// doubling chain (`var v="x";var v=v+v;…` ×32) inside a 2 KiB page would
+/// otherwise build multi-GiB intermediates from tiny input.
+const MAX_EVALUATED_STRING_BYTES: usize = 4 * 1024;
+
+/// Evaluate a JS string-valued *concatenation expression* — the RHS of a
+/// `document.cookie=` assignment or a computed `var` declaration, starting
+/// right after its `=`. Terms:
+///
+/// * a string literal (`"…"`, `'…'`, `\`-escapes),
+/// * `NAME[n]` — an element of a `var NAME=[…]` string array, optionally
+///   followed by `.split("")` / `.reverse()` / `.join("")` postfixes in the
+///   challenge pages' order (split into characters, reverse, re-join),
+/// * a bare `NAME` naming a previously computed string `var`,
+/// * `(location.protocol==="https:"?"A":"B")` — the scheme ternary, honoured
+///   only in that exact shape; the branch is chosen by the fetch's scheme.
+///
+/// Terms are joined with `+`. The expression ends at a top-level `;` (a `;`
+/// inside a string literal is part of the value, not a terminator) or at the
+/// end of the scanned text. Returns the concatenated value; `None` for
+/// anything outside the grammar — the statement is then skipped, which is
+/// the pre-existing fail-safe behaviour for unreadable pages.
+fn eval_cookie_expr(
+    expr: &str,
+    vars: &std::collections::HashMap<String, JsVal>,
+    scheme_https: bool,
+) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = expr.trim_start();
+    loop {
+        let b = rest.as_bytes();
+        let (value, len) = match b.first() {
+            Some(b'"' | b'\'') => {
+                let (v, l) = js_string_literal_span(rest)?;
+                (v, l)
+            }
+            Some(b'(') => {
+                let (v, l) = scheme_ternary(rest, scheme_https)?;
+                (v, l)
+            }
+            Some(c) if c.is_ascii_alphabetic() || *c == b'_' => {
+                let (v, l) = var_term(rest, vars)?;
+                (v, l)
+            }
+            _ => return None,
+        };
+        // The doubling-chain budget: refuse the expression before building a
+        // string that would blow memory (see [`MAX_EVALUATED_STRING_BYTES`]).
+        if out.len() + value.len() > MAX_EVALUATED_STRING_BYTES {
+            return None;
+        }
+        out.push_str(&value);
+        rest = rest[len..].trim_start();
+        match rest.chars().next() {
+            // `;` closes the statement; `}` closes the enclosing IIFE when a
+            // page omits the final semicolon.
+            Some(';') | Some('}') | None => return Some(out),
+            Some('+') => rest = rest[1..].trim_start(),
+            _ => return None,
+        }
+    }
+}
+
+/// One `NAME[n]` term with its optional `.split("")/.reverse()/.join("")`
+/// postfix chain. Returns the term's value and the bytes consumed.
+fn var_term(
+    expr: &str,
+    vars: &std::collections::HashMap<String, JsVal>,
+) -> Option<(String, usize)> {
+    let name: String = expr
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let mut rest = &expr[name.len()..];
+    // `NAME[n]` indexes a string array; a bare `NAME` reads a computed string.
+    let mut value = match vars.get(&name)? {
+        JsVal::Str(s) => {
+            if rest.trim_start().starts_with('[') {
+                return None;
+            }
+            s.clone()
+        }
+        JsVal::Arr(elements) => {
+            let after = rest.trim_start().strip_prefix('[')?;
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return None;
+            }
+            let closing = after[digits.len()..].trim_start().strip_prefix(']')?;
+            rest = closing;
+            elements.get(digits.parse::<usize>().ok()?)?.clone()
+        }
+    };
+    // Postfix chain, in the order the challenge pages write it. `.split("")`
+    // and `.join("")` are identity operations once the value is a `String`
+    // whose characters are what `split` would produce; only `.reverse()`
+    // changes the value.
+    loop {
+        if take_postfix(&mut rest, ".split(\"\")") || take_postfix(&mut rest, ".split('')") {
+            continue;
+        }
+        if take_postfix(&mut rest, ".reverse()") {
+            value = value.chars().rev().collect();
+            continue;
+        }
+        if take_postfix(&mut rest, ".join(\"\")") || take_postfix(&mut rest, ".join('')") {
+            continue;
+        }
+        break;
+    }
+    Some((value, expr.len() - rest.len()))
+}
+
+/// If `rest` starts with `postfix`, consume it (plus surrounding whitespace
+/// before it) and return `true`.
+fn take_postfix(rest: &mut &str, postfix: &str) -> bool {
+    match rest.trim_start().strip_prefix(postfix) {
+        Some(after) => {
+            *rest = after;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Parse `(location.protocol==="https:"?"A":"B")` starting at the `(`, in
+/// the exact shape these challenge pages write. Returns the branch chosen by
+/// `scheme_https` and the bytes consumed through the closing `)`.
+fn scheme_ternary(expr: &str, scheme_https: bool) -> Option<(String, usize)> {
+    let rest = expr
+        .trim_start()
+        .strip_prefix('(')?
+        .trim_start()
+        .strip_prefix("location.protocol")?
+        .trim_start()
+        .strip_prefix("===")?
+        .trim_start()
+        .strip_prefix("\"https:\"")?
+        .trim_start()
+        .strip_prefix('?')?
+        .trim_start();
+    let (when_https, used) = js_string_literal_span(rest)?;
+    let rest = rest[used..].trim_start().strip_prefix(':')?.trim_start();
+    let (other, used) = js_string_literal_span(rest)?;
+    let rest = rest[used..].trim_start().strip_prefix(')')?;
+    Some((
+        if scheme_https { when_https } else { other },
+        expr.len() - rest.len(),
+    ))
+}
+
+/// A whole JS string literal (single or double quoted, `\`-escapes) at the
+/// start of `s`: returns its decoded value and the bytes it occupies
+/// (quotes included).
+fn js_string_literal_span(s: &str) -> Option<(String, usize)> {
+    let quote = s.chars().next()?;
     if quote != '"' && quote != '\'' {
         return None;
     }
-    let arg = &rest[1..];
-    let end = arg.find(quote)?;
-    let raw = &arg[..end];
-    if raw.is_empty() {
-        return None;
+    let mut out = String::new();
+    let mut end = 1;
+    let bytes = s.as_bytes();
+    while end < bytes.len() {
+        match bytes[end] {
+            b'\\' => {
+                let esc = *bytes.get(end + 1)?;
+                match esc {
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'/' => out.push('/'),
+                    b'\\' => out.push('\\'),
+                    e if e == quote as u8 => out.push(e as char),
+                    // The challenge pages never use other escapes; bail.
+                    _ => return None,
+                }
+                end += 2;
+            }
+            b if b == quote as u8 => {
+                return Some((out, end + 1));
+            }
+            _ => {
+                let ch = s[end..].chars().next()?;
+                out.push(ch);
+                end += ch.len_utf8();
+            }
+        }
     }
-    // The challenge pages embed the path in a JS string literal, so `/` comes
-    // back escaped as `\/`.
-    let path = raw.replace("\\/", "/");
-    let base = reqwest::Url::parse(base_url).ok()?;
-    base.join(&path).ok().map(|u| u.into())
+    None
 }
 
-/// Is `idx` — the byte offset of a `location.replace(` candidate inside the
-/// script source `script` — inside a JS string literal or comment? A tiny
-/// lexer tracks line/block comments and the three quote styles (with `\`
-/// escapes, backticks included) from the start of the script: a call
-/// mentioned inside `"…"` or `// …` is sample content, not a redirect the
-/// browser would run. JS regex literals are not modelled — at worst a regex
-/// containing `//` hides a real call, which fails safe (the parse errors as
-/// it did before the challenge handling existed). An unterminated string or
-/// comment also fails safe the same way.
+/// A whole JS string literal occupying all of `s` (used for array elements).
+fn js_string_literal(s: &str) -> Option<String> {
+    let (value, end) = js_string_literal_span(s)?;
+    s[end..].trim().is_empty().then_some(value)
+}
+
+/// Is `idx` — the byte offset of a `location.replace(` / `document.cookie` /
+/// `var` candidate inside the script source `script` — inside a JS string
+/// literal or comment? A tiny lexer tracks line/block comments and the three
+/// quote styles (with `\` escapes, backticks included) from the start of the
+/// script: a call mentioned inside `"…"` or `// …` is sample content, not a
+/// redirect the browser would run. JS regex literals are not modelled — at
+/// worst a regex containing `//` hides a real call, which fails safe (the
+/// page is simply not followed, as before the challenge handling existed).
+/// An unterminated string or comment fails safe the same way.
 fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
     #[derive(PartialEq)]
     enum Js {
@@ -308,10 +722,28 @@ fn inside_js_string_or_comment(script: &str, idx: usize) -> bool {
 
 /// Follow one anti-bot challenge redirect: re-GET the target URL with the
 /// same client (its cookie jar carries whatever the challenge response set)
-/// and return the second response untouched. One hop only — if the target is
-/// itself a challenge page it is returned as-is rather than looping.
-async fn follow_challenge(client: &Client, target: &str) -> AppResult<reqwest::Response> {
-    let resp = client.get(target).send().await?;
+/// and any cookies the challenge's script computes, and return the second
+/// response untouched. One hop only — if the target is itself a challenge
+/// page it is returned as-is rather than looping.
+///
+/// The computed cookies travel as an explicit `Cookie` header — reqwest's
+/// jar only fills the header in when the request doesn't already carry one,
+/// so the explicit values win.
+async fn follow_challenge(
+    client: &Client,
+    target: &str,
+    cookies: &[(String, String)],
+) -> AppResult<reqwest::Response> {
+    let mut req = client.get(target);
+    if !cookies.is_empty() {
+        let header = cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        req = req.header(reqwest::header::COOKIE, header);
+    }
+    let resp = req.send().await?;
     Ok(resp.error_for_status()?)
 }
 
@@ -350,10 +782,11 @@ pub async fn conditional_get(
     let last_modified = header(LAST_MODIFIED);
     let bytes = read_capped(resp).await?;
     // An anti-bot challenge in place of the feed document: follow its JS
-    // redirect once and serve whatever comes back (with the second response's
-    // revalidation headers).
-    if let Some(target) = js_redirect_target(&bytes, &final_url) {
-        let resp = follow_challenge(client, &target).await?;
+    // redirect once (presenting any cookie the challenge's script computes)
+    // and serve whatever comes back (with the second response's revalidation
+    // headers).
+    if let Some(hop) = js_redirect_target(&bytes, &final_url) {
+        let resp = follow_challenge(client, &hop.target, &hop.cookies).await?;
         let doc_url = resp.url().to_string();
         let read_header = |name: reqwest::header::HeaderName| {
             resp.headers()
@@ -473,9 +906,10 @@ pub async fn get(client: &Client, url: &str) -> AppResult<(Vec<u8>, Option<Strin
         .map(|s| s.to_string());
     let bytes = read_capped(resp).await?;
     // An anti-bot challenge in place of the document: follow its JS redirect
-    // once and surface the second response's body, type and final URL.
-    if let Some(target) = js_redirect_target(&bytes, &final_url) {
-        let resp = follow_challenge(client, &target).await?;
+    // once (with the challenge's computed cookies, if any) and surface the
+    // second response's body, type and final URL.
+    if let Some(hop) = js_redirect_target(&bytes, &final_url) {
+        let resp = follow_challenge(client, &hop.target, &hop.cookies).await?;
         let final_url = resp.url().to_string();
         let content_type = resp
             .headers()
@@ -489,7 +923,10 @@ pub async fn get(client: &Client, url: &str) -> AppResult<(Vec<u8>, Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{charset_from_content_type, charset_from_html, decode_html, js_redirect_target};
+    use super::{
+        charset_from_content_type, charset_from_html, decode_html, js_redirect_target,
+        ChallengeHop,
+    };
 
     #[test]
     fn challenge_redirect_target_extracted_from_js_page() {
@@ -501,8 +938,12 @@ mod tests {
 <script>location.replace(\"\\/feed?_hgk=j9eff67319cf33ad0.1794633424.GVaSebtYlv\")\
 </script></head><body></body></html>";
         assert_eq!(
-            js_redirect_target(page, "https://www.freedidi.com/feed").as_deref(),
-            Some("https://www.freedidi.com/feed?_hgk=j9eff67319cf33ad0.1794633424.GVaSebtYlv")
+            js_redirect_target(page, "https://www.freedidi.com/feed"),
+            Some(ChallengeHop {
+                target: "https://www.freedidi.com/feed?_hgk=j9eff67319cf33ad0.1794633424.GVaSebtYlv"
+                    .into(),
+                cookies: vec![],
+            })
         );
     }
 
@@ -511,9 +952,179 @@ mod tests {
         let page =
             b"<html><script>location.replace('https://example.com/feed?x=1')</script></html>";
         assert_eq!(
-            js_redirect_target(page, "https://example.com/").as_deref(),
-            Some("https://example.com/feed?x=1")
+            js_redirect_target(page, "https://example.com/"),
+            Some(ChallengeHop {
+                target: "https://example.com/feed?x=1".into(),
+                cookies: vec![],
+            })
         );
+    }
+
+    #[test]
+    fn challenge_redirect_cross_origin_target_is_rejected() {
+        // A pass-through hop is a same-site round trip; a page pointing the
+        // follow-up fetch elsewhere (or at a loopback admin port) is not a
+        // challenge to follow.
+        let cross = b"<html><script>location.replace('https://evil.example/steal')</script></html>";
+        assert_eq!(js_redirect_target(cross, "https://example.com/feed"), None);
+        let loopback =
+            b"<html><script>location.replace('http://127.0.0.1:9222/admin')</script></html>";
+        assert_eq!(js_redirect_target(loopback, "https://example.com/feed"), None);
+        let downgraded =
+            b"<html><script>location.replace('http://example.com/feed')</script></html>";
+        assert_eq!(js_redirect_target(downgraded, "https://example.com/feed"), None);
+    }
+
+    #[test]
+    fn challenge_cookie_reload_evaluates_the_computed_cookie() {
+        // The exact page freedidi.com's openresty WAF served 2026-11: compute
+        // `hg_pass` from two reversed string pieces, set the cookie, then
+        // reload the same URL — `location.replace(location.href)`.
+        let page = b"<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta name=\"robots\" content=\"noindex,nofollow\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>\
+<body><noscript>Please enable JavaScript.</noscript><script>(function(){var p=[\"Gleshs2K42YUGjfns6RFDA.351\",\"5394971.f72a355dec38a9b4s\"];\
+var v=p[1].split(\"\").reverse().join(\"\")+p[0].split(\"\").reverse().join(\"\");\
+document.cookie=\"hg_pass=\"+v+\"; path=/; max-age=7200; SameSite=Lax\"+(location.protocol===\"https:\"?\"; Secure\":\"\");\
+location.replace(location.href)})()</script></body></html>";
+        let hop = js_redirect_target(page, "https://www.freedidi.com/feed").expect("challenge");
+        assert_eq!(hop.target, "https://www.freedidi.com/feed");
+        assert_eq!(
+            hop.cookies,
+            vec![(
+                "hg_pass".to_string(),
+                "s4b9a83ced553a27f.1794935153.ADFR6snfjGUY24K2shselG".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn cookie_reload_without_a_computable_cookie_is_rejected() {
+        // A self-reload that sets no cookie would loop forever — not a
+        // challenge to follow.
+        let bare = b"<html><script>location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(bare, "https://example.com/feed"), None);
+        // An assignment the evaluator cannot read fails the same way.
+        let opaque = b"<html><script>document.cookie=\"a=\"+crypto.randomUUID();\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(opaque, "https://example.com/feed"), None);
+    }
+
+    #[test]
+    fn location_href_must_end_at_the_identifier() {
+        // `location.hrefs`, `location.href.split('?')[0]`, `location.href +
+        // "?token=1"` (even across whitespace) are different expressions the
+        // evaluator does not model — navigating to base_url on their behalf
+        // would request an address the browser never visits.
+        let with_method = b"<html><script>var p=[\"x\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href.split('?')[0])</script></html>";
+        assert_eq!(js_redirect_target(with_method, "https://example.com/feed"), None);
+        let typo = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.hrefs)</script></html>";
+        assert_eq!(js_redirect_target(typo, "https://example.com/feed"), None);
+        let concat = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href + \"?token=1\")</script></html>";
+        assert_eq!(js_redirect_target(concat, "https://example.com/feed"), None);
+        // Whitespace between the identifier and the closing paren is fine.
+        let spaced = b"<html><script>var p=[\"x\"];document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href )</script></html>";
+        assert!(js_redirect_target(spaced, "https://example.com/feed").is_some());
+    }
+
+    #[test]
+    fn failed_redeclaration_invalidates_the_previous_binding() {
+        // `var v=unknown()` throws in a browser and aborts the script — the
+        // earlier `v` must not leak into the cookie assignment.
+        let stale = b"<html><script>var v=\"old\";var v=unknown();\
+document.cookie=\"a=\"+v+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(stale, "https://example.com/feed"), None);
+        // The array path: a failed re-declaration of a pieces array leaves
+        // nothing for later `NAME[n]` reads either.
+        let stale_array = b"<html><script>var p=[\"old\"];var p=[unknown()];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(stale_array, "https://example.com/feed"), None);
+        // A successful re-declaration still overwrites.
+        let redone = b"<html><script>var p=[\"old\"];var p=[\"new\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        let hop = js_redirect_target(redone, "https://example.com/feed").expect("challenge");
+        assert_eq!(hop.cookies, vec![("a".to_string(), "new".to_string())]);
+    }
+
+    #[test]
+    fn doubling_chains_hit_the_length_budget() {
+        // 32 doublings from one byte would build a multi-GiB string in a
+        // 2 KiB page; the evaluator's budget refuses the expression, the
+        // binding dies with it, and the reload is rejected — bounded memory.
+        let mut script = String::from("<html><script>var v=\"x\";");
+        for _ in 0..32 {
+            script.push_str("var v=v+v;");
+        }
+        script.push_str(
+            "document.cookie=\"a=\"+v+\"; path=/\";location.replace(location.href)</script></html>",
+        );
+        let page = script.into_bytes();
+        assert_eq!(js_redirect_target(&page, "https://example.com/feed"), None);
+        // A modest chain still evaluates (the budget is a ceiling, not a ban).
+        let mut script = String::from("<html><script>var v=\"abcd\";");
+        for _ in 0..4 {
+            script.push_str("var v=v+v;");
+        }
+        script.push_str(
+            "document.cookie=\"a=\"+v+\"; path=/\";location.replace(location.href)</script></html>",
+        );
+        let page = script.into_bytes();
+        let hop = js_redirect_target(&page, "https://example.com/feed").expect("challenge");
+        assert_eq!(hop.cookies, vec![("a".to_string(), "abcd".repeat(16))]);
+    }
+
+    #[test]
+    fn cookie_shapes_beyond_the_freedidi_page() {
+        // Bare `name=value` with no `; attributes` is a valid assignment.
+        let bare = b"<html><script>var p=[\"5394971.f72a355dec38a9b4s\"];\
+document.cookie=\"hg_pass=\"+p[0].split(\"\").reverse().join(\"\");\
+location.replace(location.href)</script></html>";
+        let hop = js_redirect_target(bare, "https://example.com/feed").expect("challenge");
+        assert_eq!(
+            hop.cookies,
+            vec![("hg_pass".to_string(), "s4b9a83ced553a27f.1794935".to_string())]
+        );
+        // A name re-set by a later assignment keeps the last value, in
+        // first-seen order.
+        let twice = b"<html><script>var p=[\"one\",\"two\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+document.cookie=\"b=\"+p[1]+\"; path=/\";\
+document.cookie=\"a=\"+p[1]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        let hop = js_redirect_target(twice, "https://example.com/feed").expect("challenge");
+        assert_eq!(
+            hop.cookies,
+            vec![
+                ("a".to_string(), "two".to_string()),
+                ("b".to_string(), "two".to_string()),
+            ]
+        );
+        // A value with a control character (decoded \n) is not sendable in a
+        // header — the assignment is skipped, and with nothing left to
+        // present the reload is rejected.
+        let control = b"<html><script>var p=[\"1\\n2\"];\
+document.cookie=\"a=\"+p[0]+\"; path=/\";\
+location.replace(location.href)</script></html>";
+        assert_eq!(js_redirect_target(control, "https://example.com/feed"), None);
+    }
+
+    #[test]
+    fn quoted_cookie_and_reload_samples_are_not_a_challenge() {
+        // The whole reload shape quoted in visible page text (a <pre> sample)
+        // or inside a script string stays content.
+        let quoted = b"<html><body><pre>location.replace(location.href)</pre></body></html>";
+        assert_eq!(js_redirect_target(quoted, "https://example.com/"), None);
+        let in_string = b"<html><script>const s=\"document.cookie='a=b';\
+location.replace(location.href)\"</script></html>";
+        assert_eq!(js_redirect_target(in_string, "https://example.com/"), None);
     }
 
     #[test]
@@ -572,8 +1183,11 @@ mod tests {
         let mixed = b"<html><script>const s = \"location.replace('/sample')\";\
 location.replace('/real?a=1')</script></html>";
         assert_eq!(
-            js_redirect_target(mixed, "https://example.com/x").as_deref(),
-            Some("https://example.com/real?a=1")
+            js_redirect_target(mixed, "https://example.com/x"),
+            Some(ChallengeHop {
+                target: "https://example.com/real?a=1".into(),
+                cookies: vec![],
+            })
         );
     }
 
@@ -584,8 +1198,11 @@ location.replace('/real?a=1')</script></html>";
         let titled = b"<html><head><title>Redirecting...</title></head><body>\
 <script>location.replace('/next?a=1')</script></body></html>";
         assert_eq!(
-            js_redirect_target(titled, "https://example.com/x").as_deref(),
-            Some("https://example.com/next?a=1")
+            js_redirect_target(titled, "https://example.com/x"),
+            Some(ChallengeHop {
+                target: "https://example.com/next?a=1".into(),
+                cookies: vec![],
+            })
         );
     }
 

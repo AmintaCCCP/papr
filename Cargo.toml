@@ -17,7 +17,14 @@ feed-rs = "2"
 # `cookies` keeps a per-client cookie jar so anti-bot challenge flows that
 # mint a session cookie on a first response (then expect it on the redirect)
 # resolve instead of looping.
-reqwest = { version = "0.12", features = ["gzip", "brotli", "json", "cookies"] }
+# `rustls-tls-native-roots` switches the feed client to rustls (the builder
+# calls `use_rustls_tls`): several feed hosts drop or reject the platform TLS
+# stack's handshake (native-tls → Security.framework on macOS fails with
+# `bad protocol version` on Vercel-hosted sindresorhus.com and a mid-handshake
+# timeout on www.torrentmac.net), while rustls negotiates cleanly with both.
+# Native roots keep system-trusted CAs — a local MITM proxy's root (e.g.
+# Surge's generated CA, installed into the macOS keychain) still verifies.
+reqwest = { version = "0.12", features = ["gzip", "brotli", "json", "cookies", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["full"] }
 scraper = "0.21"
 ego-tree = "0.9"

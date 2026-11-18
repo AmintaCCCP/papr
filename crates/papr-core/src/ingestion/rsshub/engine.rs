@@ -91,6 +91,7 @@ const ENV_ALLOWLIST: &[&str] = &[
     // TLS trust store overrides (custom CAs).
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
     // Windows basics Node's `os`/`child_process` modules expect.
     "SYSTEMROOT",
     "COMSPEC",
@@ -643,6 +644,16 @@ fn build_child_env(
     env.insert("NODE_ENV".into(), "production".into());
     env.insert("LISTEN_INADDR_ANY".into(), "0".into());
     env.insert("NODE_OPTIONS".into(), "--max-http-header-size=32768".into());
+    // The bundled Node verifies upstream TLS against its own bundled CA store
+    // and never sees the OS trust store — a MITM proxy's root installed into
+    // the system keychain (Surge's generated CA, a corporate inspector) makes
+    // every route fetch to an intercepted host fail with `self-signed
+    // certificate in certificate chain`. `NODE_USE_SYSTEM_CA` adds the OS
+    // store alongside the bundled one (supported from Node 22.19.0 and
+    // 24.6.0; on older engines the variable is simply ignored and the
+    // behaviour is unchanged), so routes reach those hosts exactly like the
+    // desktop app's own client does.
+    env.insert("NODE_USE_SYSTEM_CA".into(), "1".into());
     let bundled_browser = version_dir.join("browser");
     if bundled_browser.is_dir() {
         // `to_string_lossy`: an engine root with non-UTF8 bytes is not a
@@ -1280,6 +1291,9 @@ mod tests {
         assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
         assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
         assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
+        // The system trust store joins the bundled CAs, so routes reach hosts
+        // behind a keychain-installed MITM proxy's root.
+        assert_eq!(env.get("NODE_USE_SYSTEM_CA").map(String::as_str), Some("1"));
         // A standard engine (no `browser/` dir) must not advertise a browser
         // registry — patchright would then look for a browser that is not
         // there instead of failing the route cleanly.
