@@ -27,7 +27,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(not(unix))]
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -109,6 +111,76 @@ fn is_virtual_tun(ip: Ipv4Addr) -> bool {
     (a == 198 && (b == 18 || b == 19)) || (a == 100 && (64..=127).contains(&b))
 }
 
+fn is_virtual_iface_name(name: &str) -> bool {
+    const PREFIXES: [&str; 10] = [
+        "lo", "utun", "tun", "tap", "awdl", "llw", "bridge", "docker", "veth", "wg",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+#[cfg(unix)]
+fn detect_lan_ips() -> Vec<String> {
+    let mut primary = Vec::new();
+    let mut secondary = Vec::new();
+
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) == 0 && !ifap.is_null() {
+            let mut cur = ifap;
+            while !cur.is_null() {
+                let ifa = &*cur;
+                cur = ifa.ifa_next;
+                let flags = ifa.ifa_flags as i32;
+                if (flags & libc::IFF_UP) == 0
+                    || (flags & libc::IFF_RUNNING) == 0
+                    || (flags & libc::IFF_LOOPBACK) != 0
+                    || ifa.ifa_addr.is_null()
+                {
+                    continue;
+                }
+                if i32::from((*ifa.ifa_addr).sa_family) != libc::AF_INET {
+                    continue;
+                }
+                let name = if ifa.ifa_name.is_null() {
+                    ""
+                } else {
+                    std::ffi::CStr::from_ptr(ifa.ifa_name)
+                        .to_str()
+                        .unwrap_or("")
+                };
+                if is_virtual_iface_name(name) {
+                    continue;
+                }
+                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_link_local()
+                    || is_virtual_tun(ip)
+                {
+                    continue;
+                }
+                let s = ip.to_string();
+                if is_rfc1918(ip) {
+                    if !primary.contains(&s) {
+                        primary.push(s);
+                    }
+                } else if !secondary.contains(&s) {
+                    secondary.push(s);
+                }
+            }
+            libc::freeifaddrs(ifap);
+        }
+    }
+
+    primary.extend(secondary);
+    if primary.is_empty() {
+        primary.push("127.0.0.1".to_string());
+    }
+    primary
+}
+
+#[cfg(not(unix))]
 fn detect_lan_ips() -> Vec<String> {
     let probes = [
         "192.168.1.1:80",
@@ -1366,4 +1438,16 @@ async fn api_translate(
         "translatedTitle": translated_title,
         "translatedLang": target,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_lan_ips_returns_non_empty() {
+        let ips = detect_lan_ips();
+        println!("detected LAN IPs: {:?}", ips);
+        assert!(!ips.is_empty());
+    }
 }

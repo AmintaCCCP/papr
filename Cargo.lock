@@ -3569,6 +3569,7 @@ dependencies = [
  "hyper-util",
  "imap",
  "lettre",
+ "libc",
  "log",
  "lol_html",
  "mail-parser",
