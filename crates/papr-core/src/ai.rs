@@ -95,6 +95,55 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
+/// Wakeable cancellation signal for in-flight AI network requests and SSE reads.
+pub struct CancelSignal {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelSignal {
+    pub fn new() -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Returns true when an HTTP error from a provider specifically indicates that
+/// the endpoint rejected `tools` / function calling (HTTP 400 or 422 mentioning
+/// tools/functions, never auth errors like 401/403).
+pub fn is_tool_unsupported_error(err: &AppError) -> bool {
+    let msg = err.to_string().to_lowercase();
+    let is_bad_request = msg.starts_with("ai api error 400") || msg.starts_with("ai api error 422");
+    is_bad_request
+        && (msg.contains("tool") || msg.contains("function") || msg.contains("unsupported"))
+}
+
 /// One tool invocation emitted by the LLM during a streamed turn.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,6 +151,10 @@ pub struct ToolCallRequest {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Set when the model emitted malformed or non-object JSON arguments,
+    /// so the caller returns a tool error instead of running with `{}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_error: Option<String>,
 }
 
 /// Multi-turn conversation message supporting tool calls and tool results.
@@ -253,8 +306,29 @@ pub async fn stream_chat(
     }
 }
 
+/// Stream a single-turn chat completion with wakeable cancellation support
+/// across both HTTP `.send()` and SSE chunk reads.
+pub async fn stream_chat_cancellable(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    user: &str,
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<ChatOutcome> {
+    let msgs = [ConversationMessage::User(user.to_string())];
+    let outcome = stream_conversation(client, cfg, system, &msgs, &[], false, sink, max_tokens, cancel).await?;
+    Ok(ChatOutcome {
+        text: outcome.text,
+        completed: outcome.completed,
+    })
+}
+
 /// Stream one multi-turn conversation turn, optionally offering read-only tools.
-/// Returns accumulated text deltas and any tool calls requested by the model.
+/// When `tools` is non-empty and `allow_tool_calls` is `false`, the `tools`
+/// definitions stay in the request (required by Anthropic whenever prior
+/// `tool_use`/`tool_result` blocks exist) while `tool_choice` is set to `none`.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_conversation(
     client: &Client,
@@ -262,9 +336,10 @@ pub async fn stream_conversation(
     system: &str,
     messages: &[ConversationMessage],
     tools: &[ToolDef],
+    allow_tool_calls: bool,
     sink: &mut DeltaSink<'_>,
     max_tokens: u32,
-    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&CancelSignal>,
 ) -> AppResult<TurnOutcome> {
     if cfg.provider.is_openai_compatible() {
         stream_openai_conversation(
@@ -273,9 +348,10 @@ pub async fn stream_conversation(
             system,
             messages,
             tools,
+            allow_tool_calls,
             sink,
             max_tokens,
-            cancel_flag,
+            cancel,
         )
         .await
     } else {
@@ -285,11 +361,30 @@ pub async fn stream_conversation(
             system,
             messages,
             tools,
+            allow_tool_calls,
             sink,
             max_tokens,
-            cancel_flag,
+            cancel,
         )
         .await
+    }
+}
+
+async fn send_cancellable(
+    req: reqwest::RequestBuilder,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<Option<Response>> {
+    if let Some(sig) = cancel {
+        if sig.is_cancelled() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            _ = sig.cancelled() => Ok(None),
+            res = req.send() => Ok(Some(res?)),
+        }
+    } else {
+        Ok(Some(req.send().await?))
     }
 }
 
@@ -300,9 +395,10 @@ async fn stream_anthropic_conversation(
     system: &str,
     messages: &[ConversationMessage],
     tools: &[ToolDef],
+    allow_tool_calls: bool,
     sink: &mut DeltaSink<'_>,
     max_tokens: u32,
-    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&CancelSignal>,
 ) -> AppResult<TurnOutcome> {
     let mut wire_msgs: Vec<Value> = Vec::new();
     let mut pending_tool_results: Vec<Value> = Vec::new();
@@ -323,8 +419,6 @@ async fn stream_anthropic_conversation(
                 if text.trim().is_empty() {
                     continue;
                 }
-                // Merge consecutive plain-text user turns so Anthropic's strict
-                // alternating-role requirement is never violated.
                 if let Some(last) = wire_msgs.last_mut() {
                     if last["role"] == "user" && last["content"].is_string() {
                         let prev = last["content"].as_str().unwrap_or("");
@@ -406,18 +500,26 @@ async fn stream_anthropic_conversation(
             })
             .collect();
         body["tools"] = Value::Array(tool_defs);
+        if !allow_tool_calls {
+            body["tool_choice"] = json!({ "type": "none" });
+        }
     }
 
-    let resp = client
+    let req = client
         .post(format!("{}/messages", cfg.base_url))
         .header("x-api-key", &cfg.api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .timeout(AI_REQUEST_TIMEOUT)
-        .json(&body)
-        .send()
-        .await?;
-    consume_sse_turn(resp, sink, Provider::Anthropic, cancel_flag).await
+        .json(&body);
+    let Some(resp) = send_cancellable(req, cancel).await? else {
+        return Ok(TurnOutcome {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            completed: false,
+        });
+    };
+    consume_sse_turn(resp, sink, Provider::Anthropic, cancel).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,9 +529,10 @@ async fn stream_openai_conversation(
     system: &str,
     messages: &[ConversationMessage],
     tools: &[ToolDef],
+    allow_tool_calls: bool,
     sink: &mut DeltaSink<'_>,
     max_tokens: u32,
-    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&CancelSignal>,
 ) -> AppResult<TurnOutcome> {
     let mut wire_msgs: Vec<Value> = vec![json!({ "role": "system", "content": system })];
     for m in messages {
@@ -504,16 +607,24 @@ async fn stream_openai_conversation(
             })
             .collect();
         body["tools"] = Value::Array(tool_defs);
+        if !allow_tool_calls {
+            body["tool_choice"] = Value::String("none".to_string());
+        }
     }
 
-    let resp = client
+    let req = client
         .post(format!("{}/chat/completions", cfg.base_url))
         .bearer_auth(&cfg.api_key)
         .timeout(AI_REQUEST_TIMEOUT)
-        .json(&body)
-        .send()
-        .await?;
-    consume_sse_turn(resp, sink, Provider::OpenAi, cancel_flag).await
+        .json(&body);
+    let Some(resp) = send_cancellable(req, cancel).await? else {
+        return Ok(TurnOutcome {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            completed: false,
+        });
+    };
+    consume_sse_turn(resp, sink, Provider::OpenAi, cancel).await
 }
 
 #[derive(Default)]
@@ -528,13 +639,20 @@ fn handle_sse_turn_line(
     provider: Provider,
     full: &mut String,
     partials: &mut std::collections::BTreeMap<usize, PartialToolCall>,
+    saw_end: &mut bool,
     sink: &mut DeltaSink<'_>,
 ) -> AppResult<LineOutcome> {
     let Some(data) = line.trim().strip_prefix("data:") else {
         return Ok(LineOutcome::Continue);
     };
     let data = data.trim();
-    if data.is_empty() || data == "[DONE]" {
+    if data.is_empty() {
+        return Ok(LineOutcome::Continue);
+    }
+    if data == "[DONE]" {
+        if provider.is_openai_compatible() {
+            *saw_end = true;
+        }
         return Ok(LineOutcome::Continue);
     }
     let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -546,7 +664,9 @@ fn handle_sse_turn_line(
     match provider {
         Provider::Anthropic => {
             let ev_type = value["type"].as_str().unwrap_or("");
-            if ev_type == "content_block_start" {
+            if ev_type == "message_stop" {
+                *saw_end = true;
+            } else if ev_type == "content_block_start" {
                 if value["content_block"]["type"] == "tool_use" {
                     let idx = value["index"].as_u64().unwrap_or(0) as usize;
                     let entry = partials.entry(idx).or_default();
@@ -575,6 +695,9 @@ fn handle_sse_turn_line(
             }
         }
         Provider::OpenAi | Provider::DeepSeek => {
+            if value["choices"][0]["finish_reason"].is_string() {
+                *saw_end = true;
+            }
             if let Some(text) = value["choices"][0]["delta"]["content"].as_str() {
                 if !text.is_empty() {
                     full.push_str(text);
@@ -607,22 +730,41 @@ async fn consume_sse_turn(
     resp: reqwest::Response,
     sink: &mut DeltaSink<'_>,
     provider: Provider,
-    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    cancel: Option<&CancelSignal>,
 ) -> AppResult<TurnOutcome> {
     let mut resp = ensure_success(resp, "AI API").await?;
     let mut buf: Vec<u8> = Vec::new();
     let mut full = String::new();
     let mut partials: std::collections::BTreeMap<usize, PartialToolCall> =
         std::collections::BTreeMap::new();
+    let mut saw_end = false;
 
-    while let Some(chunk) = resp.chunk().await? {
-        if cancel_flag.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
-            return Ok(TurnOutcome {
-                text: full,
-                tool_calls: Vec::new(),
-                completed: false,
-            });
-        }
+    loop {
+        let maybe_chunk = if let Some(sig) = cancel {
+            if sig.is_cancelled() {
+                return Ok(TurnOutcome {
+                    text: full,
+                    tool_calls: Vec::new(),
+                    completed: false,
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = sig.cancelled() => {
+                    return Ok(TurnOutcome {
+                        text: full,
+                        tool_calls: Vec::new(),
+                        completed: false,
+                    });
+                }
+                res = resp.chunk() => res?,
+            }
+        } else {
+            resp.chunk().await?
+        };
+        let Some(chunk) = maybe_chunk else {
+            break;
+        };
         buf.extend_from_slice(&chunk);
         if buf.len() > MAX_SSE_BUFFER {
             return Err(AppError::other(
@@ -632,7 +774,7 @@ async fn consume_sse_turn(
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let raw: Vec<u8> = buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&raw);
-            match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut *sink)? {
+            match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut saw_end, &mut *sink)? {
                 LineOutcome::Continue => {}
                 LineOutcome::ChannelClosed => {
                     return Ok(TurnOutcome {
@@ -646,7 +788,7 @@ async fn consume_sse_turn(
     }
     if !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf);
-        match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut *sink)? {
+        match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut saw_end, &mut *sink)? {
             LineOutcome::Continue => {}
             LineOutcome::ChannelClosed => {
                 return Ok(TurnOutcome {
@@ -658,30 +800,51 @@ async fn consume_sse_turn(
         }
     }
 
-    let tool_calls: Vec<ToolCallRequest> = partials
-        .into_iter()
-        .filter(|(_, p)| !p.name.is_empty())
-        .map(|(idx, p)| {
-            let arguments = serde_json::from_str::<Value>(&p.args_json)
-                .ok()
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({}));
-            ToolCallRequest {
-                id: if p.id.is_empty() {
-                    format!("call_{idx}")
+    // Protocol-verified completion: Anthropic requires `message_stop`;
+    // OpenAI/DeepSeek require `finish_reason` or `[DONE]`.
+    let completed = saw_end && !cancel.is_some_and(CancelSignal::is_cancelled);
+
+    let tool_calls: Vec<ToolCallRequest> = if completed {
+        partials
+            .into_iter()
+            .filter(|(_, p)| !p.name.is_empty())
+            .map(|(idx, p)| {
+                let trimmed = p.args_json.trim();
+                let (arguments, args_error) = if trimmed.is_empty() {
+                    (json!({}), None)
                 } else {
-                    p.id
-                },
-                name: p.name,
-                arguments,
-            }
-        })
-        .collect();
+                    match serde_json::from_str::<Value>(trimmed) {
+                        Ok(v) if v.is_object() => (v, None),
+                        Ok(_) => (
+                            json!({}),
+                            Some("Tool arguments must be a JSON object".to_string()),
+                        ),
+                        Err(e) => (
+                            json!({}),
+                            Some(format!("Malformed tool arguments JSON: {e}")),
+                        ),
+                    }
+                };
+                ToolCallRequest {
+                    id: if p.id.is_empty() {
+                        format!("call_{idx}")
+                    } else {
+                        p.id
+                    },
+                    name: p.name,
+                    arguments,
+                    args_error,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(TurnOutcome {
         text: full,
         tool_calls,
-        completed: true,
+        completed,
     })
 }
 

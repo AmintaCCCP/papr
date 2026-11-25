@@ -1,11 +1,12 @@
 //! Shared application state, registered via `Builder::manage` and injected into
 //! commands as `tauri::State<AppState>`.
 
+use papr_core::ai::CancelSignal;
 use papr_core::ingestion::rsshub::engine::EngineManager;
 use reqwest::Client;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
@@ -42,7 +43,7 @@ pub struct AppState {
     pending_deep_link: std::sync::Mutex<Option<String>>,
     /// Active AI streaming runs, keyed by frontend run_id, so the user can
     /// click "Stop generating" to abort an in-flight chat/briefing stream.
-    ai_cancels: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
+    ai_cancels: std::sync::Mutex<HashMap<String, Arc<CancelSignal>>>,
 }
 
 impl AppState {
@@ -69,23 +70,23 @@ impl AppState {
         }
     }
 
-    pub fn register_ai_run(&self, run_id: &str) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
+    pub fn register_ai_run(&self, run_id: &str) -> Arc<CancelSignal> {
+        let sig = Arc::new(CancelSignal::new());
         self.ai_cancels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(run_id.to_string(), Arc::clone(&flag));
-        flag
+            .insert(run_id.to_string(), Arc::clone(&sig));
+        sig
     }
 
     pub fn cancel_ai_run(&self, run_id: &str) {
-        if let Some(flag) = self
+        if let Some(sig) = self
             .ai_cancels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
         {
-            flag.store(true, Ordering::Relaxed);
+            sig.cancel();
         }
     }
 

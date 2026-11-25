@@ -371,10 +371,9 @@ export default function Reader({ onToast }: Props) {
     scrollMarkedRef.current = null;
     // The summary card is per-article: close it so the next article starts
     // fresh (the auto-summarize preference re-opens it below when enabled).
+    // The global docked AI assistant stays open across article switches so it
+    // can follow the new article via auto-context.
     setAiOpen(false);
-    // The AI-chat sidebar is per-article too — its conversation is grounded
-    // in this article, so a switch remounts the pane closed and empty.
-    setAiChatOpen(false);
     autoSummarizedRef.current = null;
     // The open-mode marker resets with the view it books: the reset above
     // already put the reader back on the default body, so the next open of

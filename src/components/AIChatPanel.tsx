@@ -136,6 +136,7 @@ export default function AIChatPanel({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [loadingSession, setLoadingSession] = useState(false);
   const [failed, setFailed] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -229,6 +230,7 @@ export default function AIChatPanel({
   const loadSession = async (sessionId: string) => {
     abortActiveRun();
     const loadId = ++sessionLoadRef.current;
+    setLoadingSession(true);
     try {
       const rows = await api.aiChatGetMessages(sessionId);
       if (sessionLoadRef.current !== loadId) return;
@@ -245,12 +247,15 @@ export default function AIChatPanel({
       setHistoryOpen(false);
     } catch (e) {
       if (sessionLoadRef.current === loadId) reportError(e);
+    } finally {
+      if (sessionLoadRef.current === loadId) setLoadingSession(false);
     }
   };
 
   const startNewChat = () => {
     abortActiveRun();
     sessionLoadRef.current += 1;
+    setLoadingSession(false);
     setFailed(false);
     setActiveSessionId(null);
     setMessages([]);
@@ -261,13 +266,16 @@ export default function AIChatPanel({
   };
 
   const deleteSession = async (id: string) => {
-    if (activeSessionId === id) {
+    if (useUi.getState().aiActiveSessionId === id) {
       abortActiveRun();
       sessionLoadRef.current += 1;
+      setLoadingSession(false);
     }
     try {
       await api.aiChatDeleteSession(id);
-      if (activeSessionId === id) {
+      // Re-read the live activeSessionId after await so switching to another
+      // session mid-delete never wipes the newly loaded session.
+      if (useUi.getState().aiActiveSessionId === id) {
         setActiveSessionId(null);
         setMessages([]);
       }
@@ -340,7 +348,8 @@ export default function AIChatPanel({
 
   const sendQuestion = (rawQuestion: string) => {
     const question = rawQuestion.trim();
-    if (!question || busy) return;
+    if (!question || busy || loadingSession) return;
+    sessionLoadRef.current += 1;
     setDraft("");
     setPickerOpen(false);
     stickToBottomRef.current = true;
@@ -378,7 +387,8 @@ export default function AIChatPanel({
   };
 
   const retry = () => {
-    if (busy) return;
+    if (busy || loadingSession) return;
+    sessionLoadRef.current += 1;
     const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
     if (lastUserIdx < 0) return;
     const sid = activeSessionId ?? newSessionId();
@@ -783,7 +793,7 @@ export default function AIChatPanel({
             type="button"
             className="tb-btn send"
             onClick={send}
-            disabled={draft.trim() === ""}
+            disabled={loadingSession || draft.trim() === ""}
             title={t("reader.aiChatSend")}
             aria-label={t("reader.aiChatSend")}
           >

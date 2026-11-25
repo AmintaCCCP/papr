@@ -3805,6 +3805,44 @@ pub fn append_ai_message(
     Ok(msg_id)
 }
 
+/// Atomically ensure the session exists and append both the user turn and the
+/// assistant reply inside a single SQLite transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn save_ai_chat_turn(
+    conn: &mut Connection,
+    session_id: &str,
+    default_title: &str,
+    user_content: &str,
+    contexts_json: Option<&str>,
+    assistant_content: &str,
+    tools_json: Option<&str>,
+) -> AppResult<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO ai_chat_sessions(id, title) VALUES (?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+           title = CASE WHEN trim(title) = '' THEN excluded.title ELSE title END,
+           updated_at = datetime('now')",
+        params![session_id, default_title],
+    )?;
+    tx.execute(
+        "INSERT INTO ai_chat_messages(session_id, role, content, contexts_json, tools_json)
+         VALUES (?1, 'user', ?2, ?3, NULL)",
+        params![session_id, user_content, contexts_json],
+    )?;
+    tx.execute(
+        "INSERT INTO ai_chat_messages(session_id, role, content, contexts_json, tools_json)
+         VALUES (?1, 'assistant', ?2, NULL, ?3)",
+        params![session_id, assistant_content, tools_json],
+    )?;
+    tx.execute(
+        "UPDATE ai_chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
+        params![session_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn list_ai_briefings(conn: &Connection, limit: i64) -> AppResult<Vec<AiBriefing>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, scope_label, days, article_count, content, created_at
@@ -3875,6 +3913,7 @@ pub fn tool_search_articles(
     tag_id: Option<i64>,
     unread_only: bool,
     starred_only: bool,
+    read_later_only: bool,
     days: Option<i64>,
     limit: i64,
 ) -> AppResult<Vec<ToolArticleHit>> {
@@ -3887,6 +3926,7 @@ pub fn tool_search_articles(
             tag_id,
             unread_only,
             starred_only,
+            read_later_only,
             days,
             limit,
         );
@@ -3918,6 +3958,9 @@ pub fn tool_search_articles(
     }
     if starred_only {
         sql.push_str(" AND a.is_starred = 1");
+    }
+    if read_later_only {
+        sql.push_str(" AND a.read_later = 1");
     }
     if let Some(d) = days.filter(|&d| d > 0) {
         sql.push_str(" AND datetime(COALESCE(a.published_at, a.fetched_at)) >= datetime('now', ?)");
@@ -3954,6 +3997,7 @@ pub fn tool_list_recent_articles(
     tag_id: Option<i64>,
     unread_only: bool,
     starred_only: bool,
+    read_later_only: bool,
     days: Option<i64>,
     limit: i64,
 ) -> AppResult<Vec<ToolArticleHit>> {
@@ -3983,6 +4027,9 @@ pub fn tool_list_recent_articles(
     }
     if starred_only {
         sql.push_str(" AND a.is_starred = 1");
+    }
+    if read_later_only {
+        sql.push_str(" AND a.read_later = 1");
     }
     if let Some(d) = days.filter(|&d| d > 0) {
         sql.push_str(" AND datetime(COALESCE(a.published_at, a.fetched_at)) >= datetime('now', ?)");
@@ -4024,7 +4071,9 @@ pub fn tool_search_highlights(
              FROM highlights h
              JOIN articles a ON a.id = h.article_id
              JOIN feeds f ON f.id = a.feed_id
-             WHERE ulower(h.quote) LIKE ?1 OR ulower(h.note) LIKE ?1 OR ulower(a.title) LIKE ?1
+             WHERE unicode_lower(h.quote) LIKE ?1
+                OR unicode_lower(h.note) LIKE ?1
+                OR unicode_lower(a.title) LIKE ?1
              ORDER BY datetime(h.created_at) DESC, h.id DESC
              LIMIT ?2",
             vec![Value::Text(pattern), Value::Integer(limit.clamp(1, 30))],
