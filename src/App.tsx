@@ -256,15 +256,22 @@ export default function App() {
   // Article-action failures route to an error toast, not a silent default one.
   const actions = useArticleActions(toastApi.error);
 
-  // ── background refresh events from the Rust scheduler ──
+  // ── background refresh events from the Rust scheduler & mobile web client ──
   useEffect(() => {
-    const un = listen("feeds-updated", () => {
+    const un1 = listen("feeds-updated", () => {
       qc.invalidateQueries({ queryKey: ["feeds"] });
       qc.invalidateQueries({ queryKey: ["counts"] });
       qc.invalidateQueries({ queryKey: ["articles"] });
     });
+    const un2 = listen("mobile-sync", () => {
+      qc.invalidateQueries({ queryKey: ["feeds"] });
+      qc.invalidateQueries({ queryKey: ["counts"] });
+      qc.invalidateQueries({ queryKey: ["articles"] });
+      qc.invalidateQueries({ queryKey: ["article"] });
+    });
     return () => {
-      un.then((f) => f());
+      un1.then((f) => f());
+      un2.then((f) => f());
     };
   }, [qc]);
 

@@ -46,6 +46,10 @@ pub struct AppState {
     /// cancels any in-flight run for it and duplicate run_ids never clobber
     /// each other on cleanup.
     ai_cancels: std::sync::Mutex<HashMap<String, (Arc<CancelSignal>, Option<String>)>>,
+    /// Running LAN mobile web server handle, if started.
+    pub web_server: std::sync::Mutex<Option<crate::web_server::WebServerHandle>>,
+    /// Serializes web server start/stop operations so rapid restarts never race.
+    pub web_server_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -69,6 +73,8 @@ impl AppState {
             engine,
             pending_deep_link: std::sync::Mutex::new(None),
             ai_cancels: std::sync::Mutex::new(HashMap::new()),
+            web_server: std::sync::Mutex::new(None),
+            web_server_lock: Mutex::new(()),
         }
     }
 
