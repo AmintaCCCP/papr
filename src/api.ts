@@ -3,6 +3,10 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { imageBytes, type ImageBytesResponse } from "./lib/imageBytes";
 import type {
+  AiBriefing,
+  AiChatMessageRow,
+  AiChatSession,
+  AiContextRef,
   AiEvent,
   ArticleDetail,
   ArticlePreviewTranslation,
@@ -234,6 +238,63 @@ export function aiDigest(onToken: (e: AiEvent) => void): Promise<void> {
   const channel = new Channel<AiEvent>();
   channel.onmessage = onToken;
   return invoke<void>("ai_digest", { onToken: channel });
+}
+
+export function aiGlobalChat(
+  runId: string,
+  sessionId: string | null,
+  contexts: AiContextRef[],
+  history: ChatTurn[],
+  question: string,
+  onToken: (e: AiEvent) => void,
+): Promise<void> {
+  const channel = new Channel<AiEvent>();
+  channel.onmessage = onToken;
+  return invoke<void>("ai_global_chat", {
+    runId,
+    sessionId,
+    contexts,
+    history,
+    question,
+    onToken: channel,
+  });
+}
+
+export const aiChatAbort = (runId: string) =>
+  invoke<void>("ai_chat_abort", { runId });
+export const aiChatListSessions = () =>
+  invoke<AiChatSession[]>("ai_chat_list_sessions");
+export const aiChatCreateSession = (id: string, title?: string) =>
+  invoke<AiChatSession>("ai_chat_create_session", { id, title: title ?? null });
+export const aiChatRenameSession = (id: string, title: string) =>
+  invoke<void>("ai_chat_rename_session", { id, title });
+export const aiChatDeleteSession = (id: string) =>
+  invoke<void>("ai_chat_delete_session", { id });
+export const aiChatGetMessages = (sessionId: string) =>
+  invoke<AiChatMessageRow[]>("ai_chat_get_messages", { sessionId });
+
+export const aiListBriefings = () =>
+  invoke<AiBriefing[]>("ai_list_briefings");
+export const aiDeleteBriefing = (id: number) =>
+  invoke<void>("ai_delete_briefing", { id });
+export function aiGenerateBriefing(
+  args: {
+    runId: string;
+    days: number;
+    folderId: number | null;
+    feedId: number | null;
+    unreadOnly: boolean;
+    starredOnly: boolean;
+    scopeLabel: string;
+  },
+  onToken: (e: AiEvent) => void,
+): Promise<AiBriefing | null> {
+  const channel = new Channel<AiEvent>();
+  channel.onmessage = onToken;
+  return invoke<AiBriefing | null>("ai_generate_briefing", {
+    ...args,
+    onToken: channel,
+  });
 }
 
 /** Translate the article body into `lang` using `engine` (`llm` / `google` /

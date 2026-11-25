@@ -28,7 +28,6 @@ import TagPicker from "./TagPicker";
 import HighlightLayer from "./HighlightLayer";
 import ContextMenu, { type MenuEntry } from "./ContextMenu";
 import Lightbox from "./Lightbox";
-import AIChatPanel from "./AIChatPanel";
 
 interface Props {
   onToast: (msg: string) => void;
@@ -216,9 +215,10 @@ export default function Reader({ onToast }: Props) {
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
     y: number;
-    // Set when the right-click landed on an article image / over a text
-    // selection, so the menu can offer image- and copy-specific actions.
+    // Set when the right-click landed on an article image, link, or over a text
+    // selection, so the menu can offer targeted actions.
     imageUrl?: string;
+    linkUrl?: string;
     selection?: string;
   } | null>(null);
   // Full-screen image viewer: the article's image srcs + the one to open on
@@ -371,10 +371,9 @@ export default function Reader({ onToast }: Props) {
     scrollMarkedRef.current = null;
     // The summary card is per-article: close it so the next article starts
     // fresh (the auto-summarize preference re-opens it below when enabled).
+    // The global docked AI assistant stays open across article switches so it
+    // can follow the new article via auto-context.
     setAiOpen(false);
-    // The AI-chat sidebar is per-article too — its conversation is grounded
-    // in this article, so a switch remounts the pane closed and empty.
-    setAiChatOpen(false);
     autoSummarizedRef.current = null;
     // The open-mode marker resets with the view it books: the reset above
     // already put the reader back on the default body, so the next open of
@@ -1185,6 +1184,7 @@ export default function Reader({ onToast }: Props) {
           // when the reader switches articles.
           key={a.id}
           articleId={a.id}
+          articleTitle={a.title}
           bodyRef={bodyRef}
           bodyVersion={displayBody}
         />
@@ -1242,10 +1242,30 @@ export default function Reader({ onToast }: Props) {
         onScroll={onScroll}
         onContextMenu={(e) => {
           e.preventDefault();
-          // Capture what the click landed on so the menu can add image- and
-          // selection-specific actions (the native menu is suppressed app-wide;
-          // see main.tsx).
-          const img = (e.target as HTMLElement).closest("img") as HTMLImageElement | null;
+          // Capture what the click landed on so the menu can add image-, link-,
+          // and selection-specific actions (the native menu is suppressed
+          // app-wide; see main.tsx).
+          const target = e.target as HTMLElement;
+          const img = target.closest("img") as HTMLImageElement | null;
+          const anchor = target.closest("a[href]") as HTMLAnchorElement | null;
+          let linkUrl: string | undefined;
+          if (anchor) {
+            const rawHref = anchor.getAttribute("href")?.trim();
+            if (rawHref && !rawHref.startsWith("#")) {
+              try {
+                const parsed = a.url ? new URL(rawHref, a.url) : new URL(rawHref);
+                if (
+                  parsed.protocol === "http:" ||
+                  parsed.protocol === "https:" ||
+                  parsed.protocol === "mailto:"
+                ) {
+                  linkUrl = parsed.href;
+                }
+              } catch {
+                // Ignore malformed or unsupported link URLs.
+              }
+            }
+          }
           const sel = window.getSelection();
           const selection =
             sel && !sel.isCollapsed ? sel.toString().trim() : "";
@@ -1255,6 +1275,7 @@ export default function Reader({ onToast }: Props) {
             // data-papr-src holds the real address when the image was
             // recovered through the backend and src is an inline data: URL.
             imageUrl: img?.dataset.paprSrc || img?.currentSrc || img?.getAttribute("src") || undefined,
+            linkUrl,
             selection: selection || undefined,
           });
         }}
@@ -1508,16 +1529,6 @@ export default function Reader({ onToast }: Props) {
         />
       )}
 
-      {/* The AI-chat sidebar: per-article Q&A over the reading view, opened
-          from the toolbar or the article context menu. Keyed by article id so
-          a switch remounts the pane with an empty conversation. */}
-      <AIChatPanel
-        key={a.id}
-        article={a}
-        open={aiChatOpen}
-        onClose={() => setAiChatOpen(false)}
-      />
-
       {ctxMenu && (
         <ContextMenu
           x={ctxMenu.x}
@@ -1529,6 +1540,30 @@ export default function Reader({ onToast }: Props) {
                     icon: "copy" as const,
                     label: t("reader.ctxCopy"),
                     onClick: () => copyText(ctxMenu.selection!, "reader.textCopied"),
+                  },
+                  {
+                    icon: "sparkle" as const,
+                    label: t("reader.ctxAskAi"),
+                    onClick: () =>
+                      useUi
+                        .getState()
+                        .askAiAboutSelection(a.id, a.title, ctxMenu.selection!),
+                  },
+                ]
+              : []),
+            ...(ctxMenu.linkUrl
+              ? [
+                  {
+                    icon: "open" as const,
+                    label: t("reader.ctxOpenLink"),
+                    onClick: () => {
+                      openUrl(ctxMenu.linkUrl!).catch(() => {});
+                    },
+                  },
+                  {
+                    icon: "copy" as const,
+                    label: t("reader.ctxCopyLink"),
+                    onClick: () => copyText(ctxMenu.linkUrl!, "reader.linkCopied"),
                   },
                 ]
               : []),
@@ -1547,7 +1582,7 @@ export default function Reader({ onToast }: Props) {
                   },
                 ]
               : []),
-            ...(ctxMenu.selection || ctxMenu.imageUrl
+            ...(ctxMenu.selection || ctxMenu.linkUrl || ctxMenu.imageUrl
               ? [{ separator: true as const }]
               : []),
             {

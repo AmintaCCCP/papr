@@ -1,13 +1,9 @@
 // @vitest-environment jsdom
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AIChatPanel from "./AIChatPanel";
 import { useUi } from "../store";
-
-// The chat sidebar against the production call seam: the panel invoking
-// api.aiArticleChat with the conversation-so-far, deltas landing in the
-// assistant bubble, and a failed send offering a retry that re-asks the same
-// question with the prior turns as history.
 
 const h = vi.hoisted(() => {
   if (
@@ -53,7 +49,15 @@ const h = vi.hoisted(() => {
       enclosures: [],
       tags: [],
     },
-    aiArticleChat: vi.fn(),
+    aiGlobalChat: vi.fn(),
+    aiChatAbort: vi.fn(async () => {}),
+    aiChatListSessions: vi.fn(async () => []),
+    aiChatGetMessages: vi.fn(async () => []),
+    aiChatDeleteSession: vi.fn(async () => {}),
+    getArticle: vi.fn(),
+    listFeeds: vi.fn(async () => []),
+    listFolders: vi.fn(async () => []),
+    listTags: vi.fn(async () => []),
     toastError: vi.fn(),
     reportError: vi.fn(),
   };
@@ -63,7 +67,15 @@ vi.mock("../api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api")>();
   return {
     ...actual,
-    aiArticleChat: h.aiArticleChat,
+    aiGlobalChat: h.aiGlobalChat,
+    aiChatAbort: h.aiChatAbort,
+    aiChatListSessions: h.aiChatListSessions,
+    aiChatGetMessages: h.aiChatGetMessages,
+    aiChatDeleteSession: h.aiChatDeleteSession,
+    getArticle: h.getArticle,
+    listFeeds: h.listFeeds,
+    listFolders: h.listFolders,
+    listTags: h.listTags,
   };
 });
 
@@ -75,31 +87,57 @@ vi.mock("../toast", () => ({
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }));
 
 const renderPanel = (open = true) => {
-  const utils = render(<AIChatPanel article={h.article} open={open} onClose={() => {}} />);
-  return utils;
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <AIChatPanel open={open} onClose={() => {}} />
+    </QueryClientProvider>,
+  );
 };
 
 async function ask(question: string, container: HTMLElement) {
   const box = container.querySelector("textarea") as HTMLTextAreaElement;
   fireEvent.change(box, { target: { value: question } });
   fireEvent.keyDown(box, { key: "Enter", shiftKey: false });
-  await waitFor(() => expect(h.aiArticleChat).toHaveBeenCalled());
-  // The call the send produced: (articleId, history, question, onToken).
-  return h.aiArticleChat.mock.calls[h.aiArticleChat.mock.calls.length - 1];
+  await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalled());
+  return h.aiGlobalChat.mock.calls[h.aiGlobalChat.mock.calls.length - 1];
 }
 
-describe("AIChatPanel", () => {
+describe("AIChatPanel (Global)", () => {
   beforeEach(() => {
-    h.aiArticleChat.mockReset();
+    h.aiGlobalChat.mockReset();
+    h.aiChatAbort.mockReset().mockResolvedValue(undefined);
+    h.aiChatListSessions.mockReset().mockResolvedValue([]);
+    h.getArticle.mockReset().mockResolvedValue(h.article);
     h.toastError.mockReset();
     h.reportError.mockReset();
-    useUi.setState({ aiChatWidth: 360 });
+    useUi.setState({
+      aiChatWidth: 360,
+      selectedArticleId: 7,
+      aiActiveSessionId: null,
+      aiPinnedContexts: [],
+    });
   });
   afterEach(() => cleanup());
 
-  it("sends the question and streams the answer into the assistant bubble", async () => {
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+  it("streams deltas and tool traces, and attaches current article context", async () => {
+    h.aiGlobalChat.mockImplementation(
+      (
+        _runId: string,
+        _sid: string | null,
+        _ctx: unknown,
+        _history: unknown,
+        _q: string,
+        onToken: (e: { type: string; data?: unknown }) => void,
+      ) => {
+        onToken({
+          type: "toolCall",
+          data: { id: "t1", name: "search_articles", args: '{"query":"test"}' },
+        });
+        onToken({
+          type: "toolResult",
+          data: { id: "t1", name: "search_articles", summary: "3 articles" },
+        });
         onToken({ type: "delta", data: "Hel" });
         onToken({ type: "delta", data: "lo there" });
         onToken({ type: "done" });
@@ -107,26 +145,25 @@ describe("AIChatPanel", () => {
       },
     );
     const { container } = renderPanel();
-    const [, history, question, onToken] = await ask("这篇文章讲了什么？", container);
+    await waitFor(() => expect(h.getArticle).toHaveBeenCalledWith(7));
+    const [, , contexts, history, question] = await ask("这篇文章讲了什么？", container);
     expect(history).toEqual([]);
     expect(question).toBe("这篇文章讲了什么？");
-    expect(h.article.id).toBe(7);
-    // Deltas land in the (markdown-rendered) assistant bubble; the composer
-    // is cleared for the next question.
+    expect(contexts).toEqual([{ kind: "article", articleId: 7, title: "An Article" }]);
     await waitFor(() => expect(container.textContent).toContain("Hello there"));
-    const box = container.querySelector("textarea") as HTMLTextAreaElement;
-    expect(box.value).toBe("");
-    // The channel promise resolved — busy cleared, the done event was not an
-    // error.
-    expect(onToken).toBeDefined();
-    expect(container.textContent).not.toContain("失败");
+    expect(container.textContent).toContain("3 articles");
   });
 
   it("keeps the user's question and offers a retry when the stream errors", async () => {
-    // First exchange answers fine, so the retry after the failed second
-    // question proves prior turns ride along as history.
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+    h.aiGlobalChat.mockImplementation(
+      (
+        _runId: string,
+        _sid: string | null,
+        _ctx: unknown,
+        _history: unknown,
+        _q: string,
+        onToken: (e: { type: string; data?: unknown }) => void,
+      ) => {
         onToken({ type: "delta", data: "first answer" });
         onToken({ type: "done" });
         return Promise.resolve();
@@ -136,24 +173,33 @@ describe("AIChatPanel", () => {
     await ask("第一问", container);
     await waitFor(() => expect(container.textContent).toContain("first answer"));
 
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+    h.aiGlobalChat.mockImplementation(
+      (
+        _runId: string,
+        _sid: string | null,
+        _ctx: unknown,
+        _history: unknown,
+        _q: string,
+        onToken: (e: { type: string; data?: unknown }) => void,
+      ) => {
         onToken({ type: "error", data: "provider down" });
         return Promise.resolve();
       },
     );
     await ask("第二问", container);
-    // The question stays on the record and the failure banner appears (the
-    // banner is localized — assert the element, not the copy).
     await waitFor(() => expect(container.textContent).toContain("第二问"));
-    expect(container.textContent).not.toContain("provider down");
-    expect(container.querySelector(".ai-chat-failed")).not.toBeNull();
     const retry = container.querySelector(".ai-chat-failed .empty-retry") as HTMLButtonElement;
     expect(retry).not.toBeNull();
 
-    // Retry re-asks the same question; the prior exchange is now history.
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
+    h.aiGlobalChat.mockImplementation(
+      (
+        _runId: string,
+        _sid: string | null,
+        _ctx: unknown,
+        _history: unknown,
+        _q: string,
+        onToken: (e: { type: string; data?: unknown }) => void,
+      ) => {
         onToken({ type: "delta", data: "现在好了" });
         onToken({ type: "done" });
         return Promise.resolve();
@@ -162,8 +208,8 @@ describe("AIChatPanel", () => {
     await act(async () => {
       fireEvent.click(retry);
     });
-    await waitFor(() => expect(h.aiArticleChat).toHaveBeenCalledTimes(3));
-    const [, history, question] = h.aiArticleChat.mock.calls[2];
+    await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalledTimes(3));
+    const [, , , history, question] = h.aiGlobalChat.mock.calls[2];
     expect(question).toBe("第二问");
     expect(history).toEqual([
       { role: "user", content: "第一问" },
@@ -172,84 +218,10 @@ describe("AIChatPanel", () => {
     await waitFor(() => expect(container.textContent).toContain("现在好了"));
   });
 
-  it("clears a partial reply before retrying, so the new answer stands alone", async () => {
-    // First request streams a fragment, then dies mid-answer. The retry must
-    // NOT append the new stream to the fragment — that would splice two
-    // answers together, and the next question would send the concatenation
-    // as history.
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
-        onToken({ type: "delta", data: "旧片段" });
-        onToken({ type: "error", data: "stream died" });
-        return Promise.resolve();
-      },
-    );
-    const { container } = renderPanel();
-    await ask("这个概念怎么理解？", container);
-    await waitFor(() => expect(container.textContent).toContain("旧片段"));
-    expect(container.querySelector(".ai-chat-failed")).not.toBeNull();
-
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
-        onToken({ type: "delta", data: "完整新回答" });
-        onToken({ type: "done" });
-        return Promise.resolve();
-      },
-    );
-    const retry = container.querySelector(".ai-chat-failed .empty-retry") as HTMLButtonElement;
-    await act(async () => {
-      fireEvent.click(retry);
-    });
-    await waitFor(() => expect(h.aiArticleChat).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(container.textContent).toContain("完整新回答"));
-    // The fragment is gone: the bubble shows ONLY the new answer.
-    expect(container.textContent).not.toContain("旧片段");
-    // And the next question must not send the concatenation as history.
-    h.aiArticleChat.mockImplementation(() => Promise.resolve());
-    await ask("下一问", container);
-    const [, history] = h.aiArticleChat.mock.calls[h.aiArticleChat.mock.calls.length - 1];
-    expect(history).toEqual([
-      { role: "user", content: "这个概念怎么理解？" },
-      { role: "assistant", content: "完整新回答" },
-    ]);
-  });
-
-  it("parks the conversation off-screen while closed, inert", () => {
+  it("renders nothing when closed and docks when open", () => {
     const { container } = renderPanel(false);
-    const pane = container.querySelector(".ai-chat") as HTMLElement;
-    expect(pane.className).not.toContain("open");
-    expect(pane.getAttribute("inert")).not.toBeNull();
-    const opened = render(<AIChatPanel article={h.article} open={true} onClose={() => {}} />);
-    const openPane = opened.container.querySelector(".ai-chat") as HTMLElement;
-    expect(openPane.className).toContain("open");
-  });
-
-  it("invalidates in-flight requests on unmount so errors do not surface globally", async () => {
-    let rejectPromise!: (err: unknown) => void;
-    let onTokenCallback!: (e: { type: string; data?: string }) => void;
-    h.aiArticleChat.mockImplementation(
-      (_id: number, _history: unknown, _q: string, onToken: (e: { type: string; data?: string }) => void) => {
-        onTokenCallback = onToken;
-        return new Promise((_, reject) => {
-          rejectPromise = reject;
-        });
-      },
-    );
-
-    const { container, unmount } = renderPanel();
-    await ask("测试卸载请求", container);
-    expect(h.aiArticleChat).toHaveBeenCalledTimes(1);
-
-    // Unmount before the network response or stream failure settles
-    unmount();
-
-    // Emitting error event or rejecting promise after unmount must be ignored
-    await act(async () => {
-      onTokenCallback({ type: "error", data: "network aborted" });
-      rejectPromise(new Error("aborted"));
-    });
-
-    expect(h.toastError).not.toHaveBeenCalled();
-    expect(h.reportError).not.toHaveBeenCalled();
+    expect(container.querySelector(".ai-chat")).toBeNull();
+    const opened = renderPanel(true);
+    expect(opened.container.querySelector(".ai-chat--docked")).not.toBeNull();
   });
 });

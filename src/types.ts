@@ -381,8 +381,53 @@ export type ArticleQuery =
 
 export type AiEvent =
   | { type: "delta"; data: string }
+  | { type: "toolCall"; data: { id: string; name: string; args: string } }
+  | { type: "toolResult"; data: { id: string; name: string; summary: string } }
   | { type: "done" }
   | { type: "error"; data: string };
+
+export type AiContextRef =
+  | { kind: "article"; articleId: number; title: string }
+  | { kind: "selection"; articleId: number; title: string; quote: string }
+  | { kind: "feed"; feedId: number; title: string }
+  | { kind: "folder"; folderId: number; name: string }
+  | { kind: "tag"; tagId: number; name: string }
+  | { kind: "view"; query: ArticleQuery; label: string }
+  | { kind: "briefing"; briefingId: number; title: string; content: string };
+
+export interface AiToolTrace {
+  id: string;
+  name: string;
+  args: string;
+  summary?: string;
+}
+
+export interface AiChatSession {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiChatMessageRow {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant";
+  content: string;
+  contextsJson: string | null;
+  toolsJson: string | null;
+  createdAt: string;
+}
+
+export interface AiBriefing {
+  id: number;
+  title: string;
+  scopeLabel: string;
+  days: number;
+  articleCount: number;
+  content: string;
+  createdAt: string;
+}
 
 /** Batch-level translation progress (mirrors commands::TranslateEvent). */
 export type TranslateEvent =

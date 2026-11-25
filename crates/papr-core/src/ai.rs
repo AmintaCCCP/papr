@@ -69,12 +69,114 @@ pub const TRANSLATE_CHUNK_BUDGET: usize = 3000;
 const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
 /// Token-level events streamed to the frontend over an `ipc::Channel`.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase", tag = "type", content = "data")]
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "type", content = "data")]
 pub enum AiEvent {
     Delta(String),
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        summary: String,
+    },
     Done,
     Error(String),
+}
+
+/// JSON-schema definition of a read-only tool offered to the LLM.
+#[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
+}
+
+/// Wakeable cancellation signal for in-flight AI network requests and SSE reads.
+pub struct CancelSignal {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelSignal {
+    pub fn new() -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Returns true when an HTTP error from a provider specifically indicates that
+/// the endpoint rejected `tools` / function calling (HTTP 400 or 422 mentioning
+/// tools/functions, never auth errors like 401/403).
+pub fn is_tool_unsupported_error(err: &AppError) -> bool {
+    let msg = err.to_string().to_lowercase();
+    let is_bad_request = msg.starts_with("ai api error 400") || msg.starts_with("ai api error 422");
+    is_bad_request
+        && (msg.contains("tool") || msg.contains("function") || msg.contains("unsupported"))
+}
+
+/// One tool invocation emitted by the LLM during a streamed turn.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    /// Set when the model emitted malformed or non-object JSON arguments,
+    /// so the caller returns a tool error instead of running with `{}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_error: Option<String>,
+}
+
+/// Multi-turn conversation message supporting tool calls and tool results.
+#[derive(Debug, Clone)]
+pub enum ConversationMessage {
+    User(String),
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCallRequest>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        content: String,
+    },
+}
+
+/// Result of one streamed model turn (text + any requested tool calls).
+pub struct TurnOutcome {
+    pub text: String,
+    pub tool_calls: Vec<ToolCallRequest>,
+    pub completed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,6 +304,548 @@ pub async fn stream_chat(
     } else {
         stream_anthropic(client, cfg, system, user, sink, max_tokens).await
     }
+}
+
+/// Stream a single-turn chat completion with wakeable cancellation support
+/// across both HTTP `.send()` and SSE chunk reads.
+pub async fn stream_chat_cancellable(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    user: &str,
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<ChatOutcome> {
+    let msgs = [ConversationMessage::User(user.to_string())];
+    let outcome = stream_conversation(client, cfg, system, &msgs, &[], false, sink, max_tokens, cancel).await?;
+    Ok(ChatOutcome {
+        text: outcome.text,
+        completed: outcome.completed,
+    })
+}
+
+/// Stream one multi-turn conversation turn, optionally offering read-only tools.
+/// When `tools` is non-empty and `allow_tool_calls` is `false`, the `tools`
+/// definitions stay in the request (required by Anthropic whenever prior
+/// `tool_use`/`tool_result` blocks exist) while `tool_choice` is set to `none`.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_conversation(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolDef],
+    allow_tool_calls: bool,
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<TurnOutcome> {
+    if cfg.provider.is_openai_compatible() {
+        stream_openai_conversation(
+            client,
+            cfg,
+            system,
+            messages,
+            tools,
+            allow_tool_calls,
+            sink,
+            max_tokens,
+            cancel,
+        )
+        .await
+    } else {
+        stream_anthropic_conversation(
+            client,
+            cfg,
+            system,
+            messages,
+            tools,
+            allow_tool_calls,
+            sink,
+            max_tokens,
+            cancel,
+        )
+        .await
+    }
+}
+
+async fn send_cancellable(
+    req: reqwest::RequestBuilder,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<Option<Response>> {
+    if let Some(sig) = cancel {
+        if sig.is_cancelled() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            _ = sig.cancelled() => Ok(None),
+            res = req.send() => Ok(Some(res?)),
+        }
+    } else {
+        Ok(Some(req.send().await?))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_anthropic_conversation(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolDef],
+    allow_tool_calls: bool,
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<TurnOutcome> {
+    let mut wire_msgs: Vec<Value> = Vec::new();
+    let mut pending_tool_results: Vec<Value> = Vec::new();
+
+    let flush_tool_results = |wire: &mut Vec<Value>, pending: &mut Vec<Value>| {
+        if !pending.is_empty() {
+            wire.push(json!({
+                "role": "user",
+                "content": std::mem::take(pending),
+            }));
+        }
+    };
+
+    for m in messages {
+        match m {
+            ConversationMessage::User(text) => {
+                flush_tool_results(&mut wire_msgs, &mut pending_tool_results);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if let Some(last) = wire_msgs.last_mut() {
+                    if last["role"] == "user" && last["content"].is_string() {
+                        let prev = last["content"].as_str().unwrap_or("");
+                        last["content"] = Value::String(format!("{prev}\n\n{text}"));
+                        continue;
+                    }
+                }
+                wire_msgs.push(json!({ "role": "user", "content": text }));
+            }
+            ConversationMessage::Assistant { text, tool_calls } => {
+                flush_tool_results(&mut wire_msgs, &mut pending_tool_results);
+                if tool_calls.is_empty() && text.trim().is_empty() {
+                    continue;
+                }
+                if wire_msgs.is_empty() {
+                    continue;
+                }
+                if tool_calls.is_empty() {
+                    if let Some(last) = wire_msgs.last_mut() {
+                        if last["role"] == "assistant" && last["content"].is_string() {
+                            let prev = last["content"].as_str().unwrap_or("");
+                            last["content"] = Value::String(format!("{prev}\n\n{text}"));
+                            continue;
+                        }
+                    }
+                    wire_msgs.push(json!({ "role": "assistant", "content": text }));
+                } else {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    for tc in tool_calls {
+                        let input = if tc.arguments.is_object() {
+                            tc.arguments.clone()
+                        } else {
+                            json!({})
+                        };
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": input,
+                        }));
+                    }
+                    wire_msgs.push(json!({ "role": "assistant", "content": blocks }));
+                }
+            }
+            ConversationMessage::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                pending_tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content,
+                }));
+            }
+        }
+    }
+    flush_tool_results(&mut wire_msgs, &mut pending_tool_results);
+
+    let mut body = json!({
+        "model": cfg.model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "stream": true,
+        "messages": wire_msgs,
+    });
+    if !tools.is_empty() {
+        let tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tool_defs);
+        if !allow_tool_calls {
+            body["tool_choice"] = json!({ "type": "none" });
+        }
+    }
+
+    let req = client
+        .post(format!("{}/messages", cfg.base_url))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .timeout(AI_REQUEST_TIMEOUT)
+        .json(&body);
+    let Some(resp) = send_cancellable(req, cancel).await? else {
+        return Ok(TurnOutcome {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            completed: false,
+        });
+    };
+    consume_sse_turn(resp, sink, Provider::Anthropic, cancel).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_openai_conversation(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolDef],
+    allow_tool_calls: bool,
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<TurnOutcome> {
+    let mut wire_msgs: Vec<Value> = vec![json!({ "role": "system", "content": system })];
+    for m in messages {
+        match m {
+            ConversationMessage::User(text) => {
+                wire_msgs.push(json!({ "role": "user", "content": text }));
+            }
+            ConversationMessage::Assistant { text, tool_calls } => {
+                if tool_calls.is_empty() {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    wire_msgs.push(json!({ "role": "assistant", "content": text }));
+                } else {
+                    let tcs: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+                                }
+                            })
+                        })
+                        .collect();
+                    let content_val = if text.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(text.clone())
+                    };
+                    wire_msgs.push(json!({
+                        "role": "assistant",
+                        "content": content_val,
+                        "tool_calls": tcs,
+                    }));
+                }
+            }
+            ConversationMessage::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                wire_msgs.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
+                }));
+            }
+        }
+    }
+
+    let mut body = json!({
+        "model": cfg.model,
+        "max_tokens": max_tokens,
+        "stream": true,
+        "messages": wire_msgs,
+    });
+    if !tools.is_empty() {
+        let tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tool_defs);
+        if !allow_tool_calls {
+            body["tool_choice"] = Value::String("none".to_string());
+        }
+    }
+
+    let req = client
+        .post(format!("{}/chat/completions", cfg.base_url))
+        .bearer_auth(&cfg.api_key)
+        .timeout(AI_REQUEST_TIMEOUT)
+        .json(&body);
+    let Some(resp) = send_cancellable(req, cancel).await? else {
+        return Ok(TurnOutcome {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            completed: false,
+        });
+    };
+    consume_sse_turn(resp, sink, Provider::OpenAi, cancel).await
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    args_json: String,
+}
+
+fn handle_sse_turn_line(
+    line: &str,
+    provider: Provider,
+    full: &mut String,
+    partials: &mut std::collections::BTreeMap<usize, PartialToolCall>,
+    saw_end: &mut bool,
+    sink: &mut DeltaSink<'_>,
+) -> AppResult<LineOutcome> {
+    let Some(data) = line.trim().strip_prefix("data:") else {
+        return Ok(LineOutcome::Continue);
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(LineOutcome::Continue);
+    }
+    if data == "[DONE]" {
+        if provider.is_openai_compatible() {
+            *saw_end = true;
+        }
+        return Ok(LineOutcome::Continue);
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Ok(LineOutcome::Continue);
+    };
+    if let Some(msg) = extract_error(&value, provider) {
+        return Err(AppError::other(format!("AI stream error: {msg}")));
+    }
+    match provider {
+        Provider::Anthropic => {
+            let ev_type = value["type"].as_str().unwrap_or("");
+            if ev_type == "message_stop" {
+                *saw_end = true;
+            } else if ev_type == "content_block_start" {
+                if value["content_block"]["type"] == "tool_use" {
+                    let idx = value["index"].as_u64().unwrap_or(0) as usize;
+                    let entry = partials.entry(idx).or_default();
+                    if let Some(id) = value["content_block"]["id"].as_str() {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(name) = value["content_block"]["name"].as_str() {
+                        entry.name = name.to_string();
+                    }
+                }
+            } else if ev_type == "content_block_delta" {
+                let delta_type = value["delta"]["type"].as_str().unwrap_or("");
+                if delta_type == "text_delta" {
+                    if let Some(text) = value["delta"]["text"].as_str() {
+                        full.push_str(text);
+                        if !sink(text) {
+                            return Ok(LineOutcome::ChannelClosed);
+                        }
+                    }
+                } else if delta_type == "input_json_delta" {
+                    if let Some(partial) = value["delta"]["partial_json"].as_str() {
+                        let idx = value["index"].as_u64().unwrap_or(0) as usize;
+                        partials.entry(idx).or_default().args_json.push_str(partial);
+                    }
+                }
+            }
+        }
+        Provider::OpenAi | Provider::DeepSeek => {
+            if value["choices"][0]["finish_reason"].is_string() {
+                *saw_end = true;
+            }
+            if let Some(text) = value["choices"][0]["delta"]["content"].as_str() {
+                if !text.is_empty() {
+                    full.push_str(text);
+                    if !sink(text) {
+                        return Ok(LineOutcome::ChannelClosed);
+                    }
+                }
+            }
+            if let Some(tcs) = value["choices"][0]["delta"]["tool_calls"].as_array() {
+                for tc in tcs {
+                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                    let entry = partials.entry(idx).or_default();
+                    if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(name) = tc["function"]["name"].as_str().filter(|s| !s.is_empty()) {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        entry.args_json.push_str(args);
+                    }
+                }
+            }
+        }
+    }
+    Ok(LineOutcome::Continue)
+}
+
+async fn consume_sse_turn(
+    resp: reqwest::Response,
+    sink: &mut DeltaSink<'_>,
+    provider: Provider,
+    cancel: Option<&CancelSignal>,
+) -> AppResult<TurnOutcome> {
+    let mut resp = ensure_success(resp, "AI API").await?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut full = String::new();
+    let mut partials: std::collections::BTreeMap<usize, PartialToolCall> =
+        std::collections::BTreeMap::new();
+    let mut saw_end = false;
+
+    loop {
+        let maybe_chunk = if let Some(sig) = cancel {
+            if sig.is_cancelled() {
+                return Ok(TurnOutcome {
+                    text: full,
+                    tool_calls: Vec::new(),
+                    completed: false,
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = sig.cancelled() => {
+                    return Ok(TurnOutcome {
+                        text: full,
+                        tool_calls: Vec::new(),
+                        completed: false,
+                    });
+                }
+                res = resp.chunk() => res?,
+            }
+        } else {
+            resp.chunk().await?
+        };
+        let Some(chunk) = maybe_chunk else {
+            break;
+        };
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_SSE_BUFFER {
+            return Err(AppError::other(
+                "AI stream error: response is not server-sent events",
+            ));
+        }
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut saw_end, &mut *sink)? {
+                LineOutcome::Continue => {}
+                LineOutcome::ChannelClosed => {
+                    return Ok(TurnOutcome {
+                        text: full,
+                        tool_calls: Vec::new(),
+                        completed: false,
+                    });
+                }
+            }
+        }
+    }
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut saw_end, &mut *sink)? {
+            LineOutcome::Continue => {}
+            LineOutcome::ChannelClosed => {
+                return Ok(TurnOutcome {
+                    text: full,
+                    tool_calls: Vec::new(),
+                    completed: false,
+                });
+            }
+        }
+    }
+
+    // Protocol-verified completion: Anthropic requires `message_stop`;
+    // OpenAI/DeepSeek require `finish_reason` or `[DONE]`.
+    let completed = saw_end && !cancel.is_some_and(CancelSignal::is_cancelled);
+
+    let tool_calls: Vec<ToolCallRequest> = if completed {
+        partials
+            .into_iter()
+            .filter(|(_, p)| !p.name.is_empty())
+            .map(|(idx, p)| {
+                let trimmed = p.args_json.trim();
+                let (arguments, args_error) = if trimmed.is_empty() {
+                    (json!({}), None)
+                } else {
+                    match serde_json::from_str::<Value>(trimmed) {
+                        Ok(v) if v.is_object() => (v, None),
+                        Ok(_) => (
+                            json!({}),
+                            Some("Tool arguments must be a JSON object".to_string()),
+                        ),
+                        Err(e) => (
+                            json!({}),
+                            Some(format!("Malformed tool arguments JSON: {e}")),
+                        ),
+                    }
+                };
+                ToolCallRequest {
+                    id: if p.id.is_empty() {
+                        format!("call_{idx}")
+                    } else {
+                        p.id
+                    },
+                    name: p.name,
+                    arguments,
+                    args_error,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(TurnOutcome {
+        text: full,
+        tool_calls,
+        completed,
+    })
 }
 
 /// Run a completion to the end and return its full text WITHOUT forwarding

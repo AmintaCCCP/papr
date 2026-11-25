@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import i18n from "./i18n";
 import * as api from "./api";
-import type { ArticleQuery } from "./types";
+import type { AiBriefing, AiContextRef, ArticleQuery } from "./types";
 
 /** Appearance is two independent axes: a colour `Palette` (the family — warm
  *  Paper, cool Frost, high-contrast) and a light/dark `Mode`. Their product is
@@ -178,10 +178,16 @@ interface UiState {
    *  article — the reader closes it on article switch (the auto-summarize
    *  preference re-opens it for the new article when on). */
   aiOpen: boolean;
-  /** The reader's AI-chat sidebar (article Q&A) is open. Independent of the
-   *  summary card: the card's interaction is untouched, this pane only ever
-   *  hosts the conversation. */
+  /** The global AI-chat sidebar (docked on the right) is open. */
   aiChatOpen: boolean;
+  /** The AI Briefing view is active in the main area instead of list+reader. */
+  briefingOpen: boolean;
+  /** Active persisted AI chat session ID (null = fresh unsaved session). */
+  aiActiveSessionId: string | null;
+  /** Manually pinned / attached context chips in the global AI composer. */
+  aiPinnedContexts: AiContextRef[];
+  /** Optional draft prompt handed to the AI composer (e.g. from selection). */
+  aiPendingPrompt: string | null;
   /** Whether the reader shows the reading view or the article's original
    *  page (native child webview). Lives here, not in the reader component,
    *  so the keyboard / command-palette AI-summary toggle can return to the
@@ -218,6 +224,14 @@ interface UiState {
   setFocusMode: (v: boolean) => void;
   setAiOpen: (v: boolean) => void;
   setAiChatOpen: (v: boolean) => void;
+  setBriefingOpen: (v: boolean) => void;
+  setAiActiveSessionId: (id: string | null) => void;
+  addAiContext: (ctx: AiContextRef) => void;
+  removeAiContext: (index: number) => void;
+  clearAiContexts: () => void;
+  consumeAiPendingPrompt: () => string | null;
+  askAiAboutSelection: (articleId: number, title: string, quote: string) => void;
+  askAiAboutBriefing: (briefing: AiBriefing) => void;
   setReaderView: (v: "reader" | "web") => void;
   setModalOpen: (v: boolean) => void;
   setMenuOpen: (v: boolean) => void;
@@ -340,6 +354,10 @@ export const useUi = create<UiState>((set, get) => ({
   focusMode: false,
   aiOpen: false,
   aiChatOpen: false,
+  briefingOpen: false,
+  aiActiveSessionId: null,
+  aiPinnedContexts: [],
+  aiPendingPrompt: null,
   readerView: "reader",
   modalOpen: false,
   menuOpen: false,
@@ -349,9 +367,19 @@ export const useUi = create<UiState>((set, get) => ({
     // can restore it next launch.
     ls.set("lastView", JSON.stringify({ query, label }));
     // Reset the paging anchor: a new selection always opens at the newest page.
-    set({ query, queryLabel: label, selectedArticleId: null, listAnchor: 0 });
+    set({
+      query,
+      queryLabel: label,
+      selectedArticleId: null,
+      listAnchor: 0,
+      briefingOpen: false,
+    });
   },
-  openArticle: (id) => set({ selectedArticleId: id }),
+  openArticle: (id) =>
+    set((s) => ({
+      selectedArticleId: id,
+      briefingOpen: id != null ? false : s.briefingOpen,
+    })),
   // Toggling a filter/sort rebuilds the list, so re-anchor to the newest page.
   toggleUnreadOnly: () => set((s) => ({ unreadOnly: !s.unreadOnly, listAnchor: 0 })),
   toggleSort: () => set((s) => ({ sortOldest: !s.sortOldest, listAnchor: 0 })),
@@ -414,6 +442,51 @@ export const useUi = create<UiState>((set, get) => ({
   setFocusMode: (focusMode) => set({ focusMode }),
   setAiOpen: (aiOpen) => set({ aiOpen }),
   setAiChatOpen: (aiChatOpen) => set({ aiChatOpen }),
+  setBriefingOpen: (briefingOpen) =>
+    set((s) => ({
+      briefingOpen,
+      focusMode: briefingOpen ? false : s.focusMode,
+    })),
+  setAiActiveSessionId: (aiActiveSessionId) => set({ aiActiveSessionId }),
+  addAiContext: (ctx) =>
+    set((s) => {
+      const key = JSON.stringify(ctx);
+      if (s.aiPinnedContexts.some((c) => JSON.stringify(c) === key)) return s;
+      return { aiPinnedContexts: [...s.aiPinnedContexts, ctx] };
+    }),
+  removeAiContext: (index) =>
+    set((s) => ({
+      aiPinnedContexts: s.aiPinnedContexts.filter((_, i) => i !== index),
+    })),
+  clearAiContexts: () => set({ aiPinnedContexts: [] }),
+  consumeAiPendingPrompt: () => {
+    const p = get().aiPendingPrompt;
+    if (p != null) set({ aiPendingPrompt: null });
+    return p;
+  },
+  askAiAboutSelection: (articleId, title, quote) =>
+    set((s) => {
+      const nextCtx: AiContextRef = { kind: "selection", articleId, title, quote };
+      const filtered = s.aiPinnedContexts.filter((c) => c.kind !== "selection");
+      return {
+        aiChatOpen: true,
+        aiPinnedContexts: [...filtered, nextCtx],
+      };
+    }),
+  askAiAboutBriefing: (briefing) =>
+    set((s) => {
+      const nextCtx: AiContextRef = {
+        kind: "briefing",
+        briefingId: briefing.id,
+        title: briefing.title,
+        content: briefing.content,
+      };
+      const filtered = s.aiPinnedContexts.filter((c) => c.kind !== "briefing");
+      return {
+        aiChatOpen: true,
+        aiPinnedContexts: [...filtered, nextCtx],
+      };
+    }),
   setReaderView: (readerView) => set({ readerView }),
   setModalOpen: (modalOpen) => set({ modalOpen }),
   setMenuOpen: (menuOpen) => set({ menuOpen }),

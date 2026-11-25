@@ -111,6 +111,10 @@ export default function Sidebar({
   const actions = useArticleActions();
   const query = useUi((s) => s.query);
   const select = useUi((s) => s.select);
+  const briefingOpen = useUi((s) => s.briefingOpen);
+  const setBriefingOpen = useUi((s) => s.setBriefingOpen);
+  const aiChatOpen = useUi((s) => s.aiChatOpen);
+  const setAiChatOpen = useUi((s) => s.setAiChatOpen);
   const showCounts = useUi((s) => s.prefs.showSidebarCounts);
   const unreadOnly = useUi((s) => s.prefs.sidebarUnreadOnly);
   const setPref = useUi((s) => s.setPref);
@@ -218,7 +222,7 @@ export default function Sidebar({
   const allFeeds = feeds.data ?? [];
   const allFolders = folders.data ?? [];
   const allTags = tags.data ?? [];
-  const isActive = (q: ArticleQuery) => sameQuery(q, query);
+  const isActive = (q: ArticleQuery) => !briefingOpen && sameQuery(q, query);
 
   // Keep the selected feed in view. Opening an article from search jumps the
   // selection to a feed that may be scrolled out of sight — or hidden inside a
@@ -606,8 +610,20 @@ export default function Sidebar({
           icon="bookmark"
           label={t("smart.readLater")}
           count={showCounts ? counts.data?.readLater : undefined}
-          active={isActive({ kind: "readLater" })}
+          active={!briefingOpen && isActive({ kind: "readLater" })}
           onClick={() => select({ kind: "readLater" }, t("smart.readLater"))}
+        />
+        <SbItem
+          icon="sparkle"
+          label={t("briefing.title")}
+          active={briefingOpen}
+          onClick={() => setBriefingOpen(true)}
+        />
+        <SbItem
+          icon="chat"
+          label={t("ai.title")}
+          active={aiChatOpen}
+          onClick={() => setAiChatOpen(!aiChatOpen)}
         />
 
         <div className="sb-section-title">
