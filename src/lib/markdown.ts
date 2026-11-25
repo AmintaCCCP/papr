@@ -32,7 +32,7 @@ const ALLOWED_ATTRS: Record<string, Set<string>> = {
   th: new Set(["colspan", "rowspan", "scope"]),
 };
 
-const SAFE_HREF = /^(https?:|mailto:)/i;
+const SAFE_HREF = /^(https?:|mailto:|papr:\/\/article\/\d+$)/i;
 
 function sanitizeElement(el: Element) {
   // Depth-first: process children before the element may be unwrapped.

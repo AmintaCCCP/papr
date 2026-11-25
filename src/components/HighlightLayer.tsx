@@ -12,6 +12,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import * as api from "../api";
+import { useUi } from "../store";
 import { reportError, withUndo } from "../toast";
 import {
   applyHighlights,
@@ -29,6 +30,8 @@ import Icon from "./Icon";
 interface Props {
   /** The article whose body is highlighted. */
   articleId: number;
+  /** The article's title, attached when the user clicks "Ask AI" on a selection. */
+  articleTitle?: string;
   /** Ref to the rendered article-body div the highlights are applied into. */
   bodyRef: React.RefObject<HTMLDivElement | null>;
   /** The rendered body HTML — changes whenever the Reader swaps the body
@@ -51,6 +54,7 @@ interface PendingSelection {
 
 export default function HighlightLayer({
   articleId,
+  articleTitle = "",
   bodyRef,
   bodyVersion,
 }: Props) {
@@ -202,12 +206,22 @@ export default function HighlightLayer({
     });
   };
 
+  const askAiSelection = () => {
+    const pending = pendingRef.current;
+    if (!pending?.quote.trim()) return;
+    useUi.getState().askAiAboutSelection(articleId, articleTitle, pending.quote.trim());
+    window.getSelection()?.removeAllRanges();
+    setToolbar(null);
+    pendingRef.current = null;
+  };
+
   return (
     <>
       {toolbar && (
         <SelectionToolbar
           pos={toolbar}
           onPick={createHighlight}
+          onAskAi={askAiSelection}
           onDismiss={() => setToolbar(null)}
         />
       )}
@@ -230,10 +244,12 @@ export default function HighlightLayer({
 function SelectionToolbar({
   pos,
   onPick,
+  onAskAi,
   onDismiss,
 }: {
   pos: ToolbarPos;
   onPick: (color: string) => void;
+  onAskAi: () => void;
   onDismiss: () => void;
 }) {
   const { t } = useTranslation();
@@ -279,6 +295,17 @@ function SelectionToolbar({
           onClick={() => onPick(c.key)}
         />
       ))}
+      <span className="hl-toolbar-sep" aria-hidden="true" />
+      <button
+        type="button"
+        className="hl-ask-btn"
+        title={t("reader.ctxAskAi")}
+        aria-label={t("reader.ctxAskAi")}
+        onClick={onAskAi}
+      >
+        <Icon name="sparkle" size={12} />
+        <span>{t("reader.ctxAskAi")}</span>
+      </button>
     </div>
   );
 }

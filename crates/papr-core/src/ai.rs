@@ -69,12 +69,61 @@ pub const TRANSLATE_CHUNK_BUDGET: usize = 3000;
 const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
 /// Token-level events streamed to the frontend over an `ipc::Channel`.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase", tag = "type", content = "data")]
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "type", content = "data")]
 pub enum AiEvent {
     Delta(String),
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        summary: String,
+    },
     Done,
     Error(String),
+}
+
+/// JSON-schema definition of a read-only tool offered to the LLM.
+#[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
+}
+
+/// One tool invocation emitted by the LLM during a streamed turn.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+/// Multi-turn conversation message supporting tool calls and tool results.
+#[derive(Debug, Clone)]
+pub enum ConversationMessage {
+    User(String),
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCallRequest>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        content: String,
+    },
+}
+
+/// Result of one streamed model turn (text + any requested tool calls).
+pub struct TurnOutcome {
+    pub text: String,
+    pub tool_calls: Vec<ToolCallRequest>,
+    pub completed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,6 +251,438 @@ pub async fn stream_chat(
     } else {
         stream_anthropic(client, cfg, system, user, sink, max_tokens).await
     }
+}
+
+/// Stream one multi-turn conversation turn, optionally offering read-only tools.
+/// Returns accumulated text deltas and any tool calls requested by the model.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_conversation(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolDef],
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<TurnOutcome> {
+    if cfg.provider.is_openai_compatible() {
+        stream_openai_conversation(
+            client,
+            cfg,
+            system,
+            messages,
+            tools,
+            sink,
+            max_tokens,
+            cancel_flag,
+        )
+        .await
+    } else {
+        stream_anthropic_conversation(
+            client,
+            cfg,
+            system,
+            messages,
+            tools,
+            sink,
+            max_tokens,
+            cancel_flag,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_anthropic_conversation(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolDef],
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<TurnOutcome> {
+    let mut wire_msgs: Vec<Value> = Vec::new();
+    let mut pending_tool_results: Vec<Value> = Vec::new();
+
+    let flush_tool_results = |wire: &mut Vec<Value>, pending: &mut Vec<Value>| {
+        if !pending.is_empty() {
+            wire.push(json!({
+                "role": "user",
+                "content": std::mem::take(pending),
+            }));
+        }
+    };
+
+    for m in messages {
+        match m {
+            ConversationMessage::User(text) => {
+                flush_tool_results(&mut wire_msgs, &mut pending_tool_results);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                // Merge consecutive plain-text user turns so Anthropic's strict
+                // alternating-role requirement is never violated.
+                if let Some(last) = wire_msgs.last_mut() {
+                    if last["role"] == "user" && last["content"].is_string() {
+                        let prev = last["content"].as_str().unwrap_or("");
+                        last["content"] = Value::String(format!("{prev}\n\n{text}"));
+                        continue;
+                    }
+                }
+                wire_msgs.push(json!({ "role": "user", "content": text }));
+            }
+            ConversationMessage::Assistant { text, tool_calls } => {
+                flush_tool_results(&mut wire_msgs, &mut pending_tool_results);
+                if tool_calls.is_empty() && text.trim().is_empty() {
+                    continue;
+                }
+                if wire_msgs.is_empty() {
+                    continue;
+                }
+                if tool_calls.is_empty() {
+                    if let Some(last) = wire_msgs.last_mut() {
+                        if last["role"] == "assistant" && last["content"].is_string() {
+                            let prev = last["content"].as_str().unwrap_or("");
+                            last["content"] = Value::String(format!("{prev}\n\n{text}"));
+                            continue;
+                        }
+                    }
+                    wire_msgs.push(json!({ "role": "assistant", "content": text }));
+                } else {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                    for tc in tool_calls {
+                        let input = if tc.arguments.is_object() {
+                            tc.arguments.clone()
+                        } else {
+                            json!({})
+                        };
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": input,
+                        }));
+                    }
+                    wire_msgs.push(json!({ "role": "assistant", "content": blocks }));
+                }
+            }
+            ConversationMessage::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                pending_tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content,
+                }));
+            }
+        }
+    }
+    flush_tool_results(&mut wire_msgs, &mut pending_tool_results);
+
+    let mut body = json!({
+        "model": cfg.model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "stream": true,
+        "messages": wire_msgs,
+    });
+    if !tools.is_empty() {
+        let tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tool_defs);
+    }
+
+    let resp = client
+        .post(format!("{}/messages", cfg.base_url))
+        .header("x-api-key", &cfg.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .timeout(AI_REQUEST_TIMEOUT)
+        .json(&body)
+        .send()
+        .await?;
+    consume_sse_turn(resp, sink, Provider::Anthropic, cancel_flag).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_openai_conversation(
+    client: &Client,
+    cfg: &AiConfig,
+    system: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolDef],
+    sink: &mut DeltaSink<'_>,
+    max_tokens: u32,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<TurnOutcome> {
+    let mut wire_msgs: Vec<Value> = vec![json!({ "role": "system", "content": system })];
+    for m in messages {
+        match m {
+            ConversationMessage::User(text) => {
+                wire_msgs.push(json!({ "role": "user", "content": text }));
+            }
+            ConversationMessage::Assistant { text, tool_calls } => {
+                if tool_calls.is_empty() {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    wire_msgs.push(json!({ "role": "assistant", "content": text }));
+                } else {
+                    let tcs: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+                                }
+                            })
+                        })
+                        .collect();
+                    let content_val = if text.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(text.clone())
+                    };
+                    wire_msgs.push(json!({
+                        "role": "assistant",
+                        "content": content_val,
+                        "tool_calls": tcs,
+                    }));
+                }
+            }
+            ConversationMessage::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                wire_msgs.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
+                }));
+            }
+        }
+    }
+
+    let mut body = json!({
+        "model": cfg.model,
+        "max_tokens": max_tokens,
+        "stream": true,
+        "messages": wire_msgs,
+    });
+    if !tools.is_empty() {
+        let tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tool_defs);
+    }
+
+    let resp = client
+        .post(format!("{}/chat/completions", cfg.base_url))
+        .bearer_auth(&cfg.api_key)
+        .timeout(AI_REQUEST_TIMEOUT)
+        .json(&body)
+        .send()
+        .await?;
+    consume_sse_turn(resp, sink, Provider::OpenAi, cancel_flag).await
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    args_json: String,
+}
+
+fn handle_sse_turn_line(
+    line: &str,
+    provider: Provider,
+    full: &mut String,
+    partials: &mut std::collections::BTreeMap<usize, PartialToolCall>,
+    sink: &mut DeltaSink<'_>,
+) -> AppResult<LineOutcome> {
+    let Some(data) = line.trim().strip_prefix("data:") else {
+        return Ok(LineOutcome::Continue);
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(LineOutcome::Continue);
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Ok(LineOutcome::Continue);
+    };
+    if let Some(msg) = extract_error(&value, provider) {
+        return Err(AppError::other(format!("AI stream error: {msg}")));
+    }
+    match provider {
+        Provider::Anthropic => {
+            let ev_type = value["type"].as_str().unwrap_or("");
+            if ev_type == "content_block_start" {
+                if value["content_block"]["type"] == "tool_use" {
+                    let idx = value["index"].as_u64().unwrap_or(0) as usize;
+                    let entry = partials.entry(idx).or_default();
+                    if let Some(id) = value["content_block"]["id"].as_str() {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(name) = value["content_block"]["name"].as_str() {
+                        entry.name = name.to_string();
+                    }
+                }
+            } else if ev_type == "content_block_delta" {
+                let delta_type = value["delta"]["type"].as_str().unwrap_or("");
+                if delta_type == "text_delta" {
+                    if let Some(text) = value["delta"]["text"].as_str() {
+                        full.push_str(text);
+                        if !sink(text) {
+                            return Ok(LineOutcome::ChannelClosed);
+                        }
+                    }
+                } else if delta_type == "input_json_delta" {
+                    if let Some(partial) = value["delta"]["partial_json"].as_str() {
+                        let idx = value["index"].as_u64().unwrap_or(0) as usize;
+                        partials.entry(idx).or_default().args_json.push_str(partial);
+                    }
+                }
+            }
+        }
+        Provider::OpenAi | Provider::DeepSeek => {
+            if let Some(text) = value["choices"][0]["delta"]["content"].as_str() {
+                if !text.is_empty() {
+                    full.push_str(text);
+                    if !sink(text) {
+                        return Ok(LineOutcome::ChannelClosed);
+                    }
+                }
+            }
+            if let Some(tcs) = value["choices"][0]["delta"]["tool_calls"].as_array() {
+                for tc in tcs {
+                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                    let entry = partials.entry(idx).or_default();
+                    if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(name) = tc["function"]["name"].as_str().filter(|s| !s.is_empty()) {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(args) = tc["function"]["arguments"].as_str() {
+                        entry.args_json.push_str(args);
+                    }
+                }
+            }
+        }
+    }
+    Ok(LineOutcome::Continue)
+}
+
+async fn consume_sse_turn(
+    resp: reqwest::Response,
+    sink: &mut DeltaSink<'_>,
+    provider: Provider,
+    cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<TurnOutcome> {
+    let mut resp = ensure_success(resp, "AI API").await?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut full = String::new();
+    let mut partials: std::collections::BTreeMap<usize, PartialToolCall> =
+        std::collections::BTreeMap::new();
+
+    while let Some(chunk) = resp.chunk().await? {
+        if cancel_flag.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Ok(TurnOutcome {
+                text: full,
+                tool_calls: Vec::new(),
+                completed: false,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_SSE_BUFFER {
+            return Err(AppError::other(
+                "AI stream error: response is not server-sent events",
+            ));
+        }
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut *sink)? {
+                LineOutcome::Continue => {}
+                LineOutcome::ChannelClosed => {
+                    return Ok(TurnOutcome {
+                        text: full,
+                        tool_calls: Vec::new(),
+                        completed: false,
+                    });
+                }
+            }
+        }
+    }
+    if !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        match handle_sse_turn_line(&line, provider, &mut full, &mut partials, &mut *sink)? {
+            LineOutcome::Continue => {}
+            LineOutcome::ChannelClosed => {
+                return Ok(TurnOutcome {
+                    text: full,
+                    tool_calls: Vec::new(),
+                    completed: false,
+                });
+            }
+        }
+    }
+
+    let tool_calls: Vec<ToolCallRequest> = partials
+        .into_iter()
+        .filter(|(_, p)| !p.name.is_empty())
+        .map(|(idx, p)| {
+            let arguments = serde_json::from_str::<Value>(&p.args_json)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            ToolCallRequest {
+                id: if p.id.is_empty() {
+                    format!("call_{idx}")
+                } else {
+                    p.id
+                },
+                name: p.name,
+                arguments,
+            }
+        })
+        .collect();
+
+    Ok(TurnOutcome {
+        text: full,
+        tool_calls,
+        completed: true,
+    })
 }
 
 /// Run a completion to the end and return its full text WITHOUT forwarding

@@ -340,6 +340,37 @@ static MIGRATIONS: LazyLock<Migrations> = LazyLock::new(|| {
             "ALTER TABLE rules ADD COLUMN conditions TEXT;
              ALTER TABLE rules ADD COLUMN rewrite_rules TEXT;",
         ),
+        // v25 — global AI chat sessions, message history, and AI briefings.
+        M::up(
+            r#"
+            CREATE TABLE ai_chat_sessions (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE ai_chat_messages (
+                id            INTEGER PRIMARY KEY,
+                session_id    TEXT NOT NULL REFERENCES ai_chat_sessions(id) ON DELETE CASCADE,
+                role          TEXT NOT NULL,
+                content       TEXT NOT NULL DEFAULT '',
+                contexts_json TEXT,
+                tools_json    TEXT,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_ai_chat_messages_session ON ai_chat_messages(session_id, id);
+            CREATE TABLE ai_briefings (
+                id            INTEGER PRIMARY KEY,
+                title         TEXT NOT NULL,
+                scope_label   TEXT NOT NULL DEFAULT '',
+                days          INTEGER NOT NULL DEFAULT 1,
+                article_count INTEGER NOT NULL DEFAULT 0,
+                content       TEXT NOT NULL,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_ai_briefings_created ON ai_briefings(created_at DESC, id DESC);
+            "#,
+        ),
     ])
 });
 
@@ -3664,6 +3695,368 @@ pub fn requeue_sync(conn: &Connection, article_id: i64, field: &str, value: bool
     Ok(())
 }
 
+// ── Global AI chat sessions, briefings & read-only retrieval tools ───────────
+
+pub fn list_ai_sessions(conn: &Connection, limit: i64) -> AppResult<Vec<AiChatSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, created_at, updated_at
+         FROM ai_chat_sessions
+         ORDER BY datetime(updated_at) DESC, rowid DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit.clamp(1, 200)], |r| {
+            Ok(AiChatSession {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                created_at: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn create_ai_session(conn: &Connection, id: &str, title: &str) -> AppResult<AiChatSession> {
+    conn.execute(
+        "INSERT INTO ai_chat_sessions(id, title) VALUES (?1, ?2)",
+        params![id, title],
+    )?;
+    let row = conn.query_row(
+        "SELECT id, title, created_at, updated_at FROM ai_chat_sessions WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(AiChatSession {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                created_at: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        },
+    )?;
+    Ok(row)
+}
+
+pub fn ensure_ai_session(conn: &Connection, id: &str, default_title: &str) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO ai_chat_sessions(id, title) VALUES (?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+           title = CASE WHEN trim(title) = '' THEN excluded.title ELSE title END,
+           updated_at = datetime('now')",
+        params![id, default_title],
+    )?;
+    Ok(())
+}
+
+pub fn rename_ai_session(conn: &Connection, id: &str, title: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ai_chat_sessions SET title = ?2, updated_at = datetime('now') WHERE id = ?1",
+        params![id, title.trim()],
+    )?;
+    Ok(())
+}
+
+pub fn delete_ai_session(conn: &Connection, id: &str) -> AppResult<()> {
+    conn.execute("DELETE FROM ai_chat_sessions WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn list_ai_messages(conn: &Connection, session_id: &str) -> AppResult<Vec<AiChatMessageRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, role, content, contexts_json, tools_json, created_at
+         FROM ai_chat_messages
+         WHERE session_id = ?1
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok(AiChatMessageRow {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                role: r.get(2)?,
+                content: r.get(3)?,
+                contexts_json: r.get(4)?,
+                tools_json: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn append_ai_message(
+    conn: &Connection,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    contexts_json: Option<&str>,
+    tools_json: Option<&str>,
+) -> AppResult<i64> {
+    conn.execute(
+        "INSERT INTO ai_chat_messages(session_id, role, content, contexts_json, tools_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![session_id, role, content, contexts_json, tools_json],
+    )?;
+    let msg_id = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE ai_chat_sessions SET updated_at = datetime('now') WHERE id = ?1",
+        params![session_id],
+    )?;
+    Ok(msg_id)
+}
+
+pub fn list_ai_briefings(conn: &Connection, limit: i64) -> AppResult<Vec<AiBriefing>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, scope_label, days, article_count, content, created_at
+         FROM ai_briefings
+         ORDER BY datetime(created_at) DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit.clamp(1, 100)], |r| {
+            Ok(AiBriefing {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                scope_label: r.get(2)?,
+                days: r.get(3)?,
+                article_count: r.get(4)?,
+                content: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn save_ai_briefing(
+    conn: &Connection,
+    title: &str,
+    scope_label: &str,
+    days: i64,
+    article_count: i64,
+    content: &str,
+) -> AppResult<AiBriefing> {
+    conn.execute(
+        "INSERT INTO ai_briefings(title, scope_label, days, article_count, content)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![title, scope_label, days, article_count, content],
+    )?;
+    let id = conn.last_insert_rowid();
+    let row = conn.query_row(
+        "SELECT id, title, scope_label, days, article_count, content, created_at
+         FROM ai_briefings WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(AiBriefing {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                scope_label: r.get(2)?,
+                days: r.get(3)?,
+                article_count: r.get(4)?,
+                content: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        },
+    )?;
+    Ok(row)
+}
+
+pub fn delete_ai_briefing(conn: &Connection, id: i64) -> AppResult<()> {
+    conn.execute("DELETE FROM ai_briefings WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn tool_search_articles(
+    conn: &Connection,
+    query: &str,
+    feed_id: Option<i64>,
+    folder_id: Option<i64>,
+    tag_id: Option<i64>,
+    unread_only: bool,
+    starred_only: bool,
+    days: Option<i64>,
+    limit: i64,
+) -> AppResult<Vec<ToolArticleHit>> {
+    let fts = fts_query(query, true);
+    if fts.is_empty() {
+        return tool_list_recent_articles(
+            conn,
+            feed_id,
+            folder_id,
+            tag_id,
+            unread_only,
+            starred_only,
+            days,
+            limit,
+        );
+    }
+    let mut sql = String::from(
+        "SELECT a.id, a.feed_id, f.title, a.title, a.author, a.url,
+                COALESCE(a.published_at, a.fetched_at), a.is_read, a.is_starred,
+                substr(a.body_text, 1, 360)
+         FROM articles a
+         JOIN feeds f ON f.id = a.feed_id
+         JOIN articles_fts fts ON fts.rowid = a.id
+         WHERE articles_fts MATCH ?",
+    );
+    let mut vals: Vec<Value> = vec![Value::Text(fts)];
+    if let Some(fid) = feed_id {
+        sql.push_str(" AND a.feed_id = ?");
+        vals.push(Value::Integer(fid));
+    }
+    if let Some(foid) = folder_id {
+        sql.push_str(" AND f.folder_id = ?");
+        vals.push(Value::Integer(foid));
+    }
+    if let Some(tid) = tag_id {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM article_tags at WHERE at.article_id = a.id AND at.tag_id = ?)");
+        vals.push(Value::Integer(tid));
+    }
+    if unread_only {
+        sql.push_str(" AND a.is_read = 0");
+    }
+    if starred_only {
+        sql.push_str(" AND a.is_starred = 1");
+    }
+    if let Some(d) = days.filter(|&d| d > 0) {
+        sql.push_str(" AND datetime(COALESCE(a.published_at, a.fetched_at)) >= datetime('now', ?)");
+        vals.push(Value::Text(format!("-{d} days")));
+    }
+    sql.push_str(" ORDER BY fts.rank LIMIT ?");
+    vals.push(Value::Integer(limit.clamp(1, 30)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(vals), |r| {
+            Ok(ToolArticleHit {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                feed_title: r.get(2)?,
+                title: r.get(3)?,
+                author: r.get(4)?,
+                url: r.get(5)?,
+                published_at: r.get(6)?,
+                is_read: r.get::<_, i64>(7)? != 0,
+                is_starred: r.get::<_, i64>(8)? != 0,
+                snippet: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn tool_list_recent_articles(
+    conn: &Connection,
+    feed_id: Option<i64>,
+    folder_id: Option<i64>,
+    tag_id: Option<i64>,
+    unread_only: bool,
+    starred_only: bool,
+    days: Option<i64>,
+    limit: i64,
+) -> AppResult<Vec<ToolArticleHit>> {
+    let mut sql = String::from(
+        "SELECT a.id, a.feed_id, f.title, a.title, a.author, a.url,
+                COALESCE(a.published_at, a.fetched_at), a.is_read, a.is_starred,
+                substr(a.body_text, 1, 360)
+         FROM articles a
+         JOIN feeds f ON f.id = a.feed_id
+         WHERE 1 = 1",
+    );
+    let mut vals: Vec<Value> = Vec::new();
+    if let Some(fid) = feed_id {
+        sql.push_str(" AND a.feed_id = ?");
+        vals.push(Value::Integer(fid));
+    }
+    if let Some(foid) = folder_id {
+        sql.push_str(" AND f.folder_id = ?");
+        vals.push(Value::Integer(foid));
+    }
+    if let Some(tid) = tag_id {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM article_tags at WHERE at.article_id = a.id AND at.tag_id = ?)");
+        vals.push(Value::Integer(tid));
+    }
+    if unread_only {
+        sql.push_str(" AND a.is_read = 0");
+    }
+    if starred_only {
+        sql.push_str(" AND a.is_starred = 1");
+    }
+    if let Some(d) = days.filter(|&d| d > 0) {
+        sql.push_str(" AND datetime(COALESCE(a.published_at, a.fetched_at)) >= datetime('now', ?)");
+        vals.push(Value::Text(format!("-{d} days")));
+    }
+    sql.push_str(" ORDER BY datetime(COALESCE(a.published_at, a.fetched_at)) DESC, a.id DESC LIMIT ?");
+    vals.push(Value::Integer(limit.clamp(1, 40)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(vals), |r| {
+            Ok(ToolArticleHit {
+                id: r.get(0)?,
+                feed_id: r.get(1)?,
+                feed_title: r.get(2)?,
+                title: r.get(3)?,
+                author: r.get(4)?,
+                url: r.get(5)?,
+                published_at: r.get(6)?,
+                is_read: r.get::<_, i64>(7)? != 0,
+                is_starred: r.get::<_, i64>(8)? != 0,
+                snippet: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn tool_search_highlights(
+    conn: &Connection,
+    query: Option<&str>,
+    limit: i64,
+) -> AppResult<Vec<ToolHighlightHit>> {
+    let q = query.map(str::trim).filter(|s| !s.is_empty());
+    let (sql, vals): (&str, Vec<Value>) = if let Some(needle) = q {
+        let pattern = format!("%{}%", needle.to_lowercase());
+        (
+            "SELECT h.id, h.article_id, a.title, f.title, h.quote, h.note, h.created_at
+             FROM highlights h
+             JOIN articles a ON a.id = h.article_id
+             JOIN feeds f ON f.id = a.feed_id
+             WHERE ulower(h.quote) LIKE ?1 OR ulower(h.note) LIKE ?1 OR ulower(a.title) LIKE ?1
+             ORDER BY datetime(h.created_at) DESC, h.id DESC
+             LIMIT ?2",
+            vec![Value::Text(pattern), Value::Integer(limit.clamp(1, 30))],
+        )
+    } else {
+        (
+            "SELECT h.id, h.article_id, a.title, f.title, h.quote, h.note, h.created_at
+             FROM highlights h
+             JOIN articles a ON a.id = h.article_id
+             JOIN feeds f ON f.id = a.feed_id
+             ORDER BY datetime(h.created_at) DESC, h.id DESC
+             LIMIT ?1",
+            vec![Value::Integer(limit.clamp(1, 30))],
+        )
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(vals), |r| {
+            Ok(ToolHighlightHit {
+                id: r.get(0)?,
+                article_id: r.get(1)?,
+                article_title: r.get(2)?,
+                feed_title: r.get(3)?,
+                quote: r.get(4)?,
+                note: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// A fully-migrated in-memory connection for tests in other modules that
 /// exercise settings-backed behaviour (parsers, sync, …). Test-only: the
 /// migrations and function registration here mirror [`open`]'s setup.
@@ -3682,7 +4075,7 @@ mod tests {
 
     #[test]
     fn startup_migrations_preserve_existing_databases() {
-        for version in [0, 19, 20, 21, 22, 23, 24, 25] {
+        for version in [0, 19, 20, 21, 22, 23, 24, 25, 26] {
             let path = std::env::temp_dir().join(format!(
                 "papr-migrations-{}-{}-{}.db",
                 std::process::id(),
@@ -3693,7 +4086,7 @@ mod tests {
                     .as_nanos()
             ));
             let mut conn = Connection::open(&path).unwrap();
-            MIGRATIONS.to_version(&mut conn, version.min(24)).unwrap();
+            MIGRATIONS.to_version(&mut conn, version.min(25)).unwrap();
             if version > 0 {
                 conn.execute("INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.com/rss','Preserved')", []).unwrap();
                 conn.execute("INSERT INTO articles(feed_id,guid,title,is_starred) VALUES(1,'one','Article',1)", []).unwrap();
@@ -3705,27 +4098,27 @@ mod tests {
             if version >= 21 {
                 conn.execute("UPDATE feeds SET position=42", []).unwrap();
             }
-            if version == 25 {
+            if version == 26 {
                 // A database from a *future* build (higher schema version than
                 // this binary knows) must be refused, not silently migrated.
-                conn.pragma_update(None, "user_version", 25).unwrap();
+                conn.pragma_update(None, "user_version", 26).unwrap();
             }
             drop(conn);
             let result = open(&path);
-            if version == 25 {
+            if version == 26 {
                 assert!(result.is_err());
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    25
+                    26
                 );
             } else {
                 let conn = result.unwrap();
                 assert_eq!(
                     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                         .unwrap(),
-                    24
+                    25
                 );
                 if version > 0 {
                     let values: (String, i64, i64) = conn

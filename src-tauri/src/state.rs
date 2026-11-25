@@ -4,7 +4,8 @@
 use papr_core::ingestion::rsshub::engine::EngineManager;
 use reqwest::Client;
 use rusqlite::Connection;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
@@ -39,6 +40,9 @@ pub struct AppState {
     /// (`take_pending_deep_link`); a live link, arriving after the listener
     /// exists, is emitted directly and never lands here.
     pending_deep_link: std::sync::Mutex<Option<String>>,
+    /// Active AI streaming runs, keyed by frontend run_id, so the user can
+    /// click "Stop generating" to abort an in-flight chat/briefing stream.
+    ai_cancels: std::sync::Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -61,7 +65,35 @@ impl AppState {
             refresh_lock: Mutex::new(()),
             engine,
             pending_deep_link: std::sync::Mutex::new(None),
+            ai_cancels: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn register_ai_run(&self, run_id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.ai_cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.to_string(), Arc::clone(&flag));
+        flag
+    }
+
+    pub fn cancel_ai_run(&self, run_id: &str) {
+        if let Some(flag) = self
+            .ai_cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn finish_ai_run(&self, run_id: &str) {
+        self.ai_cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
     }
 
     /// Stash a deep-link URL that arrived before the webview could receive it,

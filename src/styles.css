@@ -366,6 +366,15 @@ button { font-family: inherit; }
   position: relative;
   transition: background .35s ease, color .25s ease;
 }
+.window.with-ai-chat {
+  grid-template-columns: var(--col-sidebar) var(--col-list) 1fr var(--col-ai-chat, 360px);
+}
+.window.briefing-mode {
+  grid-template-columns: var(--col-sidebar) 1fr;
+}
+.window.briefing-mode.with-ai-chat {
+  grid-template-columns: var(--col-sidebar) 1fr var(--col-ai-chat, 360px);
+}
 
 /* ====== Pane resize handles ====== */
 /* A handle is a thin draggable strip straddling a pane boundary. The two grid
@@ -1402,18 +1411,469 @@ button { font-family: inherit; }
    the reading view like the pre-summary-era AI drawer, but hosts only the
    conversation (the summary card stays inline above the article, untouched). */
 .ai-chat {
-  position: absolute;
-  top: 38px; right: 0; bottom: 0;
-  width: 360px;
+  position: relative;
+  height: 100%;
+  min-width: 0;
   background: var(--panel);
   border-left: 1px solid var(--hair);
-  transform: translateX(100%);
-  transition: transform .35s cubic-bezier(.22,.61,.36,1);
-  z-index: 5;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
-.ai-chat.open { transform: translateX(0); }
+.ai-chat--docked {
+  z-index: 4;
+}
+.ai-head-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.ai-history-drawer {
+  border-bottom: 1px solid var(--hair);
+  background: var(--panel-2);
+  max-height: 220px;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.ai-history-head {
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--hair);
+}
+.ai-history-new {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--accent-ink);
+  background: var(--accent-soft);
+  border: none;
+  border-radius: 5px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.ai-history-list {
+  overflow-y: auto;
+  padding: 4px;
+}
+.ai-history-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+.ai-history-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--ink);
+}
+.ai-history-row:hover { background: var(--hover); }
+.ai-history-row.active { background: var(--accent-soft); color: var(--accent-ink); }
+.ai-history-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-history-del {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  opacity: 0;
+}
+.ai-history-row:hover .ai-history-del { opacity: 1; }
+.ai-history-del:hover { color: var(--danger, #d94343); }
+
+.ai-starters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-top: 10px;
+}
+.ai-starter-chip {
+  text-align: left;
+  padding: 8px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--hair);
+  background: var(--panel-2);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.ai-starter-chip:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.ai-msg-contexts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 5px;
+}
+.ai-msg-ctx-tag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.14);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-tool-traces {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.ai-tool-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  color: var(--muted);
+}
+.ai-tool-pill.running {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+.ai-tool-name { font-weight: 500; }
+.ai-tool-summary { opacity: 0.8; }
+
+.ai-context-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px 2px;
+  border-top: 1px solid var(--hair);
+  flex-shrink: 0;
+}
+.ai-ctx-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 190px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border: 1px solid transparent;
+}
+.ai-ctx-chip--auto {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px dashed var(--hair);
+}
+.ai-ctx-chip--quote {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.ai-ctx-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-ctx-x {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  opacity: 0.7;
+}
+.ai-ctx-x:hover { opacity: 1; }
+.ai-ctx-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--hair);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.ai-ctx-add:hover {
+  color: var(--ink);
+  border-color: var(--muted-2);
+}
+.ai-ctx-picker {
+  margin: 4px 12px 0;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: var(--panel-2);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.ai-ctx-picker-input {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid var(--hair);
+  background: transparent;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--ink);
+  outline: none;
+}
+.ai-ctx-picker-list {
+  max-height: 150px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.ai-ctx-picker-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  text-align: left;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.ai-ctx-picker-item:hover { background: var(--hover); }
+.ai-chat-composer .send.stop {
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--hair);
+}
+
+/* Selection toolbar Ask AI button */
+.hl-toolbar-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--hair);
+  margin: 0 2px;
+}
+.hl-ask-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.hl-ask-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+/* AI Briefing View */
+.briefing-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  background: var(--reader);
+  overflow: hidden;
+}
+.briefing-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--hair);
+  flex-shrink: 0;
+  min-height: 46px;
+}
+.briefing-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.briefing-title-group h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.briefing-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.briefing-days {
+  display: inline-flex;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-radius: 7px;
+  padding: 2px;
+}
+.briefing-pill {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.briefing-pill.active {
+  background: var(--panel);
+  color: var(--ink);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.briefing-scope {
+  font-size: 12px;
+  padding: 4px 8px;
+  max-width: 160px;
+}
+.briefing-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+}
+.briefing-history {
+  border-right: 1px solid var(--hair);
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.briefing-history-head {
+  padding: 10px 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.briefing-history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 6px 12px;
+}
+.briefing-history-empty {
+  padding: 16px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.briefing-history-item {
+  position: relative;
+  padding: 8px 26px 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  margin-bottom: 2px;
+}
+.briefing-history-item:hover { background: var(--hover); }
+.briefing-history-item.active {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.briefing-history-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.briefing-history-meta {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  gap: 5px;
+  margin-top: 2px;
+}
+.briefing-history-del {
+  position: absolute;
+  right: 6px;
+  top: 8px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0;
+  padding: 2px;
+}
+.briefing-history-item:hover .briefing-history-del { opacity: 1; }
+.briefing-history-del:hover { color: var(--danger, #d94343); }
+.briefing-content-scroll {
+  overflow-y: auto;
+  padding: 28px 36px 48px;
+}
+.briefing-empty {
+  max-width: 400px;
+  margin: 80px auto;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+}
+.briefing-empty h3 {
+  margin: 0;
+  font-size: 16px;
+  color: var(--ink);
+}
+.briefing-empty p {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.briefing-article {
+  max-width: var(--reader-width, 680px);
+  margin: 0 auto;
+}
+.briefing-article-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--hair);
+}
+.briefing-prose {
+  font-size: 14.5px;
+  line-height: 1.75;
+}
+.briefing-prose h2 {
+  margin-top: 1.4em;
+  margin-bottom: 0.5em;
+  font-size: 16px;
+}
 .ai-head {
   padding: 14px 16px 11px;
   display: flex;
@@ -1763,6 +2223,16 @@ button { font-family: inherit; }
   position: absolute;
   inset: 0;
   z-index: 20;
+}
+.window.focus.with-ai-chat .reader {
+  right: var(--col-ai-chat, 360px);
+}
+.window.focus.with-ai-chat .ai-chat--docked {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 21;
 }
 .window.focus .article { max-width: 720px; }
 /* In focus mode the reader is the leftmost pane, so its toolbar must clear

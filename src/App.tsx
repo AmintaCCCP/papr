@@ -18,6 +18,8 @@ import type { ArticleQuery, ArticleSummary, Feed } from "./types";
 import Sidebar from "./components/Sidebar";
 import ArticleList from "./components/ArticleList";
 import Reader from "./components/Reader";
+import AIChatPanel from "./components/AIChatPanel";
+import AIBriefingView from "./components/AIBriefingView";
 import CommandPalette, { type CommandAction } from "./components/CommandPalette";
 import SettingsDialog from "./components/SettingsDialog";
 import AddFeedDialog from "./components/AddFeedDialog";
@@ -96,6 +98,10 @@ export default function App() {
   const readerWidth = useUi((s) => s.readerWidth);
   const sidebarWidth = useUi((s) => s.sidebarWidth);
   const listWidth = useUi((s) => s.listWidth);
+  const aiChatWidth = useUi((s) => s.aiChatWidth);
+  const aiChatOpen = useUi((s) => s.aiChatOpen);
+  const setAiChatOpen = useUi((s) => s.setAiChatOpen);
+  const briefingOpen = useUi((s) => s.briefingOpen);
   const reduceMotion = useUi((s) => s.prefs.reduceMotion);
   const focusMode = useUi((s) => s.focusMode);
 
@@ -232,7 +238,8 @@ export default function App() {
     const root = document.documentElement.style;
     root.setProperty("--col-sidebar", `${sidebarWidth}px`);
     root.setProperty("--col-list", `${listWidth}px`);
-  }, [sidebarWidth, listWidth]);
+    root.setProperty("--col-ai-chat", `${aiChatWidth}px`);
+  }, [sidebarWidth, listWidth, aiChatWidth]);
 
   // ── toast ──
   // The store owns the queue; App owns only the dwell timer and the render.
@@ -376,6 +383,12 @@ export default function App() {
         useUi.getState().setFocusMode(!useUi.getState().focusMode);
         break;
       case "toggle-ai": toggleAiSummary(); break;
+      case "toggle-ai-chat":
+        useUi.getState().setAiChatOpen(!useUi.getState().aiChatOpen);
+        break;
+      case "open-briefing":
+        useUi.getState().setBriefingOpen(true);
+        break;
       case "refresh": doRefresh(); break;
       case "add-feed": setAddFeed(true); break;
       case "new-folder": setNewFolder(true); break;
@@ -445,6 +458,11 @@ export default function App() {
         doRefresh();
         return;
       }
+      if (mod && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        useUi.getState().setAiChatOpen(!useUi.getState().aiChatOpen);
+        return;
+      }
       if (mod) return;
 
       // Past this point only the single-key list/reader shortcuts remain —
@@ -468,6 +486,16 @@ export default function App() {
         return;
 
       const st = useUi.getState();
+
+      if (st.briefingOpen) {
+        if (e.key.toLowerCase() === "escape" && !isComposingKey(e)) {
+          st.setBriefingOpen(false);
+        } else if (e.key.toLowerCase() === "d" && e.shiftKey) {
+          e.preventDefault();
+          st.setMode(resolveMode(st.mode) === "dark" ? "light" : "dark");
+        }
+        return;
+      }
 
       const items = readCurrentItems(qc);
       const idx = items.findIndex((a) => a.id === st.selectedArticleId);
@@ -540,7 +568,9 @@ export default function App() {
   return (
     <>
       <div className="app-shell">
-        <div className={`window ${focusMode ? "focus" : ""}`}>
+        <div
+          className={`window ${focusMode ? "focus" : ""} ${aiChatOpen ? "with-ai-chat" : ""} ${briefingOpen ? "briefing-mode" : ""}`}
+        >
           <Sidebar
             onAddFeed={() => setAddFeed(true)}
             onExplore={() => setExplore(true)}
@@ -551,8 +581,18 @@ export default function App() {
             refreshing={refreshing}
             onToast={showToast}
           />
-          <ArticleList onToast={showToast} />
-          <Reader onToast={showToast} />
+          {briefingOpen ? (
+            <AIBriefingView />
+          ) : (
+            <>
+              <ArticleList onToast={showToast} />
+              <Reader onToast={showToast} />
+            </>
+          )}
+          <AIChatPanel
+            open={aiChatOpen}
+            onClose={() => setAiChatOpen(false)}
+          />
           {/* Pane resize handles. Hidden in focus mode (the sidebar + list are
               hidden then, collapsing the grid to a single reader column). They
               sit at the column boundaries via the `left` offset below. */}
@@ -571,19 +611,21 @@ export default function App() {
                   label={t("app.resizeSidebar")}
                 />
               </div>
-              <div
-                className="resize-handle-slot"
-                style={{ left: "calc(var(--col-sidebar) + var(--col-list))" }}
-              >
-                <ResizeHandle
-                  width={listWidth}
-                  side="right"
-                  min={PANEL_BOUNDS.list.min}
-                  max={PANEL_BOUNDS.list.max}
-                  onResize={(w) => useUi.getState().setPanel({ listWidth: w })}
-                  label={t("app.resizeList")}
-                />
-              </div>
+              {!briefingOpen && (
+                <div
+                  className="resize-handle-slot"
+                  style={{ left: "calc(var(--col-sidebar) + var(--col-list))" }}
+                >
+                  <ResizeHandle
+                    width={listWidth}
+                    side="right"
+                    min={PANEL_BOUNDS.list.min}
+                    max={PANEL_BOUNDS.list.max}
+                    onResize={(w) => useUi.getState().setPanel({ listWidth: w })}
+                    label={t("app.resizeList")}
+                  />
+                </div>
+              )}
             </>
           )}
         </div>

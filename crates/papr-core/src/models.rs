@@ -373,7 +373,7 @@ pub struct Highlight {
 }
 
 /// Filters for the article list. Mirrors the sidebar selection in the UI.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "value")]
 pub enum ArticleQuery {
     All,
@@ -410,4 +410,69 @@ pub enum RefreshProgress {
     Finished {
         new_articles: usize,
     },
+}
+
+/// A persisted global AI chat session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiChatSession {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One persisted message in a global AI chat session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiChatMessageRow {
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub contexts_json: Option<String>,
+    pub tools_json: Option<String>,
+    pub created_at: String,
+}
+
+/// Compact article hit returned to the AI assistant's read-only retrieval tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolArticleHit {
+    pub id: i64,
+    pub feed_id: i64,
+    pub feed_title: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub url: Option<String>,
+    pub published_at: Option<String>,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub snippet: String,
+}
+
+/// Highlight + parent article info returned to the AI assistant's highlight search tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolHighlightHit {
+    pub id: i64,
+    pub article_id: i64,
+    pub article_title: String,
+    pub feed_title: String,
+    pub quote: String,
+    pub note: String,
+    pub created_at: String,
+}
+
+/// A persisted AI daily/periodic briefing generated from recent articles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiBriefing {
+    pub id: i64,
+    pub title: String,
+    pub scope_label: String,
+    pub days: i64,
+    pub article_count: i64,
+    pub content: String,
+    pub created_at: String,
 }

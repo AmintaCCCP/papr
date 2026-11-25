@@ -18,6 +18,8 @@ export type CommandAction =
   | "toggle-theme"
   | "toggle-focus"
   | "toggle-ai"
+  | "toggle-ai-chat"
+  | "open-briefing"
   | "refresh"
   | "add-feed"
   | "new-folder"
@@ -47,6 +49,8 @@ const ACTIONS: { icon: IconName; labelKey: string; hint: string; action: Command
   { icon: "globe", labelKey: "commandPalette.actionToggleTheme", hint: "⇧D", action: "toggle-theme" },
   { icon: "focus", labelKey: "commandPalette.actionToggleFocus", hint: "F", action: "toggle-focus" },
   { icon: "sparkle", labelKey: "commandPalette.actionToggleAi", hint: "I", action: "toggle-ai" },
+  { icon: "chat", labelKey: "commandPalette.actionToggleAiChat", hint: modCombo("J"), action: "toggle-ai-chat" },
+  { icon: "sparkle", labelKey: "commandPalette.actionOpenBriefing", hint: "", action: "open-briefing" },
   { icon: "refresh", labelKey: "commandPalette.actionRefresh", hint: modCombo("R"), action: "refresh" },
   { icon: "plus", labelKey: "commandPalette.actionAddFeed", hint: "A", action: "add-feed" },
   { icon: "folder", labelKey: "commandPalette.actionNewFolder", hint: "", action: "new-folder" },
