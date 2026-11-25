@@ -2,13 +2,14 @@
 //!
 //! Serves a self-contained mobile SPA (`src-tauri/mobile-web/`) plus a token-
 //! authenticated JSON API backed directly by the desktop app's `AppState`.
-//! Mutations emit `"mobile-sync"` to the desktop webview so read/starred/summary/
-//! translation state stays in sync.
+//! Pairing uses a short-lived one-time code (`?pair=...`) exchanged for a
+//! bearer/cookie session; ordinary `/api/*` routes never accept URL query
+//! credentials. Mutations emit `"mobile-sync"` to the desktop webview.
 
 use crate::commands::{
-    build_translate_selection, escape_preview_text, extract_fulltext_with_state, fetch_image_bytes,
-    load_ai_config, mark_all_read, mark_read, mark_starred, summary_system_prompt,
-    summary_user_turn, text_for_selector, translate_target_lang,
+    build_translate_selection, escape_preview_text, extract_fulltext_with_state, load_ai_config,
+    mark_all_read, mark_read, mark_starred, referer_candidates, summary_system_prompt,
+    summary_user_turn, text_for_selector, translate_target_lang, IMAGE_UA, MAX_IMAGE_BYTES,
 };
 use crate::error::{AppError, AppResult};
 use crate::integrations::{run_integration_with_state, IntegrationConfig};
@@ -27,12 +28,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 pub const DEFAULT_PORT: u16 = 14320;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
+const PAIR_CODE_TTL: Duration = Duration::from_secs(600);
+const MAX_IMAGE_REDIRECTS: usize = 5;
+
+static NEXT_SERVER_ID: AtomicU64 = AtomicU64::new(1);
 
 const INDEX_HTML: &str = include_str!("../mobile-web/index.html");
 const STYLES_CSS: &str = include_str!("../mobile-web/styles.css");
@@ -45,8 +52,10 @@ const ICON_128_PNG: &[u8] = include_bytes!("../icons/128x128.png");
 const ICON_512_PNG: &[u8] = include_bytes!("../icons/icon.png");
 
 pub struct WebServerHandle {
+    pub id: u64,
     pub port: u16,
     pub token: String,
+    pub pair_code: std::sync::Mutex<Option<(String, Instant)>>,
     shutdown: watch::Sender<bool>,
     join: Option<tauri::async_runtime::JoinHandle<()>>,
 }
@@ -70,20 +79,24 @@ pub(crate) fn read_saved_port(conn: &rusqlite::Connection) -> u16 {
         .unwrap_or(DEFAULT_PORT)
 }
 
-fn ensure_web_token(conn: &rusqlite::Connection) -> String {
+fn random_code(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+fn ensure_web_token(conn: &rusqlite::Connection) -> AppResult<String> {
     if let Ok(Some(t)) = db::get_setting(conn, "web_server_token") {
         let trimmed = t.trim();
         if trimmed.len() >= 12 {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
-    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
-    let mut rng = rand::thread_rng();
-    let token: String = (0..16)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect();
-    let _ = db::set_setting(conn, "web_server_token", &token);
-    token
+    let token = random_code(20);
+    db::set_setting(conn, "web_server_token", &token)?;
+    Ok(token)
 }
 
 fn is_rfc1918(ip: Ipv4Addr) -> bool {
@@ -93,12 +106,9 @@ fn is_rfc1918(ip: Ipv4Addr) -> bool {
 
 fn is_virtual_tun(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
-    // 198.18.0.0/15 (benchmarking / Surge-Clash TUN) or 100.64.0.0/10 (CGNAT / Tailscale)
     (a == 198 && (b == 18 || b == 19)) || (a == 100 && (64..=127).contains(&b))
 }
 
-/// Detect local LAN IPv4 addresses. Probes RFC1918 targets first so VPN/TUN
-/// default routes (e.g. Surge/Clash `198.18.x.x`) do not hide the Wi-Fi IP.
 fn detect_lan_ips() -> Vec<String> {
     let probes = [
         "192.168.1.1:80",
@@ -139,7 +149,12 @@ fn detect_lan_ips() -> Vec<String> {
     rfc1918
 }
 
-fn build_status(running: bool, port: u16, token: Option<String>) -> WebServerStatus {
+fn build_status(
+    running: bool,
+    port: u16,
+    token: Option<String>,
+    pair_code: Option<String>,
+) -> WebServerStatus {
     if !running {
         return WebServerStatus {
             running: false,
@@ -149,51 +164,72 @@ fn build_status(running: bool, port: u16, token: Option<String>) -> WebServerSta
             urls: Vec::new(),
         };
     }
-    let tok = token.unwrap_or_default();
     let urls: Vec<String> = detect_lan_ips()
         .into_iter()
-        .map(|ip| format!("http://{ip}:{port}/?token={tok}"))
+        .map(|ip| match &pair_code {
+            Some(code) => format!("http://{ip}:{port}/?pair={code}"),
+            None => format!("http://{ip}:{port}/"),
+        })
         .collect();
     let url = urls.first().cloned();
     WebServerStatus {
         running: true,
         port,
-        token: Some(tok),
+        token,
         url,
         urls,
     }
 }
 
-pub async fn start_server(app: AppHandle, port: u16) -> AppResult<WebServerStatus> {
+/// Start (or reuse) the server. Caller MUST hold `state.web_server_lock`.
+pub(crate) async fn start_server_locked(app: &AppHandle, port: u16) -> AppResult<WebServerStatus> {
     let state = app.state::<AppState>();
-    let _op = state.web_server_lock.lock().await;
 
     {
         let guard = state.web_server.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.as_ref() {
             if existing.port == port {
-                return Ok(build_status(true, port, Some(existing.token.clone())));
+                let mut pc = existing.pair_code.lock().unwrap_or_else(|e| e.into_inner());
+                let code = match pc.as_ref() {
+                    Some((c, exp)) if Instant::now() < *exp => c.clone(),
+                    _ => {
+                        let c = random_code(12);
+                        *pc = Some((c.clone(), Instant::now() + PAIR_CODE_TTL));
+                        c
+                    }
+                };
+                return Ok(build_status(
+                    true,
+                    port,
+                    Some(existing.token.clone()),
+                    Some(code),
+                ));
             }
         }
     }
 
-    stop_server_await(&app).await;
-
-    let token = {
-        let conn = state.db.lock().await;
-        ensure_web_token(&conn)
-    };
-
+    // Bind the new port BEFORE tearing down any existing listener so a bind
+    // failure (e.g. port already in use) keeps the old server running.
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| AppError::other(format!("Failed to bind port {port}: {e}")))?;
 
+    let token = {
+        let conn = state.db.lock().await;
+        ensure_web_token(&conn)?
+    };
+    let pair_code = random_code(12);
+
+    stop_server_await(app).await;
+
+    let server_id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = watch::channel(false);
     let app_clone = app.clone();
     let token_clone = token.clone();
 
     let join = tauri::async_runtime::spawn(async move {
+        let mut consecutive_errs: u32 = 0;
         loop {
             tokio::select! {
                 _ = rx.changed() => {
@@ -204,6 +240,7 @@ pub async fn start_server(app: AppHandle, port: u16) -> AppResult<WebServerStatu
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok((stream, _)) => {
+                            consecutive_errs = 0;
                             let io = TokioIo::new(stream);
                             let app_req = app_clone.clone();
                             let tok_req = token_clone.clone();
@@ -224,12 +261,22 @@ pub async fn start_server(app: AppHandle, port: u16) -> AppResult<WebServerStatu
                             });
                         }
                         Err(err) => {
-                            log::warn!("mobile web accept error: {err}");
-                            break;
+                            consecutive_errs += 1;
+                            log::warn!("mobile web accept error ({consecutive_errs}): {err}");
+                            if consecutive_errs >= 8 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50 * u64::from(consecutive_errs))).await;
                         }
                     }
                 }
             }
+        }
+        // Clear stale handle only if it still belongs to this listener instance.
+        let st = app_clone.state::<AppState>();
+        let mut guard = st.web_server.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|h| h.id == server_id) {
+            guard.take();
         }
         log::info!("mobile web server on port {port} stopped");
     });
@@ -237,14 +284,19 @@ pub async fn start_server(app: AppHandle, port: u16) -> AppResult<WebServerStatu
     {
         let mut guard = state.web_server.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(WebServerHandle {
+            id: server_id,
             port,
             token: token.clone(),
+            pair_code: std::sync::Mutex::new(Some((
+                pair_code.clone(),
+                Instant::now() + PAIR_CODE_TTL,
+            ))),
             shutdown: tx,
             join: Some(join),
         });
     }
 
-    Ok(build_status(true, port, Some(token)))
+    Ok(build_status(true, port, Some(token), Some(pair_code)))
 }
 
 async fn stop_server_await(app: &AppHandle) {
@@ -273,13 +325,20 @@ pub fn stop_server_sync(app: &AppHandle) {
 pub async fn web_server_status(state: State<'_, AppState>) -> AppResult<WebServerStatus> {
     let running = {
         let guard = state.web_server.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().map(|h| (h.port, h.token.clone()))
+        guard.as_ref().map(|h| {
+            let pc = h.pair_code.lock().unwrap_or_else(|e| e.into_inner());
+            let code = pc
+                .as_ref()
+                .filter(|(_, exp)| Instant::now() < *exp)
+                .map(|(c, _)| c.clone());
+            (h.port, h.token.clone(), code)
+        })
     };
-    if let Some((port, token)) = running {
-        return Ok(build_status(true, port, Some(token)));
+    if let Some((port, token, code)) = running {
+        return Ok(build_status(true, port, Some(token), code));
     }
     let conn = state.read().await;
-    Ok(build_status(false, read_saved_port(&conn), None))
+    Ok(build_status(false, read_saved_port(&conn), None, None))
 }
 
 #[tauri::command]
@@ -289,27 +348,28 @@ pub async fn web_server_start(
     port: Option<u16>,
 ) -> AppResult<WebServerStatus> {
     let port = port.filter(|&p| p >= 1024).unwrap_or(DEFAULT_PORT);
-    let status = start_server(app, port).await?;
+    let _op = state.web_server_lock.lock().await;
+    let status = start_server_locked(&app, port).await?;
     {
-        let conn = state.db.lock().await;
-        let _ = db::set_setting(&conn, "web_server_enabled", "1");
-        let _ = db::set_setting(&conn, "web_server_port", &port.to_string());
+        let mut conn = state.db.lock().await;
+        let tx = conn.transaction()?;
+        db::set_setting(&tx, "web_server_enabled", "1")?;
+        db::set_setting(&tx, "web_server_port", &port.to_string())?;
+        tx.commit()?;
     }
     Ok(status)
 }
 
 #[tauri::command]
 pub async fn web_server_stop(app: AppHandle, state: State<'_, AppState>) -> AppResult<WebServerStatus> {
-    {
-        let _op = state.web_server_lock.lock().await;
-        stop_server_await(&app).await;
-    }
+    let _op = state.web_server_lock.lock().await;
+    stop_server_await(&app).await;
     let port = {
         let conn = state.db.lock().await;
-        let _ = db::set_setting(&conn, "web_server_enabled", "0");
+        db::set_setting(&conn, "web_server_enabled", "0")?;
         read_saved_port(&conn)
     };
-    Ok(build_status(false, port, None))
+    Ok(build_status(false, port, None, None))
 }
 
 // ─────────────────────────── Security helpers ───────────────────────────
@@ -335,7 +395,7 @@ fn extract_cookie_token(req: &Request<Incoming>) -> Option<String> {
     None
 }
 
-fn is_authorized(req: &Request<Incoming>, params: &HashMap<String, String>, expected: &str) -> bool {
+fn is_authorized(req: &Request<Incoming>, expected: &str) -> bool {
     if let Some(auth) = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -352,8 +412,19 @@ fn is_authorized(req: &Request<Incoming>, params: &HashMap<String, String>, expe
             return true;
         }
     }
-    if let Some(q_tok) = params.get("token") {
-        if ct_eq(q_tok.trim(), expected) {
+    false
+}
+
+fn consume_pair_code(app: &AppHandle, code: &str) -> bool {
+    let state = app.state::<AppState>();
+    let guard = state.web_server.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(handle) = guard.as_ref() else {
+        return false;
+    };
+    let mut pc = handle.pair_code.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((expected, exp)) = pc.as_ref() {
+        if Instant::now() < *exp && ct_eq(code.trim(), expected) {
+            *pc = None;
             return true;
         }
     }
@@ -378,44 +449,110 @@ fn is_global_ip(ip: IpAddr) -> bool {
             !v6.is_loopback()
                 && !v6.is_multicast()
                 && !v6.is_unspecified()
-                && (seg0 & 0xfe00) != 0xfc00 // ULA fc00::/7
-                && (seg0 & 0xffc0) != 0xfe80 // link-local fe80::/10
+                && (seg0 & 0xfe00) != 0xfc00
+                && (seg0 & 0xffc0) != 0xfe80
         }
     }
 }
 
-async fn validate_public_image_url(raw: &str) -> AppResult<()> {
+async fn validate_and_resolve_public_url(raw: &str) -> AppResult<(url::Url, String, Vec<SocketAddr>)> {
     let parsed = url::Url::parse(raw).map_err(|_| AppError::other("Invalid image URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(AppError::other("Unsupported image URL scheme"));
     }
     let host = parsed
         .host_str()
-        .ok_or_else(|| AppError::other("Image URL missing host"))?;
+        .ok_or_else(|| AppError::other("Image URL missing host"))?
+        .to_string();
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") || host.ends_with(".local") {
         return Err(AppError::other("Localhost image URL blocked"));
     }
+    let port = parsed.port_or_known_default().unwrap_or(80);
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !is_global_ip(ip) {
             return Err(AppError::other("Private IP image URL blocked"));
         }
-        return Ok(());
+        return Ok((parsed, host, vec![SocketAddr::new(ip, port)]));
     }
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
         .await
-        .map_err(|_| AppError::other("Failed to resolve image host"))?;
-    let mut found = false;
-    for addr in addrs {
-        found = true;
+        .map_err(|_| AppError::other("Failed to resolve image host"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(AppError::other("No addresses resolved for image host"));
+    }
+    for addr in &addrs {
         if !is_global_ip(addr.ip()) {
             return Err(AppError::other("Resolved private IP blocked"));
         }
     }
-    if !found {
-        return Err(AppError::other("No addresses resolved for image host"));
+    Ok((parsed, host, addrs))
+}
+
+/// SSRF-safe image proxy fetch: disables automatic redirects, pins DNS
+/// resolution to the validated public `SocketAddr`s on each hop, and streams
+/// chunks up to `MAX_IMAGE_BYTES`.
+async fn fetch_public_image_bytes(raw_url: &str, page_url: Option<&str>) -> AppResult<Vec<u8>> {
+    let mut current_url = raw_url.to_string();
+    for _hop in 0..=MAX_IMAGE_REDIRECTS {
+        let (parsed, host, addrs) = validate_and_resolve_public_url(&current_url).await?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+            .map_err(|e| AppError::other(format!("image client: {e}")))?;
+
+        let mut redirected_to: Option<String> = None;
+        let mut last_err = AppError::code("badImageUrl");
+        for referer in referer_candidates(parsed.as_str(), page_url) {
+            let mut req = client.get(parsed.as_str()).header("User-Agent", IMAGE_UA);
+            if let Some(r) = &referer {
+                req = req.header("Referer", r.as_str());
+            }
+            let mut resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = e.into();
+                    break;
+                }
+            };
+            if resp.status().is_redirection() {
+                let loc = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| AppError::other("Redirect missing Location"))?;
+                let next = parsed
+                    .join(loc)
+                    .map_err(|_| AppError::other("Invalid redirect URL"))?;
+                redirected_to = Some(next.to_string());
+                break;
+            }
+            if !resp.status().is_success() {
+                last_err = AppError::other(format!("HTTP {}", resp.status()));
+                continue;
+            }
+            if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES) {
+                return Err(AppError::code("imageTooLarge"));
+            }
+            let mut buf = Vec::new();
+            while let Some(chunk) = resp.chunk().await? {
+                if buf.len() as u64 + chunk.len() as u64 > MAX_IMAGE_BYTES {
+                    return Err(AppError::code("imageTooLarge"));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            return Ok(buf);
+        }
+
+        if let Some(next_url) = redirected_to {
+            current_url = next_url;
+            continue;
+        }
+        return Err(last_err);
     }
-    Ok(())
+    Err(AppError::other("Too many image redirects"))
 }
 
 // ─────────────────────────── HTTP routing ───────────────────────────
@@ -452,7 +589,9 @@ fn json_resp<T: Serialize>(status: StatusCode, value: &T) -> Resp {
 
 fn err_resp(err: AppError) -> Resp {
     let msg = err.to_string();
-    let status = if msg.to_ascii_lowercase().contains("not found") {
+    let status = if msg.contains("articleChanged") {
+        StatusCode::CONFLICT
+    } else if msg.to_ascii_lowercase().contains("not found") {
         StatusCode::NOT_FOUND
     } else {
         StatusCode::BAD_REQUEST
@@ -551,23 +690,10 @@ async fn handle_request(
     let path = req.uri().path().to_string();
     let params = parse_query_params(req.uri().query());
 
-    // Static PWA shell (does not expose private data; sets HttpOnly session cookie when ?token= is valid)
     if method == Method::GET {
         match path.as_str() {
             "/" | "/index.html" => {
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                    .header(header::CACHE_CONTROL, "no-cache");
-                if let Some(q_tok) = params.get("token") {
-                    if ct_eq(q_tok.trim(), &expected_token) {
-                        builder = builder.header(
-                            header::SET_COOKIE,
-                            format!("papr_token={expected_token}; Path=/; HttpOnly; SameSite=Lax"),
-                        );
-                    }
-                }
-                return Ok(builder.body(Full::new(Bytes::from(INDEX_HTML))).unwrap());
+                return Ok(text_resp(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML));
             }
             "/styles.css" => return Ok(text_resp(StatusCode::OK, "text/css; charset=utf-8", STYLES_CSS)),
             "/app.js" => {
@@ -607,8 +733,32 @@ async fn handle_request(
         }
     }
 
-    // All /api/* endpoints require valid pairing token
-    if path.starts_with("/api/") && !is_authorized(&req, &params, &expected_token) {
+    // One-time pairing code exchange -> returns long-lived token + sets HttpOnly cookie
+    if method == Method::POST && path == "/api/pair" {
+        #[derive(Deserialize)]
+        struct Body {
+            code: String,
+        }
+        return Ok(match read_json_body::<Body>(req).await {
+            Ok(b) if consume_pair_code(&app, &b.code) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(
+                    header::SET_COOKIE,
+                    format!("papr_token={expected_token}; Path=/; HttpOnly; SameSite=Lax"),
+                )
+                .body(Full::new(Bytes::from(
+                    serde_json::to_vec(&json!({ "token": expected_token })).unwrap(),
+                )))
+                .unwrap(),
+            Ok(_) => json_resp(StatusCode::UNAUTHORIZED, &json!({ "error": "Invalid or expired pairing code" })),
+            Err(e) => err_resp(e),
+        });
+    }
+
+    // All other /api/* endpoints require Bearer header or HttpOnly cookie (never URL query params)
+    if path.starts_with("/api/") && !is_authorized(&req, &expected_token) {
         return Ok(json_resp(
             StatusCode::UNAUTHORIZED,
             &json!({ "error": "Unauthorized" }),
@@ -627,7 +777,7 @@ async fn handle_request(
             .body(Full::new(Bytes::from_static(b"{\"ok\":true}")))
             .unwrap(),
 
-        // ── Bootstrap (folders, feeds, counts, safe integration list) ──
+        // ── Bootstrap ──
         (Method::GET, "/api/bootstrap") => match api_bootstrap(&app).await {
             Ok(v) => json_resp(StatusCode::OK, &v),
             Err(e) => err_resp(e),
@@ -694,23 +844,19 @@ async fn handle_request(
             }
         }
 
-        // ── Image proxy (SSRF-protected + SVG sandboxed) ──
+        // ── Image proxy (SSRF-safe + SVG sandboxed + private cache) ──
         (Method::GET, "/api/image") => {
             let Some(url) = params.get("url").cloned().filter(|u| !u.is_empty()) else {
                 return Ok(text_resp(StatusCode::BAD_REQUEST, "text/plain", "missing url"));
             };
-            if let Err(e) = validate_public_image_url(&url).await {
-                return Ok(text_resp(StatusCode::FORBIDDEN, "text/plain", e.to_string()));
-            }
             let page_url = params.get("pageUrl").cloned();
-            let http = app.state::<AppState>().http();
-            match fetch_image_bytes(&http, &url, page_url.as_deref()).await {
+            match fetch_public_image_bytes(&url, page_url.as_deref()).await {
                 Ok(bytes) => {
                     let mime = sniff_image_mime(&bytes, &url);
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, mime)
-                        .header(header::CACHE_CONTROL, "public, max-age=86400")
+                        .header(header::CACHE_CONTROL, "private, max-age=86400")
                         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
                         .header(
                             header::CONTENT_SECURITY_POLICY,
@@ -752,7 +898,17 @@ async fn handle_article_route(
             let state = app.state::<AppState>();
             let conn = state.read().await;
             match db::get_article(&conn, id) {
-                Ok(detail) => json_resp(StatusCode::OK, &detail),
+                Ok(detail) => {
+                    let summary: Option<String> = conn
+                        .query_row("SELECT summary FROM articles WHERE id = ?1", [id], |r| r.get(0))
+                        .ok()
+                        .flatten();
+                    let mut val = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("summary".to_string(), json!(summary));
+                    }
+                    json_resp(StatusCode::OK, &val)
+                }
                 Err(e) => err_resp(e),
             }
         }
@@ -809,7 +965,9 @@ async fn handle_article_route(
             }
         }
         (Method::POST, Some("fulltext")) => {
-            let _ = read_json_body::<Value>(req).await;
+            if let Err(e) = read_json_body::<Value>(req).await {
+                return err_resp(e);
+            }
             let state = app.state::<AppState>();
             match extract_fulltext_with_state(&state, id).await {
                 Ok(html) => {
@@ -865,7 +1023,7 @@ async fn handle_article_route(
     }
 }
 
-// ─────────────────────────── Integration helpers (server-side) ───────────────────────────
+// ─────────────────────────── Integration helpers ───────────────────────────
 
 const BUILTIN_KEYS: [&str; 7] = [
     "cubox",
@@ -1191,15 +1349,16 @@ async fn api_translate(
             ),
             Err(_) => (String::new(), String::new()),
         };
-        if current_source == source_html && current_title == article_title {
-            db::set_translation(
-                &conn,
-                article_id,
-                &final_html,
-                &target,
-                translated_title.as_deref(),
-            )?;
+        if current_source != source_html || current_title != article_title {
+            return Err(AppError::code("articleChanged"));
         }
+        db::set_translation(
+            &conn,
+            article_id,
+            &final_html,
+            &target,
+            translated_title.as_deref(),
+        )?;
     }
 
     Ok(json!({

@@ -226,12 +226,14 @@ function buildMatrix(text: string): boolean[][] {
   const formatBits = 0x5412;
   for (let i = 0; i < 15; i++) {
     const bit = ((formatBits >> (14 - i)) & 1) === 1;
-    // Around top-left finder
+    // Copy 1: around top-left finder (skipping timing modules at row 6 / col 6)
     if (i < 6) modules[8][i] = bit;
-    else if (i < 8) modules[8][i + 1] = bit;
+    else if (i === 6) modules[8][7] = bit;
+    else if (i === 7) modules[8][8] = bit;
+    else if (i === 8) modules[7][8] = bit;
     else modules[14 - i][8] = bit;
-    // Around other two finders
-    if (i < 8) modules[size - 1 - i][8] = bit;
+    // Copy 2: bottom-left (i = 0..6, keeping dark module at [size - 8][8]) & top-right (i = 7..14)
+    if (i < 7) modules[size - 1 - i][8] = bit;
     else modules[8][size - 15 + i] = bit;
   }
 

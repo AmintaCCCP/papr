@@ -18,7 +18,7 @@ use reqwest::header::{CONTENT_TYPE, LOCATION};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 
 // ─────────────────────────── configuration ───────────────────────────
@@ -112,7 +112,7 @@ pub(crate) async fn run_integration_with_state(
             .as_deref()
             .map_or(true, |s| s.trim().is_empty())
     {
-        ensure_ai_summary(state, &mut article).await?;
+        ensure_ai_summary(app, state, &mut article).await?;
     }
     let ctx = ArticleContext::build(article, feed_url).await?;
 
@@ -129,6 +129,7 @@ pub(crate) async fn run_integration_with_state(
 /// way — the next reader open (or send) shows it without spending another
 /// API call. Runs off the connection lock: the completion is network work.
 async fn ensure_ai_summary(
+    app: &AppHandle,
     state: &AppState,
     article: &mut ArticleDetail,
 ) -> AppResult<()> {
@@ -158,6 +159,7 @@ async fn ensure_ai_summary(
         let conn = state.db.lock().await;
         crate::db::set_ai_summary(&conn, article.id, text)?;
     }
+    let _ = app.emit("mobile-sync", ());
     article.ai_summary = Some(text.to_string());
     Ok(())
 }
