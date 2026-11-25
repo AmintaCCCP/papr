@@ -508,6 +508,17 @@
       }
     },
     "sync": {
+      "mobileWebTitle": "Mobile Web Service",
+      "mobileWebDesc": "Start a local web server so you can scan or open the URL on your phone. Supports iOS Add to Home Screen (PWA).",
+      "mobileWebStart": "Start Server",
+      "mobileWebStop": "Stop Server",
+      "mobileWebRunning": "Running",
+      "mobileWebStopped": "Stopped",
+      "mobileWebPort": "Port",
+      "mobileWebUrl": "URL",
+      "mobileWebCopy": "Copy URL",
+      "mobileWebCopied": "URL copied",
+      "mobileWebScanHint": "Scan with your phone camera or open the URL above in Safari",
       "greader": "GReader Sync",
       "provider": "Service",
       "providerFreshrss": "FreshRSS",

@@ -72,6 +72,18 @@ pub async fn run_integration(
     config: IntegrationConfig,
     article_id: i64,
 ) -> AppResult<RunOutcome> {
+    run_integration_with_state(&app, &state, kind, use_ai_summary, config, article_id, true).await
+}
+
+pub(crate) async fn run_integration_with_state(
+    app: &AppHandle,
+    state: &AppState,
+    kind: String,
+    use_ai_summary: bool,
+    config: IntegrationConfig,
+    article_id: i64,
+    open_scheme_locally: bool,
+) -> AppResult<RunOutcome> {
     // Load the article (plus its feed's URL for the Obsidian frontmatter)
     // behind a short-lived read lock; the network work below needs none.
     let (mut article, feed_url) = {
@@ -100,12 +112,12 @@ pub async fn run_integration(
             .as_deref()
             .map_or(true, |s| s.trim().is_empty())
     {
-        ensure_ai_summary(&state, &mut article).await?;
+        ensure_ai_summary(state, &mut article).await?;
     }
     let ctx = ArticleContext::build(article, feed_url).await?;
 
     let client = state.http();
-    let url = dispatch(&app, &client, &kind, use_ai_summary, &config, &ctx).await?;
+    let url = dispatch(app, &client, &kind, use_ai_summary, &config, &ctx, open_scheme_locally).await?;
     Ok(RunOutcome { url })
 }
 
@@ -117,7 +129,7 @@ pub async fn run_integration(
 /// way — the next reader open (or send) shows it without spending another
 /// API call. Runs off the connection lock: the completion is network work.
 async fn ensure_ai_summary(
-    state: &State<'_, AppState>,
+    state: &AppState,
     article: &mut ArticleDetail,
 ) -> AppResult<()> {
     let (cfg, system, user) = {
@@ -159,6 +171,7 @@ async fn dispatch(
     use_ai_summary: bool,
     config: &IntegrationConfig,
     ctx: &ArticleContext,
+    open_scheme_locally: bool,
 ) -> AppResult<Option<String>> {
     match kind {
         "cubox" => cubox(client, config, use_ai_summary, ctx).await,
@@ -169,7 +182,7 @@ async fn dispatch(
         "zotero" => zotero(client, config, use_ai_summary, ctx).await,
         "obsidian" => obsidian(config, use_ai_summary, ctx).await,
         "webhook" => webhook(client, config, use_ai_summary, ctx).await,
-        "urlScheme" => url_scheme(app, config, use_ai_summary, ctx),
+        "urlScheme" => url_scheme(app, config, use_ai_summary, ctx, open_scheme_locally),
         _ => Err(AppError::code("integrationUnknown")),
     }
 }
@@ -1026,6 +1039,7 @@ fn url_scheme(
     config: &IntegrationConfig,
     use_ai_summary: bool,
     ctx: &ArticleContext,
+    open_locally: bool,
 ) -> AppResult<Option<String>> {
     let raw = require(&config.scheme, "URL scheme")?;
     let summary = ctx.description_with(use_ai_summary);
@@ -1041,6 +1055,9 @@ fn url_scheme(
     };
     let url = replace_placeholders(raw, &ctx, TokenMode::Url);
     validate_scheme_url(&url)?;
+    if !open_locally {
+        return Ok(Some(url));
+    }
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| AppError::other(format!("could not open the URL: {e}")))?;

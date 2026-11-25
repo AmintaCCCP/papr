@@ -1446,6 +1446,13 @@ pub async fn smart_counts(state: State<'_, AppState>) -> AppResult<SmartCounts> 
 /// Stores the result so subsequent reads are instant/offline.
 #[tauri::command]
 pub async fn extract_fulltext(state: State<'_, AppState>, article_id: i64) -> AppResult<String> {
+    extract_fulltext_with_state(&state, article_id).await
+}
+
+pub(crate) async fn extract_fulltext_with_state(
+    state: &AppState,
+    article_id: i64,
+) -> AppResult<String> {
     // Parser feeds already deliver their final content from our own renderer
     // (an X timeline, generated card and all). Fetching the article URL to
     // "extract" it would hand back the site's SPA shell — for x.com that is the
@@ -1535,7 +1542,7 @@ fn referer_candidates(image_url: &str, page_url: Option<&str>) -> Vec<Option<Str
 /// whitelist-style hotlink protection. `page_url` is the article's link, used
 /// as the final candidate. Transport errors abort the chain — a different
 /// Referer can't fix an unreachable host — only HTTP status errors advance it.
-async fn fetch_image_bytes(
+pub(crate) async fn fetch_image_bytes(
     http: &reqwest::Client,
     url: &str,
     page_url: Option<&str>,
@@ -1991,7 +1998,7 @@ async fn stream_to_channel(
 /// / `llm`; anything else falls back to the LLM. Google, DeepL and Bing are
 /// keyless free endpoints; only the LLM path needs credentials (the shared AI
 /// provider config). The engine is picked per translation.
-fn build_translate_selection(
+pub(crate) fn build_translate_selection(
     conn: &rusqlite::Connection,
     engine: &str,
 ) -> AppResult<translate::Selection> {
@@ -2022,7 +2029,7 @@ fn response_language(conn: &rusqlite::Connection) -> &'static str {
 /// `translate_target_lang` setting, falling back to the UI `language`, then
 /// English. Stored as a code (`en` / `zh` / `ja`); `translate::language_name`
 /// maps it to the name used in the prompt.
-fn translate_target_lang(conn: &rusqlite::Connection) -> String {
+pub(crate) fn translate_target_lang(conn: &rusqlite::Connection) -> String {
     db::get_setting(conn, "translate_target_lang")
         .ok()
         .flatten()
@@ -3219,7 +3226,7 @@ pub struct ArticlePreviewTranslation {
     engine: String,
 }
 
-fn escape_preview_text(s: &str) -> String {
+pub(crate) fn escape_preview_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -3234,7 +3241,7 @@ fn preview_translation_html(title: &str, snippet: &str) -> String {
     )
 }
 
-fn text_for_selector(fragment: &str, selector: &str) -> String {
+pub(crate) fn text_for_selector(fragment: &str, selector: &str) -> String {
     let doc = scraper::Html::parse_fragment(fragment);
     let selector = scraper::Selector::parse(selector).expect("static preview selector");
     doc.select(&selector)

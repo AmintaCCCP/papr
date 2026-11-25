@@ -508,6 +508,17 @@
       }
     },
     "sync": {
+      "mobileWebTitle": "手机端 Web 服务",
+      "mobileWebDesc": "在局域网启动 Web 服务，手机扫码或输入地址即可同步阅读，支持 iOS 添加到主屏幕（PWA）。",
+      "mobileWebStart": "启动服务",
+      "mobileWebStop": "停止服务",
+      "mobileWebRunning": "运行中",
+      "mobileWebStopped": "未启动",
+      "mobileWebPort": "端口",
+      "mobileWebUrl": "访问地址",
+      "mobileWebCopy": "复制地址",
+      "mobileWebCopied": "已复制访问地址",
+      "mobileWebScanHint": "使用手机相机扫码或浏览器打开上方地址",
       "greader": "GReader 同步",
       "provider": "服务",
       "providerFreshrss": "FreshRSS",
