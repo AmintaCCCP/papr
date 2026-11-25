@@ -268,6 +268,7 @@ export default function App() {
       qc.invalidateQueries({ queryKey: ["counts"] });
       qc.invalidateQueries({ queryKey: ["articles"] });
       qc.invalidateQueries({ queryKey: ["article"] });
+      qc.invalidateQueries({ queryKey: ["cp-search"] });
     });
     return () => {
       un1.then((f) => f());

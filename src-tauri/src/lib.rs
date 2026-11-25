@@ -227,8 +227,9 @@ pub fn run() {
             // ── Mobile web server (if previously enabled in Settings) ──
             let web_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let state = web_handle.state::<AppState>();
+                let _op = state.web_server_lock.lock().await;
                 let (enabled, port) = {
-                    let state = web_handle.state::<AppState>();
                     let conn = state.read().await;
                     let enabled = db::get_setting(&conn, "web_server_enabled")
                         .ok()
@@ -239,7 +240,7 @@ pub fn run() {
                     (enabled, port)
                 };
                 if enabled {
-                    if let Err(e) = web_server::start_server(web_handle, port).await {
+                    if let Err(e) = web_server::start_server_locked(&web_handle, port).await {
                         log::warn!("auto-start mobile web server failed: {e}");
                     }
                 }

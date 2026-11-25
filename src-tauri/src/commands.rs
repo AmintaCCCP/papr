@@ -1502,12 +1502,12 @@ pub(crate) async fn extract_fulltext_with_state(
 /// the `Referer`; sending a browser UA (and no Referer) mirrors what the webview
 /// itself does when it renders the image, so a save succeeds wherever the inline
 /// render did.
-const IMAGE_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+pub(crate) const IMAGE_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
 /// Upper bound on a saved image, so a hostile or mistyped URL can't balloon
 /// memory. Well above any real article image.
-const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// The `Referer` values to try, in order, when fetching an image. Hotlink
 /// protection cuts both ways: blacklist hosts (`*.sinaimg.cn`) 403 a foreign
@@ -1515,7 +1515,7 @@ const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 /// bare request and demand a Referer be present; strict whitelist CDNs accept
 /// only their own site — which the article URL satisfies. No single value
 /// works everywhere, so the fetch walks this chain until one succeeds.
-fn referer_candidates(image_url: &str, page_url: Option<&str>) -> Vec<Option<String>> {
+pub(crate) fn referer_candidates(image_url: &str, page_url: Option<&str>) -> Vec<Option<String>> {
     let mut out = vec![None];
     if let Ok(u) = Url::parse(image_url) {
         let origin = u.origin().ascii_serialization();
@@ -1558,15 +1558,18 @@ pub(crate) async fn fetch_image_bytes(
         }
         match req.send().await?.error_for_status() {
             Err(e) => last_err = e.into(),
-            Ok(resp) => {
+            Ok(mut resp) => {
                 if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES) {
                     return Err(AppError::code("imageTooLarge"));
                 }
-                let bytes = resp.bytes().await?;
-                if bytes.len() as u64 > MAX_IMAGE_BYTES {
-                    return Err(AppError::code("imageTooLarge"));
+                let mut buf = Vec::new();
+                while let Some(chunk) = resp.chunk().await? {
+                    if buf.len() as u64 + chunk.len() as u64 > MAX_IMAGE_BYTES {
+                        return Err(AppError::code("imageTooLarge"));
+                    }
+                    buf.extend_from_slice(&chunk);
                 }
-                return Ok(bytes.to_vec());
+                return Ok(buf);
             }
         }
     }

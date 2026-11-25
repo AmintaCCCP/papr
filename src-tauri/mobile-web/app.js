@@ -28,6 +28,7 @@
       copyFail: "复制失败",
       open: "浏览器",
       share: "集成",
+      openApp: "点击打开应用",
       noUrl: "该文章没有原文链接",
       markAllConfirm: "将当前分类全部标为已读？",
       markedAllRead: "已全部标为已读",
@@ -62,6 +63,7 @@
       copyFail: "Copy failed",
       open: "Browser",
       share: "Share",
+      openApp: "Open App",
       noUrl: "Article has no URL",
       markAllConfirm: "Mark all articles in this view as read?",
       markedAllRead: "Marked all as read",
@@ -96,6 +98,7 @@
       copyFail: "コピーに失敗しました",
       open: "ブラウザ",
       share: "共有",
+      openApp: "アプリを開く",
       noUrl: "記事のURLがありません",
       markAllConfirm: "この一覧をすべて既読にしますか？",
       markedAllRead: "すべて既読にしました",
@@ -172,12 +175,24 @@
   }
 
   let toastTimer = null;
-  function showToast(msg) {
+  function showToast(msg, actionHref, actionLabel) {
     const el = $("toast");
-    el.textContent = msg;
+    el.innerHTML = "";
+    const span = document.createElement("span");
+    span.textContent = msg;
+    el.appendChild(span);
+    if (actionHref && actionLabel) {
+      const a = document.createElement("a");
+      a.href = actionHref;
+      a.textContent = ` ${actionLabel}`;
+      a.style.color = "#ffd2bd";
+      a.style.textDecoration = "underline";
+      a.style.marginLeft = "6px";
+      el.appendChild(a);
+    }
     el.classList.remove("hidden");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.add("hidden"), 2400);
+    toastTimer = setTimeout(() => el.classList.add("hidden"), actionHref ? 5000 : 2400);
   }
 
   const TOKEN_KEY = "papr_mobile_token";
@@ -430,6 +445,8 @@
   function renderArticleList() {
     $("current-category-title").textContent = currentCategoryLabel();
     $("unread-filter-btn").classList.toggle("is-active", state.unreadOnly);
+    $("mark-all-btn").disabled = Boolean(state.search.trim());
+    $("mark-all-btn").style.opacity = state.search.trim() ? "0.35" : "";
 
     const listEl = $("article-list");
     if (state.articles.length === 0 && !state.loadingList) {
@@ -563,14 +580,22 @@
     }
   }
 
-  async function loadArticles(reset = true) {
-    if (state.loadingList) return;
-    state.loadingList = true;
+  let listSeq = 0;
+  let loadingMore = false;
+  async function loadArticles(reset = true, preserveScroll = false) {
+    if (!reset && loadingMore) return;
+    const seq = reset ? ++listSeq : listSeq;
+    if (reset) {
+      state.loadingList = true;
+    } else {
+      loadingMore = true;
+    }
     const offset = reset ? 0 : state.articles.length;
+    const limit = preserveScroll ? Math.max(40, state.articles.length) : 40;
     const params = new URLSearchParams({
       kind: state.query.kind,
       unreadOnly: String(state.unreadOnly),
-      limit: "40",
+      limit: String(limit),
       offset: String(offset),
     });
     if (state.query.value != null) params.set("value", String(state.query.value));
@@ -578,22 +603,28 @@
 
     try {
       const rows = await apiFetch(`/api/articles?${params.toString()}`);
+      if (seq !== listSeq) return;
       if (reset) {
+        const prevScroll = $("article-list").scrollTop;
         state.articles = rows;
-        $("article-list").scrollTop = 0;
+        $("article-list").scrollTop = preserveScroll ? prevScroll : 0;
       } else {
         state.articles = state.articles.concat(rows);
       }
-      state.hasMore = rows.length === 40;
+      state.hasMore = rows.length === limit;
       renderArticleList();
     } catch (e) {
-      showToast(e.message);
+      if (seq === listSeq) showToast(e.message);
     } finally {
-      state.loadingList = false;
+      if (seq === listSeq) state.loadingList = false;
+      loadingMore = false;
     }
   }
 
   let openSeq = 0;
+  const readMutSeq = new Map();
+  const starMutSeq = new Map();
+
   async function openArticle(id) {
     const seq = ++openSeq;
     try {
@@ -608,13 +639,22 @@
       renderReader();
 
       if (!detail.isRead) {
-        detail.isRead = true;
+        const mutSeq = (readMutSeq.get(id) || 0) + 1;
+        readMutSeq.set(id, mutSeq);
         patchLocalArticle(id, { isRead: true });
-        await apiFetch(`/api/articles/${id}/read`, {
+        renderReader();
+        apiFetch(`/api/articles/${id}/read`, {
           method: "POST",
           body: JSON.stringify({ read: true }),
-        });
-        loadBootstrap(true);
+        })
+          .then(() => loadBootstrap(true))
+          .catch((e) => {
+            if (readMutSeq.get(id) === mutSeq) {
+              patchLocalArticle(id, { isRead: false });
+              if (state.currentArticle && state.currentArticle.id === id) renderReader();
+              showToast(e.message);
+            }
+          });
       }
     } catch (e) {
       if (seq === openSeq) showToast(e.message);
@@ -703,9 +743,11 @@
               body: JSON.stringify({ id: item.id }),
             });
             if (res && res.clientOpen && res.url) {
+              showToast(tr("sentTo", { name: item.name }), res.url, tr("openApp"));
               window.location.href = res.url;
+            } else {
+              showToast(tr("sentTo", { name: item.name }));
             }
-            showToast(tr("sentTo", { name: item.name }));
           } catch (e) {
             showToast(e.message);
           }
@@ -721,12 +763,12 @@
     $("integration-sheet").classList.add("hidden");
   }
 
-  async function syncNow(silent = false) {
+  async function syncNow(silent = false, preserveScroll = false) {
     const btn = $("sync-btn");
     btn.classList.add("spinning");
     try {
       await loadBootstrap(silent);
-      await loadArticles(true);
+      await loadArticles(true, preserveScroll);
       if (!silent) showToast(tr("synced"));
     } finally {
       btn.classList.remove("spinning");
@@ -745,6 +787,7 @@
     });
 
     $("mark-all-btn").addEventListener("click", async () => {
+      if (state.search.trim()) return;
       if (!window.confirm(tr("markAllConfirm"))) return;
       try {
         await apiFetch("/api/articles/mark-all-read", {
@@ -775,16 +818,24 @@
     $("reader-read-btn").addEventListener("click", async () => {
       const a = state.currentArticle;
       if (!a) return;
-      const next = !a.isRead;
-      patchLocalArticle(a.id, { isRead: next });
+      const targetId = a.id;
+      const prev = Boolean(a.isRead);
+      const next = !prev;
+      const mutSeq = (readMutSeq.get(targetId) || 0) + 1;
+      readMutSeq.set(targetId, mutSeq);
+      patchLocalArticle(targetId, { isRead: next });
       renderReader();
       try {
-        await apiFetch(`/api/articles/${a.id}/read`, {
+        await apiFetch(`/api/articles/${targetId}/read`, {
           method: "POST",
           body: JSON.stringify({ read: next }),
         });
         loadBootstrap(true);
       } catch (e) {
+        if (readMutSeq.get(targetId) === mutSeq) {
+          patchLocalArticle(targetId, { isRead: prev });
+          if (state.currentArticle && state.currentArticle.id === targetId) renderReader();
+        }
         showToast(e.message);
       }
     });
@@ -871,16 +922,24 @@
     $("btn-star").addEventListener("click", async () => {
       const a = state.currentArticle;
       if (!a) return;
-      const next = !a.isStarred;
-      patchLocalArticle(a.id, { isStarred: next });
+      const targetId = a.id;
+      const prev = Boolean(a.isStarred);
+      const next = !prev;
+      const mutSeq = (starMutSeq.get(targetId) || 0) + 1;
+      starMutSeq.set(targetId, mutSeq);
+      patchLocalArticle(targetId, { isStarred: next });
       renderReader();
       try {
-        await apiFetch(`/api/articles/${a.id}/starred`, {
+        await apiFetch(`/api/articles/${targetId}/starred`, {
           method: "POST",
           body: JSON.stringify({ starred: next }),
         });
         loadBootstrap(true);
       } catch (e) {
+        if (starMutSeq.get(targetId) === mutSeq) {
+          patchLocalArticle(targetId, { isStarred: prev });
+          if (state.currentArticle && state.currentArticle.id === targetId) renderReader();
+        }
         showToast(e.message);
       }
     });
@@ -903,22 +962,42 @@
     // Sync with PC when returning to app/tab or periodically while visible.
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
-        syncNow(true);
+        syncNow(true, true);
       }
     });
     setInterval(() => {
       if (document.visibilityState === "visible" && !state.currentArticle) {
-        syncNow(true);
+        syncNow(true, true);
       }
     }, 15000);
   }
 
   async function init() {
     const urlParams = new URLSearchParams(window.location.search);
-    const qTok = urlParams.get("token");
-    if (qTok && qTok.trim()) {
-      setToken(qTok.trim());
+    const pairCode = urlParams.get("pair");
+    if (pairCode && pairCode.trim()) {
+      try {
+        const res = await fetch("/api/pair", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: pairCode.trim() }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.token) setToken(data.token);
+        }
+      } catch {}
       window.history.replaceState(null, "", window.location.pathname);
+    } else if (getToken()) {
+      // Refresh HttpOnly cookie for <img> requests on session restore
+      await fetch("/api/auth", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${getToken()}`,
+        },
+        body: "{}",
+      }).catch(() => {});
     }
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/sw.js").catch(() => {});

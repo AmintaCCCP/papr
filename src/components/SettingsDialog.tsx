@@ -1463,6 +1463,11 @@ function MobileWebGroup({ onToast }: { onToast: (m: string) => void }) {
             <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.45 }}>
               {t("settings.sync.mobileWebScanHint")}
             </div>
+            {webStatus.data?.token && (
+              <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 6, fontFamily: "var(--mono, monospace)" }}>
+                Token: {webStatus.data.token}
+              </div>
+            )}
           </div>
         </div>
       )}
