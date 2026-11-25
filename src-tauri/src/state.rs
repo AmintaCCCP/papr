@@ -41,9 +41,11 @@ pub struct AppState {
     /// (`take_pending_deep_link`); a live link, arriving after the listener
     /// exists, is emitted directly and never lands here.
     pending_deep_link: std::sync::Mutex<Option<String>>,
-    /// Active AI streaming runs, keyed by frontend run_id, so the user can
-    /// click "Stop generating" to abort an in-flight chat/briefing stream.
-    ai_cancels: std::sync::Mutex<HashMap<String, Arc<CancelSignal>>>,
+    /// Active AI streaming runs, keyed by frontend run_id, storing the
+    /// wakeable cancel signal and optional session_id so deleting a session
+    /// cancels any in-flight run for it and duplicate run_ids never clobber
+    /// each other on cleanup.
+    ai_cancels: std::sync::Mutex<HashMap<String, (Arc<CancelSignal>, Option<String>)>>,
 }
 
 impl AppState {
@@ -70,17 +72,23 @@ impl AppState {
         }
     }
 
-    pub fn register_ai_run(&self, run_id: &str) -> Arc<CancelSignal> {
+    pub fn register_ai_run(&self, run_id: &str, session_id: Option<&str>) -> Arc<CancelSignal> {
         let sig = Arc::new(CancelSignal::new());
-        self.ai_cancels
+        let mut map = self
+            .ai_cancels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(run_id.to_string(), Arc::clone(&sig));
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((prev, _)) = map.insert(
+            run_id.to_string(),
+            (Arc::clone(&sig), session_id.map(String::from)),
+        ) {
+            prev.cancel();
+        }
         sig
     }
 
     pub fn cancel_ai_run(&self, run_id: &str) {
-        if let Some(sig) = self
+        if let Some((sig, _)) = self
             .ai_cancels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -90,11 +98,28 @@ impl AppState {
         }
     }
 
-    pub fn finish_ai_run(&self, run_id: &str) {
-        self.ai_cancels
+    pub fn cancel_ai_session_runs(&self, session_id: &str) {
+        let map = self
+            .ai_cancels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(run_id);
+            .unwrap_or_else(|e| e.into_inner());
+        for (sig, sid) in map.values() {
+            if sid.as_deref() == Some(session_id) {
+                sig.cancel();
+            }
+        }
+    }
+
+    pub fn finish_ai_run(&self, run_id: &str, sig: &Arc<CancelSignal>) {
+        let mut map = self
+            .ai_cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((current, _)) = map.get(run_id) {
+            if Arc::ptr_eq(current, sig) {
+                map.remove(run_id);
+            }
+        }
     }
 
     /// Stash a deep-link URL that arrived before the webview could receive it,

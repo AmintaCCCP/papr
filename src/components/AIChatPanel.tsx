@@ -29,7 +29,7 @@ function chatLinkClick(e: React.MouseEvent) {
   const href = link.getAttribute("href");
   if (!href) return;
   e.preventDefault();
-  const m = /^papr:\/\/article\/(\d+)$/.exec(href);
+  const m = /^papr:\/\/article\/(\d+)$/i.exec(href);
   if (m) {
     useUi.getState().openArticle(Number(m[1]));
     return;
@@ -556,6 +556,7 @@ export default function AIChatPanel({
                   tabIndex={0}
                   onClick={() => void loadSession(s.id)}
                   onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
                       void loadSession(s.id);

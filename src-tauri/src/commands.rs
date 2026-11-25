@@ -2717,6 +2717,9 @@ pub async fn ai_chat_rename_session(
 
 #[tauri::command]
 pub async fn ai_chat_delete_session(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    // Cancel any in-flight stream for this session before acquiring the DB
+    // write lock so a finishing run cannot resurrect the deleted session.
+    state.cancel_ai_session_runs(&id);
     let conn = state.db.lock().await;
     db::delete_ai_session(&conn, &id)
 }
@@ -2751,7 +2754,7 @@ pub async fn ai_global_chat(
     question: String,
     on_token: Channel<AiEvent>,
 ) -> AppResult<()> {
-    let cancel_flag = state.register_ai_run(&run_id);
+    let cancel_flag = state.register_ai_run(&run_id, session_id.as_deref());
     let result = ai_global_chat_inner(
         &state,
         &cancel_flag,
@@ -2762,7 +2765,7 @@ pub async fn ai_global_chat(
         &on_token,
     )
     .await;
-    state.finish_ai_run(&run_id);
+    state.finish_ai_run(&run_id, &cancel_flag);
     result
 }
 
@@ -2965,9 +2968,16 @@ async fn ai_global_chat_inner(
             break;
         }
 
-        if outcome.tool_calls.is_empty() || !allow_tool_calls {
+        if outcome.tool_calls.is_empty() {
             finished_cleanly = true;
             break;
+        }
+        if !allow_tool_calls {
+            let err = AppError::other(
+                "AI reached tool-call limit without producing a final answer",
+            );
+            let _ = on_token.send(AiEvent::Error(err.to_string()));
+            return Err(err);
         }
 
         conv.push(ai::ConversationMessage::Assistant {
@@ -3077,7 +3087,7 @@ pub async fn ai_generate_briefing(
     on_token: Channel<AiEvent>,
 ) -> AppResult<Option<AiBriefing>> {
     let days = days.clamp(1, 30);
-    let cancel = state.register_ai_run(&run_id);
+    let cancel = state.register_ai_run(&run_id, None);
     let res = async {
         let (cfg, articles, lang) = {
             let conn = state.read().await;
@@ -3173,7 +3183,7 @@ pub async fn ai_generate_briefing(
         Ok(saved)
     }
     .await;
-    state.finish_ai_run(&run_id);
+    state.finish_ai_run(&run_id, &cancel);
     res
 }
 

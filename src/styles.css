@@ -1497,7 +1497,9 @@ button { font-family: inherit; }
   border-radius: 4px;
   opacity: 0;
 }
-.ai-history-row:hover .ai-history-del { opacity: 1; }
+.ai-history-row:hover .ai-history-del,
+.ai-history-row:focus-visible .ai-history-del,
+.ai-history-del:focus-visible { opacity: 1; }
 .ai-history-del:hover { color: var(--danger, #d94343); }
 
 .ai-starters {
@@ -1826,7 +1828,9 @@ button { font-family: inherit; }
   opacity: 0;
   padding: 2px;
 }
-.briefing-history-item:hover .briefing-history-del { opacity: 1; }
+.briefing-history-item:hover .briefing-history-del,
+.briefing-history-item:focus-visible .briefing-history-del,
+.briefing-history-del:focus-visible { opacity: 1; }
 .briefing-history-del:hover { color: var(--danger, #d94343); }
 .briefing-content-scroll {
   overflow-y: auto;

@@ -18,7 +18,7 @@ function handleBriefingLinkClick(e: React.MouseEvent) {
   const href = link.getAttribute("href");
   if (!href) return;
   e.preventDefault();
-  const m = /^papr:\/\/article\/(\d+)$/.exec(href);
+  const m = /^papr:\/\/article\/(\d+)$/i.exec(href);
   if (m) {
     useUi.getState().openArticle(Number(m[1]));
     return;
@@ -34,6 +34,7 @@ export default function AIBriefingView() {
   const askAiAboutBriefing = useUi((s) => s.askAiAboutBriefing);
 
   const folders = useQuery({ queryKey: ["folders"], queryFn: api.listFolders });
+  const feeds = useQuery({ queryKey: ["feeds"], queryFn: api.listFeeds });
   const briefings = useQuery({
     queryKey: ["ai-briefings"],
     queryFn: api.aiListBriefings,
@@ -65,27 +66,40 @@ export default function AIBriefingView() {
 
   const resolveScope = (): {
     folderId: number | null;
+    feedId: number | null;
     unreadOnly: boolean;
     starredOnly: boolean;
     label: string;
   } => {
     if (scopeKey === "unread") {
-      return { folderId: null, unreadOnly: true, starredOnly: false, label: t("smart.unread") };
+      return { folderId: null, feedId: null, unreadOnly: true, starredOnly: false, label: t("smart.unread") };
     }
     if (scopeKey === "starred") {
-      return { folderId: null, unreadOnly: false, starredOnly: true, label: t("smart.starred") };
+      return { folderId: null, feedId: null, unreadOnly: false, starredOnly: true, label: t("smart.starred") };
     }
     if (scopeKey.startsWith("folder:")) {
       const fid = Number(scopeKey.slice(7));
       const f = (folders.data ?? []).find((x) => x.id === fid);
       return {
         folderId: fid,
+        feedId: null,
         unreadOnly: false,
         starredOnly: false,
         label: f?.name ?? t("smart.all"),
       };
     }
-    return { folderId: null, unreadOnly: false, starredOnly: false, label: t("smart.all") };
+    if (scopeKey.startsWith("feed:")) {
+      const fid = Number(scopeKey.slice(5));
+      const f = (feeds.data ?? []).find((x) => x.id === fid);
+      return {
+        folderId: null,
+        feedId: fid,
+        unreadOnly: false,
+        starredOnly: false,
+        label: f?.title ?? t("smart.all"),
+      };
+    }
+    return { folderId: null, feedId: null, unreadOnly: false, starredOnly: false, label: t("smart.all") };
   };
 
   const generate = async () => {
@@ -102,7 +116,7 @@ export default function AIBriefingView() {
           runId,
           days,
           folderId: scope.folderId,
-          feedId: null,
+          feedId: scope.feedId,
           unreadOnly: scope.unreadOnly,
           starredOnly: scope.starredOnly,
           scopeLabel: scope.label,
@@ -140,7 +154,7 @@ export default function AIBriefingView() {
   const remove = async (id: number) => {
     try {
       await api.aiDeleteBriefing(id);
-      if (selectedId === id) setSelectedId(null);
+      setSelectedId((cur) => (cur === id ? null : cur));
       await qc.invalidateQueries({ queryKey: ["ai-briefings"] });
     } catch (e) {
       reportError(e);
@@ -192,8 +206,13 @@ export default function AIBriefingView() {
             <option value="unread">{t("smart.unread")}</option>
             <option value="starred">{t("smart.starred")}</option>
             {(folders.data ?? []).map((f) => (
-              <option key={f.id} value={`folder:${f.id}`}>
+              <option key={`folder-${f.id}`} value={`folder:${f.id}`}>
                 {f.name}
+              </option>
+            ))}
+            {(feeds.data ?? []).map((f) => (
+              <option key={`feed-${f.id}`} value={`feed:${f.id}`}>
+                {f.title}
               </option>
             ))}
           </select>
@@ -229,6 +248,7 @@ export default function AIBriefingView() {
                     tabIndex={0}
                     onClick={() => setSelectedId(b.id)}
                     onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return;
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
                         setSelectedId(b.id);

@@ -3918,7 +3918,7 @@ pub fn tool_search_articles(
     limit: i64,
 ) -> AppResult<Vec<ToolArticleHit>> {
     let fts = fts_query(query, true);
-    if fts.is_empty() {
+    if query.trim().is_empty() || fts.trim_matches('"').trim().is_empty() {
         return tool_list_recent_articles(
             conn,
             feed_id,
@@ -4065,18 +4065,18 @@ pub fn tool_search_highlights(
 ) -> AppResult<Vec<ToolHighlightHit>> {
     let q = query.map(str::trim).filter(|s| !s.is_empty());
     let (sql, vals): (&str, Vec<Value>) = if let Some(needle) = q {
-        let pattern = format!("%{}%", needle.to_lowercase());
+        let lower_needle = needle.to_lowercase();
         (
             "SELECT h.id, h.article_id, a.title, f.title, h.quote, h.note, h.created_at
              FROM highlights h
              JOIN articles a ON a.id = h.article_id
              JOIN feeds f ON f.id = a.feed_id
-             WHERE unicode_lower(h.quote) LIKE ?1
-                OR unicode_lower(h.note) LIKE ?1
-                OR unicode_lower(a.title) LIKE ?1
+             WHERE instr(unicode_lower(h.quote), ?1) > 0
+                OR instr(unicode_lower(h.note), ?1) > 0
+                OR instr(unicode_lower(a.title), ?1) > 0
              ORDER BY datetime(h.created_at) DESC, h.id DESC
              LIMIT ?2",
-            vec![Value::Text(pattern), Value::Integer(limit.clamp(1, 30))],
+            vec![Value::Text(lower_needle), Value::Integer(limit.clamp(1, 30))],
         )
     } else {
         (
