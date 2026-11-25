@@ -1446,6 +1446,13 @@ pub async fn smart_counts(state: State<'_, AppState>) -> AppResult<SmartCounts> 
 /// Stores the result so subsequent reads are instant/offline.
 #[tauri::command]
 pub async fn extract_fulltext(state: State<'_, AppState>, article_id: i64) -> AppResult<String> {
+    extract_fulltext_with_state(&state, article_id).await
+}
+
+pub(crate) async fn extract_fulltext_with_state(
+    state: &AppState,
+    article_id: i64,
+) -> AppResult<String> {
     // Parser feeds already deliver their final content from our own renderer
     // (an X timeline, generated card and all). Fetching the article URL to
     // "extract" it would hand back the site's SPA shell — for x.com that is the
@@ -1495,12 +1502,12 @@ pub async fn extract_fulltext(state: State<'_, AppState>, article_id: i64) -> Ap
 /// the `Referer`; sending a browser UA (and no Referer) mirrors what the webview
 /// itself does when it renders the image, so a save succeeds wherever the inline
 /// render did.
-const IMAGE_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+pub(crate) const IMAGE_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
 /// Upper bound on a saved image, so a hostile or mistyped URL can't balloon
 /// memory. Well above any real article image.
-const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// The `Referer` values to try, in order, when fetching an image. Hotlink
 /// protection cuts both ways: blacklist hosts (`*.sinaimg.cn`) 403 a foreign
@@ -1508,7 +1515,7 @@ const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 /// bare request and demand a Referer be present; strict whitelist CDNs accept
 /// only their own site — which the article URL satisfies. No single value
 /// works everywhere, so the fetch walks this chain until one succeeds.
-fn referer_candidates(image_url: &str, page_url: Option<&str>) -> Vec<Option<String>> {
+pub(crate) fn referer_candidates(image_url: &str, page_url: Option<&str>) -> Vec<Option<String>> {
     let mut out = vec![None];
     if let Ok(u) = Url::parse(image_url) {
         let origin = u.origin().ascii_serialization();
@@ -1535,7 +1542,7 @@ fn referer_candidates(image_url: &str, page_url: Option<&str>) -> Vec<Option<Str
 /// whitelist-style hotlink protection. `page_url` is the article's link, used
 /// as the final candidate. Transport errors abort the chain — a different
 /// Referer can't fix an unreachable host — only HTTP status errors advance it.
-async fn fetch_image_bytes(
+pub(crate) async fn fetch_image_bytes(
     http: &reqwest::Client,
     url: &str,
     page_url: Option<&str>,
@@ -1551,15 +1558,18 @@ async fn fetch_image_bytes(
         }
         match req.send().await?.error_for_status() {
             Err(e) => last_err = e.into(),
-            Ok(resp) => {
+            Ok(mut resp) => {
                 if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES) {
                     return Err(AppError::code("imageTooLarge"));
                 }
-                let bytes = resp.bytes().await?;
-                if bytes.len() as u64 > MAX_IMAGE_BYTES {
-                    return Err(AppError::code("imageTooLarge"));
+                let mut buf = Vec::new();
+                while let Some(chunk) = resp.chunk().await? {
+                    if buf.len() as u64 + chunk.len() as u64 > MAX_IMAGE_BYTES {
+                        return Err(AppError::code("imageTooLarge"));
+                    }
+                    buf.extend_from_slice(&chunk);
                 }
-                return Ok(bytes.to_vec());
+                return Ok(buf);
             }
         }
     }
@@ -1991,7 +2001,7 @@ async fn stream_to_channel(
 /// / `llm`; anything else falls back to the LLM. Google, DeepL and Bing are
 /// keyless free endpoints; only the LLM path needs credentials (the shared AI
 /// provider config). The engine is picked per translation.
-fn build_translate_selection(
+pub(crate) fn build_translate_selection(
     conn: &rusqlite::Connection,
     engine: &str,
 ) -> AppResult<translate::Selection> {
@@ -2022,7 +2032,7 @@ fn response_language(conn: &rusqlite::Connection) -> &'static str {
 /// `translate_target_lang` setting, falling back to the UI `language`, then
 /// English. Stored as a code (`en` / `zh` / `ja`); `translate::language_name`
 /// maps it to the name used in the prompt.
-fn translate_target_lang(conn: &rusqlite::Connection) -> String {
+pub(crate) fn translate_target_lang(conn: &rusqlite::Connection) -> String {
     db::get_setting(conn, "translate_target_lang")
         .ok()
         .flatten()
@@ -3219,7 +3229,7 @@ pub struct ArticlePreviewTranslation {
     engine: String,
 }
 
-fn escape_preview_text(s: &str) -> String {
+pub(crate) fn escape_preview_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -3234,7 +3244,7 @@ fn preview_translation_html(title: &str, snippet: &str) -> String {
     )
 }
 
-fn text_for_selector(fragment: &str, selector: &str) -> String {
+pub(crate) fn text_for_selector(fragment: &str, selector: &str) -> String {
     let doc = scraper::Html::parse_fragment(fragment);
     let selector = scraper::Selector::parse(selector).expect("static preview selector");
     doc.select(&selector)

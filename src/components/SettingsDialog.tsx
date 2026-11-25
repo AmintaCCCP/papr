@@ -63,6 +63,7 @@ import Icon, { type IconName } from "./Icon";
 import ConfirmDialog from "./ConfirmDialog";
 import { useBackdropClose } from "../hooks/useBackdropClose";
 import FeedAvatar from "./FeedAvatar";
+import { qrSvgDataUrl } from "../lib/qrcode";
 
 interface Props {
   onClose: () => void;
@@ -1296,6 +1297,184 @@ function RsshubEngineGroup() {
 }
 
 /* ── sync ────────────────────────────────────────────────── */
+function MobileWebGroup({ onToast }: { onToast: (m: string) => void }) {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const webStatus = useQuery({
+    queryKey: ["web-server-status"],
+    queryFn: api.webServerStatus,
+  });
+  const [portInput, setPortInput] = useState("14320");
+  const [selectedUrlIdx, setSelectedUrlIdx] = useState(0);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (webStatus.data?.port) {
+      setPortInput(String(webStatus.data.port));
+    }
+  }, [webStatus.data?.port]);
+
+  const running = webStatus.data?.running ?? false;
+  const urls = webStatus.data?.urls ?? [];
+  const accessUrl = urls[selectedUrlIdx] ?? webStatus.data?.url ?? null;
+  const qrDataUrl = useMemo(() => {
+    if (!accessUrl) return "";
+    try {
+      return qrSvgDataUrl(accessUrl, 156);
+    } catch {
+      return "";
+    }
+  }, [accessUrl]);
+
+  const toggleServer = async () => {
+    setBusy(true);
+    try {
+      if (running) {
+        await api.webServerStop();
+      } else {
+        const parsed = parseInt(portInput, 10);
+        const validPort = Number.isFinite(parsed) && parsed >= 1024 && parsed <= 65535 ? parsed : 14320;
+        await api.webServerStart(validPort);
+      }
+      await qc.invalidateQueries({ queryKey: ["web-server-status"] });
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyUrl = async () => {
+    if (!accessUrl) return;
+    try {
+      await navigator.clipboard.writeText(accessUrl);
+      onToast(t("settings.sync.mobileWebCopied"));
+    } catch (e) {
+      reportError(e);
+    }
+  };
+
+  return (
+    <div className="settings-group">
+      <h3 className="settings-group-title">{t("settings.sync.mobileWebTitle")}</h3>
+      <p className="modal-hint" style={{ marginBottom: 12 }}>
+        {t("settings.sync.mobileWebDesc")}
+      </p>
+
+      <div className="s-service" style={{ marginBottom: 12 }}>
+        <div className="logo" style={{ background: running ? "#2E7D4F" : "#6B7280" }}>
+          <Icon name="globe" size={16} />
+        </div>
+        <div className="info">
+          <div className="title">{t("settings.sync.mobileWebTitle")}</div>
+          <div className="desc">
+            {running ? accessUrl : `${t("settings.sync.mobileWebPort")}: ${portInput}`}
+          </div>
+        </div>
+        <span className={`status ${running ? "on" : ""}`}>
+          {running ? t("settings.sync.mobileWebRunning") : t("settings.sync.mobileWebStopped")}
+        </span>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <label style={{ fontSize: 12.5, color: "var(--muted)", display: "flex", alignItems: "center", gap: 6 }}>
+          {t("settings.sync.mobileWebPort")}
+          <input
+            className="modal-input"
+            style={{ width: 88, margin: 0 }}
+            type="number"
+            min={1024}
+            max={65535}
+            disabled={running || busy}
+            value={portInput}
+            onChange={(e) => setPortInput(e.target.value)}
+          />
+        </label>
+        <button
+          className={`s-btn ${running ? "" : "primary"}`}
+          onClick={toggleServer}
+          disabled={busy}
+        >
+          {running ? t("settings.sync.mobileWebStop") : t("settings.sync.mobileWebStart")}
+        </button>
+        {running && accessUrl && (
+          <button className="s-btn" onClick={copyUrl}>
+            {t("settings.sync.mobileWebCopy")}
+          </button>
+        )}
+      </div>
+
+      {running && accessUrl && (
+        <div
+          style={{
+            marginTop: 14,
+            padding: 14,
+            borderRadius: 12,
+            background: "var(--bg-elevated, rgba(128,128,128,0.08))",
+            display: "flex",
+            alignItems: "center",
+            gap: 16,
+            flexWrap: "wrap",
+          }}
+        >
+          {qrDataUrl && (
+            <img
+              src={qrDataUrl}
+              alt="QR Code"
+              width={156}
+              height={156}
+              style={{
+                borderRadius: 10,
+                boxShadow: "0 2px 10px rgba(0,0,0,0.08)",
+                flexShrink: 0,
+                display: "block",
+              }}
+            />
+          )}
+          <div style={{ flex: 1, minWidth: 180 }}>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>
+              {t("settings.sync.mobileWebUrl")}
+            </div>
+            {urls.length > 1 && (
+              <select
+                className="modal-input"
+                style={{ marginBottom: 6, fontSize: 12 }}
+                value={selectedUrlIdx}
+                onChange={(e) => setSelectedUrlIdx(Number(e.target.value))}
+              >
+                {urls.map((u, idx) => (
+                  <option key={u} value={idx}>
+                    {u}
+                  </option>
+                ))}
+              </select>
+            )}
+            <div
+              style={{
+                fontFamily: "var(--mono, monospace)",
+                fontSize: 13.5,
+                fontWeight: 600,
+                wordBreak: "break-all",
+                marginBottom: 8,
+              }}
+            >
+              {accessUrl}
+            </div>
+            <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.45 }}>
+              {t("settings.sync.mobileWebScanHint")}
+            </div>
+            {webStatus.data?.token && (
+              <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 6, fontFamily: "var(--mono, monospace)" }}>
+                Token: {webStatus.data.token}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SyncSection({ onToast }: { onToast: (m: string) => void }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1366,6 +1545,8 @@ function SyncSection({ onToast }: { onToast: (m: string) => void }) {
 
   return (
     <>
+      <MobileWebGroup onToast={onToast} />
+
       <div className="settings-group">
         <h3 className="settings-group-title">{t("settings.sync.greader")}</h3>
         {connected ? (

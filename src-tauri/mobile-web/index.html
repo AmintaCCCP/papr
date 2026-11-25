@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Papr" />
+    <meta name="theme-color" content="#FBF9F3" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1D1E1F" media="(prefers-color-scheme: dark)" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>Papr</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <!-- Category / Feed Drawer -->
+      <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+      <aside id="drawer" class="drawer" aria-hidden="true">
+        <div class="drawer-header">
+          <div class="drawer-brand">
+            <img src="/icon-128.png" alt="Papr" class="brand-icon" />
+            <span>Papr</span>
+          </div>
+          <button id="drawer-close" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+        <div id="drawer-content" class="drawer-content"></div>
+      </aside>
+
+      <!-- List View -->
+      <section id="list-view" class="view active">
+        <header class="top-bar">
+          <button id="menu-btn" class="icon-btn" aria-label="Categories">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="3" y1="6" x2="21" y2="6" />
+              <line x1="3" y1="12" x2="21" y2="12" />
+              <line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+          </button>
+          <button id="title-cat-btn" class="top-title-btn">
+            <span id="current-category-title">Papr</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <polyline points="6 9 12 15 18 9" />
+            </svg>
+          </button>
+          <div class="top-actions">
+            <button id="unread-filter-btn" class="icon-btn" title="Unread only">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="9" />
+                <circle cx="12" cy="12" r="3" fill="currentColor" />
+              </svg>
+            </button>
+            <button id="mark-all-btn" class="icon-btn" title="Mark all read">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </button>
+            <button id="sync-btn" class="icon-btn" title="Sync">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10" />
+                <polyline points="1 20 1 14 7 14" />
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="search-wrap">
+          <input id="search-input" type="search" class="search-input" placeholder="Search articles..." />
+        </div>
+
+        <div id="article-list" class="article-list"></div>
+      </section>
+
+      <!-- Reader View -->
+      <section id="reader-view" class="view">
+        <header class="top-bar reader-top-bar">
+          <button id="back-btn" class="icon-btn back-btn" aria-label="Back">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="15 18 9 12 15 6" />
+            </svg>
+          </button>
+          <div id="reader-feed-name" class="reader-feed-name"></div>
+          <div class="top-actions">
+            <button id="reader-read-btn" class="icon-btn" title="Toggle read">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="8" />
+              </svg>
+            </button>
+            <button id="reader-fulltext-btn" class="icon-btn" title="Extract full text">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+                <line x1="8" y1="13" x2="16" y2="13" />
+                <line x1="8" y1="17" x2="16" y2="17" />
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <main id="reader-scroll" class="reader-scroll">
+          <article id="reader-article" class="reader-article"></article>
+        </main>
+
+        <footer class="reader-bottom-bar">
+          <button id="btn-translate" class="bar-btn">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 8l6 6" />
+              <path d="M4 14l6-6 2-3" />
+              <path d="M2 5h12" />
+              <path d="M7 2h1" />
+              <path d="M22 22l-5-10-5 10" />
+              <path d="M14 18h6" />
+            </svg>
+            <span data-i18n="translate">翻译</span>
+          </button>
+          <button id="btn-summarize" class="bar-btn">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l1.9 5.8L20 10.7l-6.1 1.9L12 18.4l-1.9-5.8L4 10.7l6.1-1.9z" />
+            </svg>
+            <span data-i18n="summarize">总结</span>
+          </button>
+          <button id="btn-star" class="bar-btn">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+            </svg>
+            <span data-i18n="star">收藏</span>
+          </button>
+          <button id="btn-copy" class="bar-btn">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+            <span data-i18n="copy">复制链接</span>
+          </button>
+          <button id="btn-browser" class="bar-btn">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+              <polyline points="15 3 21 3 21 9" />
+              <line x1="10" y1="14" x2="21" y2="3" />
+            </svg>
+            <span data-i18n="open">浏览器</span>
+          </button>
+          <button id="btn-share" class="bar-btn">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" />
+              <polyline points="16 6 12 2 8 6" />
+              <line x1="12" y1="2" x2="12" y2="15" />
+            </svg>
+            <span data-i18n="share">集成</span>
+          </button>
+        </footer>
+      </section>
+
+      <!-- Integrations Action Sheet -->
+      <div id="sheet-backdrop" class="sheet-backdrop hidden"></div>
+      <div id="integration-sheet" class="action-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+        <div class="sheet-handle"></div>
+        <div class="sheet-title" id="sheet-title">分享到集成</div>
+        <div id="sheet-list" class="sheet-list"></div>
+        <button id="sheet-cancel" class="sheet-cancel">取消</button>
+      </div>
+
+      <!-- Toast -->
+      <div id="toast" class="toast hidden"></div>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

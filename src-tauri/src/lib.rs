@@ -21,6 +21,7 @@ mod scheduler;
 mod state;
 mod translate;
 mod tray;
+mod web_server;
 
 use ingestion::discovery::{self, DeepLink};
 use state::AppState;
@@ -223,6 +224,28 @@ pub fn run() {
                 notify::update_badge(&badge_handle).await;
             });
 
+            // ── Mobile web server (if previously enabled in Settings) ──
+            let web_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = web_handle.state::<AppState>();
+                let _op = state.web_server_lock.lock().await;
+                let (enabled, port) = {
+                    let conn = state.read().await;
+                    let enabled = db::get_setting(&conn, "web_server_enabled")
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some("1");
+                    let port = web_server::read_saved_port(&conn);
+                    (enabled, port)
+                };
+                if enabled {
+                    if let Err(e) = web_server::start_server_locked(&web_handle, port).await {
+                        log::warn!("auto-start mobile web server failed: {e}");
+                    }
+                }
+            });
+
             // ── One-time card-thumbnail backfill ──────────────────────
             // Articles ingested before the body-image fallback have no
             // thumbnail even when their HTML embeds one. Adopt that first
@@ -360,6 +383,9 @@ pub fn run() {
             page_view::set_page_view_bounds,
             page_view::set_page_view_visible,
             page_view::close_page_view,
+            web_server::web_server_status,
+            web_server::web_server_start,
+            web_server::web_server_stop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Papr")
@@ -367,6 +393,7 @@ pub fn run() {
             // The local RSSHub engine is a child process — on quit it must be
             // killed, or it would outlive the app holding its port and memory.
             if matches!(event, tauri::RunEvent::Exit) {
+                web_server::stop_server_sync(app_handle);
                 let engine = app_handle.state::<AppState>().engine.clone();
                 tauri::async_runtime::block_on(engine.shutdown());
             }

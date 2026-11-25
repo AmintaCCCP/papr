@@ -1,0 +1,22 @@
+{
+  "name": "Papr",
+  "short_name": "Papr",
+  "description": "Papr Mobile RSS Reader",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FBF9F3",
+  "theme_color": "#FBF9F3",
+  "icons": [
+    {
+      "src": "/icon-128.png",
+      "sizes": "128x128",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
