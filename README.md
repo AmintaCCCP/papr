@@ -6,72 +6,96 @@
 
 **A fast, native RSS reader — and a CLI your AI agent can actually drive.**
 
+**English** | [简体中文](README.zh-CN.md)
+
 > [!NOTE]
 > **Fork Notice & Maintenance Scope**
 > This repository is a personal fork of [Papr](https://github.com/l0ng-ai/papr), created to serve as a self-hosted, independent alternative to proprietary/paid reader features (such as Folo's premium capabilities).
 >
 > You are very welcome to use, fork, or adapt this project for your own workflow. However, please note that **this fork is maintained strictly for personal use: external issues and pull requests will not be accepted**. If you encounter bugs or wish to propose general features or improvements, please submit them directly to the upstream project at [l0ng-ai/papr](https://github.com/l0ng-ai/papr).
 
-<img src="docs/screenshot.webp" alt="Papr" width="820" />
+<img src="assets/screenshot/SCR-20261125-suai.png" alt="Papr Desktop Reader with Inline AI Summary and Global AI Assistant" width="880" />
 
 </div>
 
 ## Fork Highlights & Enhancements
 
-This fork enhances Papr with richer export workflows, a Folo-style inline AI reading experience, native social media parsers, an embedded local RSSHub engine, and hardened translation reliability:
+This fork builds on Papr with a global AI reading workspace, LAN mobile PWA access, a programmable rule engine, native social media parsers, an embedded local RSSHub engine, rich export workflows, and hardened feed ingestion & translation:
 
-### 1. Rich Export Integrations & Custom Webhooks ([#1](https://github.com/AmintaCCCP/papr/pull/1))
-- **Built-in Read-Later & Note-Taking Services**: One-click dispatch from the reader toolbar directly into:
-  - **Cubox** (via personal API URL)
-  - **Readwise Reader** (full document and metadata ingestion)
-  - **Instapaper** (HTTP credential bookmarking)
-  - **Outline** (document creation within chosen collections)
-  - **Readeck** (bookmark and link ingestion)
-  - **Zotero** (creates webpage items in user libraries)
-  - **Obsidian** (writes Markdown notes with structured YAML frontmatter directly into a local vault)
-- **Custom Webhooks & URL Schemes**:
-  - Full HTTP method support (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`) with configurable headers and payload templates.
-  - Native URI scheme triggering (e.g. `obsidian://new?vault=...`).
-  - 8 dynamic template variables: `[title]`, `[url]`, `[content_html]`, `[content_markdown]`, `[summary]`, `[description]`, `[author]`, and `[published_at]`, with automatic URL percent-encoding and JSON-safe string escaping.
-- **On-Demand AI Summary Handoff**: Optionally forward the AI summary as the item's summary/description, generating and persisting it on the fly if not yet present.
-- **Native Rust Dispatch**: All requests execute in backend Rust, bypassing webview CORS restrictions, honoring system proxies and timeouts, and guarded by protocol blocklists.
+### 1. Global AI Assistant, AI Briefing & Inline AI Reading ([#3](https://github.com/AmintaCCCP/papr/pull/3), [#15](https://github.com/AmintaCCCP/papr/pull/15), [#17](https://github.com/AmintaCCCP/papr/pull/17))
+- **Global Docked AI Assistant**: A persistent right-hand AI sidebar that works both on the currently opened article and across your entire local library. Backed by read-only retrieval tools, it can search subscriptions, folders, tags, highlights, and notes, supports explicit context picking (`+ Context` by feed/folder/tag), streaming replies, conversation history, and quick-start prompts.
+- **AI Briefing**: A dedicated briefing workspace that synthesizes articles from the last 24 hours, 3 days, or 7 days (globally or scoped to specific feeds/folders) into structured, topic-grouped digests with clickable article citations, saved briefing history, and one-click **Follow up on this briefing** handoff into the AI Assistant.
+- **Folo-Style Inline AI Summary & Prompt Editor**: Renders an inline summary card naturally between the article header and body (with copy, regenerate, dismiss, and optional auto-summarize on open), plus an in-app customizable prompt editor shared across summaries and export integrations.
+- **Reader Interaction Enhancements**: Highlight any passage in the reader to trigger **Ask AI** directly in context, alongside a dedicated link context menu.
 
-### 2. Inline AI Summary Card & Custom Prompt Editor ([#3](https://github.com/AmintaCCCP/papr/pull/3))
-- **Folo-Style Inline Card**: Replaced the sliding drawer with an inline summary card positioned naturally between the article header and content, scrolling with the document. Includes one-click Markdown copy, regeneration, and dismissal.
-- **Auto-Summarize on Open**: Added an optional setting (`autoSummarize`) to instantly display cached summaries or generate them in the background upon opening an article.
-- **Configurable Prompt Editor**: In-app prompt customization with one-click restoration to default, uniformly applied across reader summaries and integration exports.
+<p align="center">
+  <img src="assets/screenshot/SCR-20261125-surr.png" alt="AI Briefing View" width="840" />
+</p>
 
-### 3. Native First-Class X (Twitter) Parser ([#5](https://github.com/AmintaCCCP/papr/pull/5))
-- **Zero Third-Party Middlemen**: Subscribes directly to X via official GraphQL endpoints—no external RSSHub instances or intermediate proxies required.
-- **Rich Media & Post Fidelity**: Preserves full entity styling (links, @mentions, hashtags), embeds highest-bitrate MP4 videos and images, formats retweets and quote tweets, and derives exact timestamps via Snowflake IDs.
-- **Resilient Query ID Rotation**: Automatically extracts and caches GraphQL query IDs from client bundles, with automatic invalidation and retries on 404s.
-- **Dedicated Parser Settings**: Manage credentials (`auth_token` and `ct0`) with built-in connection probe diagnostics, plus background rate-limiting (500ms) and per-feed error isolation.
+### 2. LAN Mobile Web Reader & iOS PWA Support ([#18](https://github.com/AmintaCCCP/papr/pull/18))
+- **Built-in Local Web Server**: Start a lightweight HTTP server right from **Settings → Sync → Mobile Web Server** on a configurable port to read and sync directly against your desktop Papr database over LAN — no cloud account or third-party sync server required.
+- **Instant QR Pairing & Token Auth**: Scan the generated QR code or open the LAN URL with token authentication from your phone browser.
+- **iOS Add to Home Screen (PWA)**: Ships with a web app manifest and service worker for a native-feeling mobile reading experience on iOS and Android.
 
-### 3b. Native Xiaohongshu (RED) & Kuaishou Parsers
-- **Xiaohongshu, cookie-optional anonymous mode**: Subscribe directly to `xiaohongshu.com/user/profile/<id>`. The parser reads the profile page's server-rendered `__INITIAL_STATE__` — nickname, bio, avatar and the newest ~30 note cards (title, cover, publish time, likes) — using the full Chrome document header group, no login required. Pasting a logged-in `Cookie` (optional) unlocks per-note detail pages: full text, image sets and MP4 video, fetched only for genuinely new notes, throttled with jitter and capped per refresh (failed details fall back to the card and are retried from a pending queue next cycle).
-- **Kuaishou, cookie-recommended**: Subscribe to `kuaishou.com/profile/<id>` (www / live / `v.kuaishou.com` share links all resolve). The web API is captcha-gated for anonymous traffic and its signed REST endpoints rely on an in-page JS signer that cannot be reproduced faithfully offline — so the parser runs the same GraphQL operations the web client sends, with a pasted login cookie as the supported credential, and surfaces the captcha as a distinct, localisable error that explains both the cookie path and the RSSHub browser-engine route alternative.
-- **Anti-ban posture shared by both**: strictly serial per-site legs, jittered inter-feed pacing, first-page-only reads, read-only requests, hard host allow-lists (session cookies only ever travel in an explicit header to their own site), and upstream risk-control states surfaced as coded, localised per-feed errors instead of silent retries.
+<p align="center">
+  <img src="assets/screenshot/SCR-20261125-svts.png" alt="LAN Mobile Web Server and Sync Settings" width="760" />
+</p>
 
-### 4. Embedded Local RSSHub Engine & Route Marketplace ([#6](https://github.com/AmintaCCCP/papr/pull/6), [#7](https://github.com/AmintaCCCP/papr/pull/7))
-- **Self-Contained Local Runtime**: Bundles a slim Node 24 + RSSHub engine running locally on `127.0.0.1`. Spawns on-demand and idles out after 10 minutes of inactivity, completely bypassing blocked or rate-limited public instances.
-- **In-App Route Marketplace**: Browse an offline catalog of 4,000+ routes across 2,000+ namespaces with search, category filtering, and popularity sorting. Features automated parameter forms with pre-filled examples and environment variable configuration.
-- **Browser Engine Flavor**: Two engine builds ship from CI — `standard` (Node + RSSHub) and `browser` (`scripts/build-engine.sh --browser`), which additionally bundles RSSHub's own `patchright` runtime plus a headless Chromium. Installing the browser flavor (Settings → Subscriptions → RSSHub local engine, from file or URL) unlocks the marketplace's `Needs browser` routes: the engine pins `PLAYWRIGHT_BROWSERS_PATH` at its bundled Chromium, so anti-bot routes run headlessly on-device with no system Chrome required.
-- **Catch-All & Query Handling**: Fully supports greedy/wildcard path parameters (`{:path*}`) and strips query strings/fragments during route matching. Cleans up orphan engine processes on exit and provides clear feedback for uninstalled routes.
+### 3. Advanced Filter Rules & Open-Time Automation ([#12](https://github.com/AmintaCCCP/papr/pull/12), [#13](https://github.com/AmintaCCCP/papr/pull/13))
+- **When / Then Condition Groups**: Build multi-condition rules using `AND` / `OR` groups across `title`, `author`, `content`, `url`, or `any`, with full `regex` operator support (`regexp()` parity between live Rust ingestion and SQLite preview/backfill).
+- **Text Rewrite Action**: Apply literal `from → to` replacements to matched article titles, summaries, and bodies both at ingestion time and via save-time backfill (automatically rebuilding affected FTS entries and invalidating stale derivative caches).
+- **Open-Time Actions**: Automatically trigger **Auto Full-Text**, **Auto Translate**, **Auto Summarize**, or **Open Original** whenever you open an article matching your rules (e.g., auto-extract full text and auto-translate specific domains).
 
-### 5. Hardened Keyless Translation Engines & UI Concurrency Fixes ([#2](https://github.com/AmintaCCCP/papr/pull/2), [#4](https://github.com/AmintaCCCP/papr/pull/4))- **Repaired Free Translation Endpoints**:
-  - Bing: Migrated to Edge's keyless `translatetext` API, resolving broken token endpoint 404 failures.
-  - Google: Switched to Chromium's batch form endpoint (`clients5.google.com`), supporting aligned multi-segment payloads without awkward newline splits.
-- **Scoped Viewport Translation**: Scoped list-view auto-translation strictly to the currently opened article instead of queuing all visible list rows, eliminating severe Google 429 rate-limiting.
-- **Race Condition Fix**: Eliminated the React Query refetch race condition when switching translation engines in Settings, and added descriptive error messaging per engine.
+<p align="center">
+  <img src="assets/screenshot/SCR-20261125-svql.png" alt="Advanced Filter Rules and Open-Time Actions" width="760" />
+</p>
 
-### 6. Dialog Robustness: IME-Safe Escape & Nested Modals
-- **IME Candidate Escape No Longer Closes Dialogs**: Every dialog, popover and the command palette guards Escape with `isComposing` — cancelling a CJK/IME candidate window no longer tears down the dialog the user is typing in (the same guard `Enter` submits already had).
-- **Nested-Modal Escape Scoping**: Inner modals (RSSHub env editor, uninstall confirms, parser credential dialogs) own Escape while open; the outer dialog no longer closes both layers at once.
+### 4. Native Social Media Parsers & Local RSSHub Engine ([#5](https://github.com/AmintaCCCP/papr/pull/5), [#6](https://github.com/AmintaCCCP/papr/pull/6), [#7](https://github.com/AmintaCCCP/papr/pull/7), [#8](https://github.com/AmintaCCCP/papr/pull/8), [#10](https://github.com/AmintaCCCP/papr/pull/10), [#14](https://github.com/AmintaCCCP/papr/pull/14), [#15](https://github.com/AmintaCCCP/papr/pull/15))
+- **Native X (Twitter) Parser**: Subscribes directly to `x.com/<handle>` via official GraphQL endpoints with resilient query ID rotation. Renders attributed tweet cards, highest-bitrate MP4 videos and images, retweets, result-level quote tweets, pinned tweets, and **full-text X long-form Articles** (DraftJS rich content state with downgrade protection).
+- **Native Xiaohongshu (RED) & Kuaishou Parsers**:
+  - **Xiaohongshu**: Cookie-optional anonymous mode reads server-rendered profile notes out of the box; adding an optional login cookie unlocks per-note full text, image sets, and MP4 videos with throttled fetching.
+  - **Kuaishou**: Migrated to the live GraphQL endpoint (`kuaishou.com/profile/<id>`, `live`, and `v.kuaishou.com` share links) with cookie support and clear captcha/risk-control diagnostics.
+  - **Shared Anti-Ban Posture**: Strictly serial per-site fetches, jittered pacing, host allow-lists for credentials, and localized per-feed error states.
+- **Embedded Local RSSHub Engine & Route Marketplace**:
+  - Bundles a local Node 24 + RSSHub runtime on `127.0.0.1` that spawns on demand and idles out after 10 minutes.
+  - Supports both `standard` and `browser` engine flavors (bundling `patchright` + headless Chromium for anti-bot routes with no system Chrome required).
+  - Offline **Route Marketplace** covering 4,000+ routes across 2,000+ namespaces with search, category filtering, NSFW toggle, pre-filled parameter forms, environment variable configuration, catch-all route params (`{:path*}`), and one-click test/install/subscribe.
 
-### 7. Folo Shared-List Import
-- **One-Click List Migration**: Paste a Folo share link (`app.folo.is/share/lists/…`) into the add-feed dialog's new "Folo list" tab to preview a list — title, owner, subscriber count, every feed — and import all of it in one transaction, deduplicated and grouped into a folder of your choice. The CLI twin is `papr folo import <share-link-or-id>`.
-- **Native Parser Rewrites**: `rsshub://twitter/user/*` routes are rewritten to `https://x.com/<handle>` and served by the built-in X parser (with your existing credentials) instead of RSSHub's credential-hungry Twitter routes; every other `rsshub://` route flows into the local engine as usual. Unrecognized schemes are counted and skipped, never silently dropped.
-- **Anonymous Cap, Lifted by Token**: Folo's backend embeds only the first few feeds of a shared list for anonymous access — the preview and the import report say so explicitly. Pasting an optional Folo access token (Settings → Subscriptions) lifts the cap and imports the list's full membership.
+<table>
+  <tr>
+    <td width="50%"><img src="assets/screenshot/SCR-20261125-swdc.png" alt="Built-in Parsers Settings" /></td>
+    <td width="50%"><img src="assets/screenshot/SCR-20261125-swja.png" alt="RSSHub Route Marketplace" /></td>
+  </tr>
+</table>
+
+### 5. Subscriptions, Folo Shared-List Import & Feed Fetch Hardening ([#9](https://github.com/AmintaCCCP/papr/pull/9), [#11](https://github.com/AmintaCCCP/papr/pull/11), [#16](https://github.com/AmintaCCCP/papr/pull/16))
+- **One-Click Folo Shared-List Import**: Paste any `app.folo.is/share/lists/…` link into the Add Feed dialog (or run `papr folo import <share-link-or-id>`) to preview and batch-import into a folder. Automatically rewrites `rsshub://twitter/user/*` routes to the native X parser, and accepts an optional **Folo API token** to lift the anonymous list cap.
+- **Per-Feed Controls & Edit Dialog**: Configure per-feed full-text and translation overrides directly in Subscriptions or via the per-feed edit dialog.
+- **Feed Fetch & Anti-Bot Compatibility**:
+  - Switched the HTTP client to `rustls` + native OS roots (fixing TLS handshake drops on hosts like Vercel while still trusting keychain/MITM proxy CAs).
+  - Plain browser User-Agent to bypass Tengine/Cloudflare UA blacklists, plus a constrained JS evaluator for cookie-reload WAF challenges.
+  - Local RSSHub engine honors system CAs (`NODE_USE_SYSTEM_CA=1` / `NODE_EXTRA_CA_CERTS`) and auto-configures `ALLOW_USER_SUPPLY_UNSAFE_DOMAIN` for `/rsshub/transform/*` routes.
+
+<p align="center">
+  <img src="assets/screenshot/SCR-20261125-svcy.png" alt="Subscriptions, RSSHub Browser Engine, and Folo Token Settings" width="760" />
+</p>
+
+### 6. Rich Export Integrations & Custom Webhooks ([#1](https://github.com/AmintaCCCP/papr/pull/1))
+- **7 Built-in Services**: One-click toolbar dispatch to **Cubox**, **Readwise Reader**, **Instapaper**, **Outline**, **Readeck**, **Zotero**, and **Obsidian** (writes Markdown notes with YAML frontmatter directly into your vault).
+- **Custom Webhooks & URL Schemes**: Full HTTP method support (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`) with custom headers/payloads and native URI schemes (e.g., `picseed://`, `ticktick://`, `obsidian://`), powered by 8 dynamic template variables (`[title]`, `[url]`, `[content_html]`, `[content_markdown]`, `[summary]`, `[description]`, `[author]`, `[published_at]`).
+- **On-Demand AI Summary Handoff & Native Rust Dispatch**: Optionally send the AI summary as the exported description (generating it on the fly if missing); all requests execute natively in Rust, bypassing webview CORS limits.
+
+<table>
+  <tr>
+    <td width="50%"><img src="assets/screenshot/SCR-20261125-svwk.png" alt="Built-in Export Integrations" /></td>
+    <td width="50%"><img src="assets/screenshot/SCR-20261125-svzu.png" alt="Custom Webhooks and URL Scheme Integrations" /></td>
+  </tr>
+</table>
+
+### 7. Hardened Keyless Translation & UI Polish ([#2](https://github.com/AmintaCCCP/papr/pull/2), [#4](https://github.com/AmintaCCCP/papr/pull/4), [#9](https://github.com/AmintaCCCP/papr/pull/9), [#14](https://github.com/AmintaCCCP/papr/pull/14))
+- **Reliable Keyless Engines**: Migrated Bing to Edge's keyless `translatetext` API and Google to Chromium's batch endpoint (`clients5.google.com`), supporting both article body and title translation.
+- **Scoped Viewport Translation**: Translates only the currently opened article instead of queuing every visible list item, avoiding 429 rate-limiting, alongside a settings engine race-condition fix.
+- **Dialog & IME Robustness**: IME-safe `Escape` handling (`isComposing` guard), nested-modal Escape scoping, and click-drag text selection inside dialogs no longer accidentally closes modals.
 
 ---
 
@@ -90,16 +114,16 @@ the CLI can never drift apart.
 ## The desktop app
 
 - **Feeds & folders** — subscribe, organize, and import/export OPML.
-- **Smart views** — All, Unread, Starred, and Read Later, with live counts.
-- **Tags & rules** — color-coded tags and rules that tag new articles automatically.
+- **Smart views** — All, Unread, Starred, Read Later, AI Briefing, and AI Assistant, with live counts.
+- **Tags & rules** — color-coded tags and programmable When/Then rules with open-time actions.
 - **Full-text** — fetch and clean the complete article when a feed ships only a summary.
-- **AI** — summaries, ask-the-article Q&A, and digests. Bring your own API key.
+- **AI** — inline summaries, global & per-article AI assistant, and scheduled/on-demand briefings. Bring your own API key.
 - **Audio** — a built-in player that follows you from article to article.
-- **FreshRSS sync** — keep read state in step with a FreshRSS server.
+- **Sync & Mobile** — FreshRSS / Miniflux sync plus a built-in LAN Mobile Web Reader (PWA).
 - **Local-first** — everything stays on your machine. No account, no cloud.
 - **Localized** — English, Japanese, and Simplified Chinese.
 
-### Install
+### Install (Upstream Releases)
 
 | Platform | How |
 | --- | --- |
@@ -107,8 +131,7 @@ the CLI can never drift apart.
 | **Windows** | Download the `.msi` installer |
 | **Linux** | Download the `.AppImage` or `.deb` |
 
-All packages live on the **[latest release](https://github.com/l0ng-ai/papr/releases/latest)**.
-The macOS builds are Developer ID signed and notarized.
+Upstream packages live on **[l0ng-ai/papr releases](https://github.com/l0ng-ai/papr/releases/latest)**. To use the enhancements in this fork, build from source or grab builds from this repository's releases.
 
 ---
 
@@ -120,7 +143,7 @@ work your feeds with no GUI:
 
 - **Read** — `feeds`, `list`, `read`, full-text `search`
 - **Triage** — `mark` read/star/later, `extract` full text, `refresh`
-- **Manage** — subscriptions, folders, tags, rules, highlights, OPML
+- **Manage** — subscriptions, folders, tags, rules, highlights, OPML, `folo import`
 - **Sync** — FreshRSS / Miniflux
 
 Run bare `papr` and it prints your unread dashboard *plus the next useful
