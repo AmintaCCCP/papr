@@ -13,7 +13,7 @@
 use papr_core::db;
 use papr_core::ingestion::fetch;
 use papr_core::ingestion::refresh::{refresh_core, RefreshScope};
-use papr_core::ingestion::rsshub::engine::EngineManager;
+use papr_core::ingestion::rsshub::engine::{EngineManager, EngineProxyMode};
 use papr_core::models::SourceType;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -22,13 +22,20 @@ async fn real_engine_refresh_ingests_articles() {
     let engine_root = tempfile::tempdir().expect("engine root");
     let manager = EngineManager::new(engine_root.path().to_path_buf());
 
-    let dl_client = fetch::build_client(1800, "system");
+    let db_dir = tempfile::tempdir().expect("db dir");
+    let conn = db::open(&db_dir.path().join("papr.db")).expect("open database");
+    if let Ok(proxy_val) = std::env::var("PAPR_E2E_PROXY") {
+        db::set_setting(&conn, "net_proxy", &proxy_val).expect("set net_proxy");
+    }
+    let dl_client = fetch::build_download_client(&conn);
+    let proxy_setting = db::get_setting(&conn, "net_proxy").ok().flatten();
+    let proxy_mode = EngineProxyMode::from_setting(proxy_setting.as_deref());
     let use_cn_mirror = std::env::var("PAPR_E2E_CN_MIRROR")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
     let info = manager
-        .install_or_update(&dl_client, use_cn_mirror)
+        .install_or_update(&dl_client, use_cn_mirror, &proxy_mode)
         .await
         .expect("engine install_or_update");
     assert_eq!(info.version, "2");
@@ -36,8 +43,6 @@ async fn real_engine_refresh_ingests_articles() {
     assert!(!info.bun_version.is_empty());
     assert!(manager.installed());
 
-    let db_dir = tempfile::tempdir().expect("db dir");
-    let conn = db::open(&db_dir.path().join("papr.db")).expect("open database");
     let db = tokio::sync::Mutex::new(conn);
 
     // Install the route template that gates the feed, then subscribe the

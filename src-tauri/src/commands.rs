@@ -757,17 +757,25 @@ pub async fn engine_check_update(
 }
 
 /// Install or update the local Bun + `rsshub@latest` engine. Uses a dedicated
-/// download client with a generous timeout and the user's proxy settings.
+/// download client with a generous timeout and passes the user's proxy setting
+/// to both the Rust downloader and the `bun add` subprocess.
 #[tauri::command]
 pub async fn engine_install_or_update(
     state: State<'_, AppState>,
     use_cn_mirror: bool,
 ) -> AppResult<rsshub::engine::EngineInfo> {
-    let client = {
+    let (client, proxy) = {
         let conn = state.db.lock().await;
-        fetch::build_download_client(&conn)
+        let proxy_setting = db::get_setting(&conn, "net_proxy").ok().flatten();
+        (
+            fetch::build_download_client(&conn),
+            rsshub::engine::EngineProxyMode::from_setting(proxy_setting.as_deref()),
+        )
     };
-    state.engine.install_or_update(&client, use_cn_mirror).await
+    state
+        .engine
+        .install_or_update(&client, use_cn_mirror, &proxy)
+        .await
 }
 
 /// Install the optional headless Chromium runtime (`patchright install chromium`)
@@ -776,7 +784,12 @@ pub async fn engine_install_or_update(
 pub async fn engine_install_browser(
     state: State<'_, AppState>,
 ) -> AppResult<rsshub::engine::EngineInfo> {
-    state.engine.install_browser().await
+    let proxy = {
+        let conn = state.db.lock().await;
+        let proxy_setting = db::get_setting(&conn, "net_proxy").ok().flatten();
+        rsshub::engine::EngineProxyMode::from_setting(proxy_setting.as_deref())
+    };
+    state.engine.install_browser(&proxy).await
 }
 
 /// Remove the optional headless Chromium runtime from `<engine_root>/browser`.

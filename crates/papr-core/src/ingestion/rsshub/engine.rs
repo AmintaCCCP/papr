@@ -28,6 +28,8 @@
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,7 +52,9 @@ const ENGINE_FORMAT_VERSION: &str = "2";
 
 const NPM_REGISTRY_DEFAULT: &str = "https://registry.npmjs.org";
 const NPM_REGISTRY_CN: &str = "https://registry.npmmirror.com";
+const BUN_GITHUB_LATEST_URL: &str = "https://github.com/oven-sh/bun/releases/latest";
 const BUN_GITHUB_RELEASE_BASE: &str = "https://github.com/oven-sh/bun/releases/latest/download";
+const BUN_GITHUB_TAG_DOWNLOAD_BASE: &str = "https://github.com/oven-sh/bun/releases/download";
 const BUN_CN_MIRROR_PREFIX: &str = "https://gh-proxy.org/";
 
 const APP_PACKAGE_JSON: &str = "{\"name\":\"papr-rsshub-engine\",\"private\":true}\n";
@@ -86,6 +90,27 @@ const MAX_BUN_ZIP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BUN_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 /// Hard cap on npm registry JSON metadata responses.
 const MAX_REGISTRY_JSON_BYTES: usize = 4 * 1024 * 1024;
+/// Hard cap on Bun `SHASUMS256.txt` responses.
+const MAX_SHASUMS_BYTES: usize = 256 * 1024;
+
+/// How Bun install/update subprocesses should route outbound network requests,
+/// matching Papr's persisted `net_proxy` setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineProxyMode {
+    System,
+    None,
+    Explicit(String),
+}
+
+impl EngineProxyMode {
+    pub fn from_setting(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).unwrap_or("") {
+            "" | "system" => Self::System,
+            "none" => Self::None,
+            custom => Self::Explicit(custom.to_string()),
+        }
+    }
+}
 
 /// Environment variables the engine process may inherit. Everything else is
 /// stripped: the child runs arbitrary scraping code with credentials the user
@@ -127,9 +152,11 @@ const ENV_ALLOWLIST: &[&str] = &[
     // Proxy egress.
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "ALL_PROXY",
     "NO_PROXY",
     "http_proxy",
     "https_proxy",
+    "all_proxy",
     "no_proxy",
     "PROXY_URI",
 ];
@@ -398,7 +425,7 @@ impl EngineManager {
         user_env: &BTreeMap<String, String>,
         budget: Duration,
     ) -> AppResult<u16> {
-        let _info = self
+        let info = self
             .info()
             .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
         let bun_bin = Self::bun_bin(&self.root);
@@ -415,7 +442,7 @@ impl EngineManager {
         let port = free_port()
             .map_err(|e| AppError::other(format!("rsshub engine: no free port: {e}")))?;
         // Enforce the execve size budget before touching the log files.
-        let child_env = build_child_env(user_env, port, &self.root)?;
+        let child_env = build_child_env(user_env, port, &self.root, info.is_browser_flavor())?;
         let log_path = self.root.join("engine.log");
 
         // The log file is opened twice (stdout + stderr share it in append
@@ -544,7 +571,10 @@ impl EngineManager {
             ));
         }
         let current_version = self.info().map(|i| i.rsshub_version);
-        let update_available = current_version.as_deref() != Some(latest_version.as_str());
+        let update_available = match current_version.as_deref() {
+            None => true,
+            Some(cur) => compare_npm_versions(&latest_version, cur) == Ordering::Greater,
+        };
         Ok(EngineUpdateInfo {
             current_version,
             latest_version,
@@ -553,73 +583,162 @@ impl EngineManager {
     }
 
     /// Install or update the Bun + `rsshub@latest` engine under `<engine_root>`.
+    ///
+    /// Installs into an isolated staging directory first and only publishes
+    /// the new `app/`, `browser/`, and `engine.json` once validated; legacy v1
+    /// directories (including `1/browser`) and any previous working v2 layout
+    /// stay untouched if any step fails.
     pub async fn install_or_update(
         &self,
         client: &reqwest::Client,
         use_cn_mirror: bool,
+        proxy: &EngineProxyMode,
     ) -> AppResult<EngineInfo> {
         let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
 
         std::fs::create_dir_all(&self.root)
             .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
-        cleanup_legacy_layout(&self.root)?;
+
+        let prev_info = self.info();
+        let had_v2_browser = prev_info.as_ref().is_some_and(|i| i.is_browser_flavor());
 
         let bun_version = ensure_bun(&self.root, client, use_cn_mirror).await?;
         let bun_bin = Self::bun_bin(&self.root);
-        let app_dir = Self::app_dir(&self.root);
-        std::fs::create_dir_all(&app_dir)
-            .map_err(|e| AppError::other(format!("rsshub engine: create app dir: {e}")))?;
 
-        std::fs::write(app_dir.join("package.json"), APP_PACKAGE_JSON)
-            .map_err(|e| AppError::other(format!("rsshub engine: write package.json: {e}")))?;
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        );
+        let staging_app = self.root.join(format!(".app-staging-{stamp}"));
+        let staging_browser = self.root.join(format!(".browser-staging-{stamp}"));
+        let _ = std::fs::remove_dir_all(&staging_app);
+        let _ = std::fs::remove_dir_all(&staging_browser);
 
-        let registry_arg = format!(
-            "--registry={}",
-            if use_cn_mirror {
-                NPM_REGISTRY_CN
-            } else {
-                NPM_REGISTRY_DEFAULT
+        let stage_result = async {
+            std::fs::create_dir_all(&staging_app)
+                .map_err(|e| AppError::other(format!("rsshub engine: create staging app: {e}")))?;
+            std::fs::write(staging_app.join("package.json"), APP_PACKAGE_JSON)
+                .map_err(|e| AppError::other(format!("rsshub engine: write package.json: {e}")))?;
+
+            let registry_arg = format!(
+                "--registry={}",
+                if use_cn_mirror {
+                    NPM_REGISTRY_CN
+                } else {
+                    NPM_REGISTRY_DEFAULT
+                }
+            );
+
+            let mut cmd = bun_command(&bun_bin, Some(&staging_app), proxy);
+            cmd.args(["add", "rsshub@latest", "--exact", &registry_arg])
+                .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+                .env("PUPPETEER_SKIP_DOWNLOAD", "1")
+                .env("PUPPETEER_SKIP_CHROMIUM_DOWNLOAD", "1");
+
+            log::info!(
+                "rsshub engine: installing rsshub@latest in staging via {} ({registry_arg})",
+                bun_bin.display()
+            );
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| AppError::other(format!("rsshub engine: run bun add: {e}")))?;
+            if !output.status.success() {
+                return Err(format_cmd_failure("bun add rsshub@latest", &output));
             }
-        );
 
-        let mut cmd = bun_command(&bun_bin, Some(&app_dir));
-        cmd.args(["add", "rsshub@latest", "--exact", &registry_arg])
-            .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
-            .env("PUPPETEER_SKIP_DOWNLOAD", "1")
-            .env("PUPPETEER_SKIP_CHROMIUM_DOWNLOAD", "1");
+            let staged_server = staging_app.join("server.mjs");
+            std::fs::write(&staged_server, APP_SERVER_MJS)
+                .map_err(|e| AppError::other(format!("rsshub engine: write server.mjs: {e}")))?;
 
-        log::info!(
-            "rsshub engine: installing rsshub@latest via {} ({registry_arg})",
-            bun_bin.display()
-        );
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| AppError::other(format!("rsshub engine: run bun add: {e}")))?;
-        if !output.status.success() {
-            return Err(format_cmd_failure("bun add rsshub@latest", &output));
+            let rsshub_version = read_installed_rsshub_version_in(&staging_app)?;
+            let staged_entry = staging_app
+                .join("node_modules")
+                .join("rsshub")
+                .join("dist-lib")
+                .join("magpie-server.mjs");
+            if !is_regular_file(&staged_server) || !is_regular_file(&staged_entry) {
+                return Err(AppError::other(
+                    "rsshub engine: staged install is missing server entrypoint",
+                ));
+            }
+
+            let browser_dir = Self::browser_dir(&self.root);
+            let v1_browser_dir = self.root.join("1").join("browser");
+            let mut browser_plan = BrowserPlan::None;
+            let flavor = if browser_dir.exists() {
+                if verify_browser_usable(&bun_bin, &staging_app, &browser_dir).await {
+                    "browser".to_string()
+                } else if had_v2_browser {
+                    log::info!(
+                        "rsshub engine: existing Chromium needs refresh for updated patchright"
+                    );
+                    if std::fs::create_dir_all(&staging_browser).is_ok()
+                        && run_patchright_install_chromium(
+                            &bun_bin,
+                            &staging_app,
+                            &staging_browser,
+                            proxy,
+                        )
+                        .await
+                        .is_ok()
+                        && verify_browser_usable(&bun_bin, &staging_app, &staging_browser).await
+                    {
+                        browser_plan = BrowserPlan::SwapStaging(staging_browser.clone());
+                        "browser".to_string()
+                    } else {
+                        let _ = std::fs::remove_dir_all(&staging_browser);
+                        log::warn!(
+                            "rsshub engine: existing Chromium is incompatible with updated patchright and automatic refresh failed; please reinstall Chromium in Settings"
+                        );
+                        browser_plan = BrowserPlan::RemoveExistingAfterPublish;
+                        "standard".to_string()
+                    }
+                } else {
+                    browser_plan = BrowserPlan::RemoveExistingAfterPublish;
+                    "standard".to_string()
+                }
+            } else if v1_browser_dir.exists() {
+                if verify_browser_usable(&bun_bin, &staging_app, &v1_browser_dir).await {
+                    browser_plan = BrowserPlan::MigrateV1(v1_browser_dir);
+                    "browser".to_string()
+                } else {
+                    log::warn!(
+                        "rsshub engine: legacy v1 Chromium is incompatible with updated patchright; please reinstall Chromium in Settings"
+                    );
+                    "standard".to_string()
+                }
+            } else {
+                "standard".to_string()
+            };
+
+            let info = EngineInfo {
+                version: ENGINE_FORMAT_VERSION.to_string(),
+                flavor,
+                rsshub_version,
+                bun_version,
+                installed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            publish_staged_install(&self.root, &staging_app, browser_plan, &info, &stamp)?;
+            Ok(info)
+        }
+        .await;
+
+        if stage_result.is_err() {
+            let _ = std::fs::remove_dir_all(&staging_app);
+            let _ = std::fs::remove_dir_all(&staging_browser);
+        } else if let Err(e) = cleanup_legacy_layout(&self.root) {
+            log::warn!("rsshub engine: post-install legacy cleanup warning: {e}");
         }
 
-        std::fs::write(Self::server_mjs(&self.root), APP_SERVER_MJS)
-            .map_err(|e| AppError::other(format!("rsshub engine: write server.mjs: {e}")))?;
-
-        let rsshub_version = read_installed_rsshub_version(&self.root)?;
-        let flavor = detect_flavor(&self.root);
-        let info = EngineInfo {
-            version: ENGINE_FORMAT_VERSION.to_string(),
-            flavor,
-            rsshub_version,
-            bun_version,
-            installed_at: chrono::Utc::now().to_rfc3339(),
-        };
-        write_manifest_atomic(&self.root, &info)?;
-        Ok(info)
+        stage_result
     }
 
     /// Install the optional headless Chromium runtime (`patchright install chromium`)
     /// into `<engine_root>/browser` and mark the engine flavor as `"browser"`.
-    pub async fn install_browser(&self) -> AppResult<EngineInfo> {
+    pub async fn install_browser(&self, proxy: &EngineProxyMode) -> AppResult<EngineInfo> {
         let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
 
@@ -632,39 +751,33 @@ impl EngineManager {
             return Err(AppError::code(CODE_ENGINE_MISSING));
         }
 
-        let browser_dir = Self::browser_dir(&self.root);
-        let had_browser_dir = browser_dir.exists();
-        std::fs::create_dir_all(&browser_dir)
-            .map_err(|e| AppError::other(format!("rsshub engine: create browser dir: {e}")))?;
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        );
+        let staging_browser = self.root.join(format!(".browser-staging-{stamp}"));
+        let _ = std::fs::remove_dir_all(&staging_browser);
+        std::fs::create_dir_all(&staging_browser)
+            .map_err(|e| AppError::other(format!("rsshub engine: create browser staging: {e}")))?;
 
-        let mut cmd = bun_command(&bun_bin, Some(&app_dir));
-        cmd.args(["x", "patchright", "install", "chromium"])
-            .env("PLAYWRIGHT_BROWSERS_PATH", &browser_dir);
-
-        log::info!("rsshub engine: installing patchright chromium");
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| AppError::other(format!("rsshub engine: run patchright install: {e}")))?;
-        if !output.status.success() {
-            if !had_browser_dir && !dir_is_non_empty(&browser_dir) {
-                let _ = std::fs::remove_dir_all(&browser_dir);
+        let result = async {
+            run_patchright_install_chromium(&bun_bin, &app_dir, &staging_browser, proxy).await?;
+            if !verify_browser_usable(&bun_bin, &app_dir, &staging_browser).await {
+                return Err(AppError::other(
+                    "rsshub engine: patchright install chromium did not produce a usable Chromium binary",
+                ));
             }
-            return Err(format_cmd_failure("patchright install chromium", &output));
+            info.flavor = "browser".to_string();
+            swap_browser_dir_and_manifest(&self.root, &staging_browser, &info, &stamp)?;
+            Ok(info)
         }
+        .await;
 
-        if !dir_is_non_empty(&browser_dir) {
-            if !had_browser_dir {
-                let _ = std::fs::remove_dir_all(&browser_dir);
-            }
-            return Err(AppError::other(
-                "rsshub engine: patchright install chromium produced an empty browser directory",
-            ));
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&staging_browser);
         }
-
-        info.flavor = "browser".to_string();
-        write_manifest_atomic(&self.root, &info)?;
-        Ok(info)
+        result
     }
 
     /// Remove `<engine_root>/browser` and reset the engine flavor to `"standard"`.
@@ -769,12 +882,172 @@ fn dir_is_non_empty(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
-fn detect_flavor(root: &Path) -> String {
-    if dir_is_non_empty(&EngineManager::browser_dir(root)) {
-        "browser".to_string()
-    } else {
-        "standard".to_string()
+enum BrowserPlan {
+    None,
+    SwapStaging(PathBuf),
+    MigrateV1(PathBuf),
+    RemoveExistingAfterPublish,
+}
+
+fn publish_staged_install(
+    root: &Path,
+    staging_app: &Path,
+    browser_plan: BrowserPlan,
+    info: &EngineInfo,
+    stamp: &str,
+) -> AppResult<()> {
+    let app_dir = EngineManager::app_dir(root);
+    let browser_dir = EngineManager::browser_dir(root);
+    let backup_app = root.join(format!(".app-backup-{stamp}"));
+    let backup_browser = root.join(format!(".browser-backup-{stamp}"));
+    let _ = std::fs::remove_dir_all(&backup_app);
+    let _ = std::fs::remove_dir_all(&backup_browser);
+
+    let had_app = app_dir.exists();
+    if had_app {
+        std::fs::rename(&app_dir, &backup_app)
+            .map_err(|e| AppError::other(format!("rsshub engine: backup existing app: {e}")))?;
     }
+
+    if let Err(e) = std::fs::rename(staging_app, &app_dir) {
+        if had_app {
+            let _ = std::fs::rename(&backup_app, &app_dir);
+        }
+        return Err(AppError::other(format!(
+            "rsshub engine: publish staged app: {e}"
+        )));
+    }
+
+    let mut migrated_from: Option<PathBuf> = None;
+    let mut swapped_browser = false;
+    let mut remove_browser_after = false;
+
+    let browser_step: AppResult<()> = match browser_plan {
+        BrowserPlan::None => Ok(()),
+        BrowserPlan::RemoveExistingAfterPublish => {
+            remove_browser_after = true;
+            Ok(())
+        }
+        BrowserPlan::SwapStaging(staging_browser) => {
+            if browser_dir.exists() {
+                std::fs::rename(&browser_dir, &backup_browser).map_err(|e| {
+                    AppError::other(format!("rsshub engine: backup existing browser: {e}"))
+                })?;
+                swapped_browser = true;
+            }
+            std::fs::rename(&staging_browser, &browser_dir).map_err(|e| {
+                AppError::other(format!("rsshub engine: publish staged browser: {e}"))
+            })
+        }
+        BrowserPlan::MigrateV1(v1_browser) => {
+            std::fs::rename(&v1_browser, &browser_dir).map_err(|e| {
+                AppError::other(format!("rsshub engine: migrate v1 browser: {e}"))
+            })?;
+            migrated_from = Some(v1_browser);
+            Ok(())
+        }
+    };
+
+    if let Err(e) = browser_step.and_then(|()| write_manifest_atomic(root, info)) {
+        if let Some(v1_origin) = migrated_from {
+            if browser_dir.exists() {
+                let _ = std::fs::rename(&browser_dir, v1_origin);
+            }
+        } else if swapped_browser {
+            let _ = std::fs::remove_dir_all(&browser_dir);
+            let _ = std::fs::rename(&backup_browser, &browser_dir);
+        }
+        let _ = std::fs::remove_dir_all(&app_dir);
+        if had_app {
+            let _ = std::fs::rename(&backup_app, &app_dir);
+        }
+        return Err(e);
+    }
+
+    if had_app {
+        let _ = std::fs::remove_dir_all(&backup_app);
+    }
+    if swapped_browser {
+        let _ = std::fs::remove_dir_all(&backup_browser);
+    }
+    if remove_browser_after && browser_dir.exists() {
+        let _ = std::fs::remove_dir_all(&browser_dir);
+    }
+    Ok(())
+}
+
+fn swap_browser_dir_and_manifest(
+    root: &Path,
+    staging_browser: &Path,
+    info: &EngineInfo,
+    stamp: &str,
+) -> AppResult<()> {
+    let browser_dir = EngineManager::browser_dir(root);
+    let backup_browser = root.join(format!(".browser-backup-{stamp}"));
+    let _ = std::fs::remove_dir_all(&backup_browser);
+
+    let had_browser = browser_dir.exists();
+    if had_browser {
+        std::fs::rename(&browser_dir, &backup_browser).map_err(|e| {
+            AppError::other(format!("rsshub engine: backup existing browser: {e}"))
+        })?;
+    }
+
+    if let Err(e) = std::fs::rename(staging_browser, &browser_dir)
+        .map_err(|e| AppError::other(format!("rsshub engine: publish staged browser: {e}")))
+        .and_then(|()| write_manifest_atomic(root, info))
+    {
+        let _ = std::fs::remove_dir_all(&browser_dir);
+        if had_browser {
+            let _ = std::fs::rename(&backup_browser, &browser_dir);
+        }
+        return Err(e);
+    }
+
+    if had_browser {
+        let _ = std::fs::remove_dir_all(&backup_browser);
+    }
+    Ok(())
+}
+
+async fn run_patchright_install_chromium(
+    bun_bin: &Path,
+    app_dir: &Path,
+    browser_dir: &Path,
+    proxy: &EngineProxyMode,
+) -> AppResult<()> {
+    // `--bun` forces Bun to execute patchright's `#!/usr/bin/env node` CLI
+    // directly without requiring a host `node` installation.
+    let mut cmd = bun_command(bun_bin, Some(app_dir), proxy);
+    cmd.args(["x", "--bun", "patchright", "install", "chromium"])
+        .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir);
+
+    log::info!("rsshub engine: installing patchright chromium");
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| AppError::other(format!("rsshub engine: run patchright install: {e}")))?;
+    if !output.status.success() {
+        return Err(format_cmd_failure("patchright install chromium", &output));
+    }
+    Ok(())
+}
+
+/// Probe whether `browser_dir` contains a Chromium executable that `patchright`
+/// inside `app_dir` can actually resolve and find on disk.
+async fn verify_browser_usable(bun_bin: &Path, app_dir: &Path, browser_dir: &Path) -> bool {
+    if !dir_is_non_empty(browser_dir) || !is_regular_file(bun_bin) {
+        return false;
+    }
+    let mut cmd = bun_command(bun_bin, Some(app_dir), &EngineProxyMode::None);
+    cmd.env("PLAYWRIGHT_BROWSERS_PATH", browser_dir).args([
+        "-e",
+        "import { chromium } from 'patchright'; import { existsSync } from 'node:fs'; const p = chromium.executablePath(); if (!p || !existsSync(p)) process.exit(1);",
+    ]);
+    cmd.output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn allowlisted_host_env() -> BTreeMap<String, String> {
@@ -788,7 +1061,11 @@ fn allowlisted_host_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn bun_command(bun_bin: &Path, cwd: Option<&Path>) -> tokio::process::Command {
+fn bun_command(
+    bun_bin: &Path,
+    cwd: Option<&Path>,
+    proxy: &EngineProxyMode,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bun_bin);
     cmd.env_clear().kill_on_drop(true);
     if let Some(dir) = cwd {
@@ -796,6 +1073,35 @@ fn bun_command(bun_bin: &Path, cwd: Option<&Path>) -> tokio::process::Command {
     }
     for (k, v) in allowlisted_host_env() {
         cmd.env(k, v);
+    }
+    match proxy {
+        EngineProxyMode::System => {}
+        EngineProxyMode::None => {
+            for k in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "PROXY_URI",
+            ] {
+                cmd.env_remove(k);
+            }
+        }
+        EngineProxyMode::Explicit(url) => {
+            cmd.env_remove("PROXY_URI");
+            for k in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                cmd.env(k, url);
+            }
+        }
     }
     cmd
 }
@@ -871,8 +1177,11 @@ fn write_manifest_atomic(root: &Path, info: &EngineInfo) -> AppResult<()> {
     Ok(())
 }
 
-fn read_installed_rsshub_version(root: &Path) -> AppResult<String> {
-    let pkg_path = EngineManager::rsshub_dir(root).join("package.json");
+fn read_installed_rsshub_version_in(app_dir: &Path) -> AppResult<String> {
+    let pkg_path = app_dir
+        .join("node_modules")
+        .join("rsshub")
+        .join("package.json");
     let raw = std::fs::read_to_string(&pkg_path).map_err(|e| {
         AppError::other(format!(
             "rsshub engine: read rsshub package.json at {}: {e}",
@@ -894,6 +1203,75 @@ fn read_installed_rsshub_version(root: &Path) -> AppResult<String> {
     Ok(ver)
 }
 
+/// Compare two npm/SemVer strings (`a` vs `b`), supporting RSSHub's
+/// `YYYY.MM.DD-build.g<sha>` prerelease tags as well as standard SemVer.
+fn compare_npm_versions(a: &str, b: &str) -> Ordering {
+    fn strip_prefix_and_build(s: &str) -> &str {
+        let s = s.trim();
+        let s = s.strip_prefix('v').unwrap_or(s);
+        s.split('+').next().unwrap_or(s)
+    }
+    fn parse_parts(s: &str) -> (&str, Option<&str>) {
+        match s.split_once('-') {
+            Some((core, pre)) if !pre.is_empty() => (core, Some(pre)),
+            _ => (s, None),
+        }
+    }
+    fn compare_core(a: &str, b: &str) -> Ordering {
+        let a_parts: Vec<&str> = a.split('.').collect();
+        let b_parts: Vec<&str> = b.split('.').collect();
+        let max_len = a_parts.len().max(b_parts.len());
+        let a_nums: Option<Vec<u64>> = a_parts.iter().map(|p| p.parse::<u64>().ok()).collect();
+        let b_nums: Option<Vec<u64>> = b_parts.iter().map(|p| p.parse::<u64>().ok()).collect();
+        if let (Some(an), Some(bn)) = (a_nums, b_nums) {
+            for i in 0..max_len {
+                let x = an.get(i).copied().unwrap_or(0);
+                let y = bn.get(i).copied().unwrap_or(0);
+                match x.cmp(&y) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
+            }
+            return Ordering::Equal;
+        }
+        a_parts.cmp(&b_parts)
+    }
+    fn compare_prerelease(a: &str, b: &str) -> Ordering {
+        let a_ids: Vec<&str> = a.split('.').collect();
+        let b_ids: Vec<&str> = b.split('.').collect();
+        for (x, y) in a_ids.iter().zip(b_ids.iter()) {
+            let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => x.cmp(y),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        a_ids.len().cmp(&b_ids.len())
+    }
+
+    let (ca, pa) = parse_parts(strip_prefix_and_build(a));
+    let (cb, pb) = parse_parts(strip_prefix_and_build(b));
+    match compare_core(ca, cb) {
+        Ordering::Equal => match (pa, pb) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(x), Some(y)) => compare_prerelease(x, y),
+        },
+        ord => ord,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BunDownloadSource {
+    url: String,
+    expected_sha256: Option<String>,
+}
+
 fn bun_release_asset(os: &str, arch: &str) -> AppResult<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Ok("bun-darwin-aarch64.zip"),
@@ -907,17 +1285,119 @@ fn bun_release_asset(os: &str, arch: &str) -> AppResult<&'static str> {
     }
 }
 
-fn bun_download_urls(asset: &str, use_cn_mirror: bool) -> Vec<String> {
-    let direct = format!("{BUN_GITHUB_RELEASE_BASE}/{asset}");
-    if use_cn_mirror {
-        vec![format!("{BUN_CN_MIRROR_PREFIX}{direct}"), direct]
+fn extract_bun_tag_from_url(url: &reqwest::Url) -> Option<String> {
+    let mut segs = url.path_segments()?;
+    while let Some(seg) = segs.next() {
+        if seg == "releases" && segs.next() == Some("tag") {
+            let tag = segs.next()?.trim();
+            if !tag.is_empty() {
+                return Some(tag.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_shasums256(content: &str, asset: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name_raw) = parts.next() else {
+            continue;
+        };
+        let name = name_raw.trim_start_matches('*');
+        if name == asset && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn build_bun_download_sources(
+    asset: &str,
+    use_cn_mirror: bool,
+    official_release: Option<(&str, &str)>,
+) -> Vec<BunDownloadSource> {
+    if let Some((tag, sha256)) = official_release {
+        let direct = format!("{BUN_GITHUB_TAG_DOWNLOAD_BASE}/{tag}/{asset}");
+        if use_cn_mirror {
+            vec![
+                BunDownloadSource {
+                    url: format!("{BUN_CN_MIRROR_PREFIX}{direct}"),
+                    expected_sha256: Some(sha256.to_string()),
+                },
+                BunDownloadSource {
+                    url: direct,
+                    expected_sha256: Some(sha256.to_string()),
+                },
+            ]
+        } else {
+            vec![BunDownloadSource {
+                url: direct,
+                expected_sha256: Some(sha256.to_string()),
+            }]
+        }
     } else {
-        vec![direct]
+        // Without an official SHA-256 digest from GitHub, refuse third-party
+        // mirrors so an unverified mirror archive is never extracted/executed.
+        vec![BunDownloadSource {
+            url: format!("{BUN_GITHUB_RELEASE_BASE}/{asset}"),
+            expected_sha256: None,
+        }]
     }
 }
 
+async fn fetch_official_bun_release_digest(
+    client: &reqwest::Client,
+    asset: &str,
+) -> Option<(String, String)> {
+    let head_resp = client.head(BUN_GITHUB_LATEST_URL).send().await;
+    let tag = match head_resp {
+        Ok(r) if r.status().is_success() => extract_bun_tag_from_url(r.url()),
+        _ => None,
+    };
+    let tag = match tag {
+        Some(t) => t,
+        None => {
+            let get_resp = client
+                .get(BUN_GITHUB_LATEST_URL)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            extract_bun_tag_from_url(get_resp.url())?
+        }
+    };
+
+    let shasums_url = format!("{BUN_GITHUB_TAG_DOWNLOAD_BASE}/{tag}/SHASUMS256.txt");
+    let mut resp = client
+        .get(&shasums_url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if buf.len() + chunk.len() > MAX_SHASUMS_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(buf).ok()?;
+    let sha = parse_shasums256(&text, asset)?;
+    Some((tag, sha))
+}
+
 async fn read_bun_version(bun_bin: &Path) -> AppResult<String> {
-    let output = bun_command(bun_bin, None)
+    let output = bun_command(bun_bin, None, &EngineProxyMode::None)
         .arg("--version")
         .output()
         .await
@@ -939,15 +1419,32 @@ async fn ensure_bun(
     client: &reqwest::Client,
     use_cn_mirror: bool,
 ) -> AppResult<String> {
+    let bun_bin = EngineManager::bun_bin(root);
+    if is_executable_regular_file(&bun_bin) {
+        if let Ok(ver) = read_bun_version(&bun_bin).await {
+            return Ok(ver);
+        }
+    }
+
     let asset = bun_release_asset(std::env::consts::OS, std::env::consts::ARCH)?;
-    let urls = bun_download_urls(asset, use_cn_mirror);
-    ensure_bun_with_urls(root, client, &urls).await
+    let official = fetch_official_bun_release_digest(client, asset).await;
+    if use_cn_mirror && official.is_none() {
+        log::warn!(
+            "rsshub engine: could not fetch official Bun SHASUMS256.txt; skipping mirror and downloading directly from GitHub"
+        );
+    }
+    let sources = build_bun_download_sources(
+        asset,
+        use_cn_mirror,
+        official.as_ref().map(|(t, s)| (t.as_str(), s.as_str())),
+    );
+    ensure_bun_with_sources(root, client, &sources).await
 }
 
-async fn ensure_bun_with_urls(
+async fn ensure_bun_with_sources(
     root: &Path,
     client: &reqwest::Client,
-    urls: &[String],
+    sources: &[BunDownloadSource],
 ) -> AppResult<String> {
     let bun_bin = EngineManager::bun_bin(root);
     if is_executable_regular_file(&bun_bin) {
@@ -962,14 +1459,20 @@ async fn ensure_bun_with_urls(
     let expected_name = EngineManager::bun_filename();
     let mut last_err: Option<AppError> = None;
 
-    for (idx, url) in urls.iter().enumerate() {
+    for (idx, source) in sources.iter().enumerate() {
         let tmp_zip = root.join(format!(
             ".bun-download-{}-{}-{idx}.zip",
             std::process::id(),
             chrono::Utc::now().timestamp_millis()
         ));
         let attempt = async {
-            download_bun_zip(client, url, &tmp_zip).await?;
+            download_bun_zip(
+                client,
+                &source.url,
+                &tmp_zip,
+                source.expected_sha256.as_deref(),
+            )
+            .await?;
             let zip_for_extract = tmp_zip.clone();
             let bin_dest = bun_bin.clone();
             tokio::task::spawn_blocking(move || {
@@ -990,7 +1493,10 @@ async fn ensure_bun_with_urls(
         match attempt {
             Ok(ver) => return Ok(ver),
             Err(err) => {
-                log::warn!("rsshub engine: bun bootstrap from {url} failed: {err}");
+                log::warn!(
+                    "rsshub engine: bun bootstrap from {} failed: {err}",
+                    source.url
+                );
                 last_err = Some(err);
             }
         }
@@ -1000,7 +1506,12 @@ async fn ensure_bun_with_urls(
         .unwrap_or_else(|| AppError::other("rsshub engine: failed to bootstrap Bun runtime")))
 }
 
-async fn download_bun_zip(client: &reqwest::Client, url: &str, dest: &Path) -> AppResult<()> {
+async fn download_bun_zip(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+) -> AppResult<()> {
     let mut resp = client.get(url).send().await?.error_for_status()?;
     if resp
         .content_length()
@@ -1012,6 +1523,7 @@ async fn download_bun_zip(client: &reqwest::Client, url: &str, dest: &Path) -> A
     }
     let mut file = std::fs::File::create(dest)
         .map_err(|e| AppError::other(format!("rsshub engine: create temp zip: {e}")))?;
+    let mut hasher = Sha256::new();
     let mut downloaded: u64 = 0;
     while let Some(chunk) = resp.chunk().await? {
         downloaded = downloaded.saturating_add(chunk.len() as u64);
@@ -1020,11 +1532,21 @@ async fn download_bun_zip(client: &reqwest::Client, url: &str, dest: &Path) -> A
                 "rsshub engine: bun release archive exceeds size cap",
             ));
         }
+        hasher.update(&chunk);
         file.write_all(&chunk)
             .map_err(|e| AppError::other(format!("rsshub engine: write temp zip: {e}")))?;
     }
     file.flush()
         .map_err(|e| AppError::other(format!("rsshub engine: flush temp zip: {e}")))?;
+    if let Some(expected) = expected_sha256 {
+        let actual = format!("{:x}", hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            let _ = std::fs::remove_file(dest);
+            return Err(AppError::other(format!(
+                "rsshub engine: bun zip checksum mismatch (expected {expected}, got {actual})"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1136,6 +1658,7 @@ fn build_child_env(
     user_env: &BTreeMap<String, String>,
     port: u16,
     engine_root: &Path,
+    is_browser_flavor: bool,
 ) -> AppResult<BTreeMap<String, String>> {
     let mut env = allowlisted_host_env();
     env.extend(user_env.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -1145,7 +1668,7 @@ fn build_child_env(
     env.insert("RSSHUB_MAGPIE_HOST".into(), "1".into());
 
     let browser_dir = EngineManager::browser_dir(engine_root);
-    if dir_is_non_empty(&browser_dir) {
+    if is_browser_flavor && dir_is_non_empty(&browser_dir) {
         env.insert(
             "PLAYWRIGHT_BROWSERS_PATH".into(),
             browser_dir.to_string_lossy().into_owned(),
@@ -1386,39 +1909,64 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ensure_bun_reuses_valid_binary_and_falls_back_from_broken_mirror() {
+    async fn ensure_bun_reuses_valid_binary_and_rejects_tampered_mirror() {
         let root = temp_root("ensure-bun");
         let install_root = root.join("install");
         std::fs::create_dir_all(install_root.join("bin")).unwrap();
 
         let fake_bun = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"1.2.3\"; exit 0; fi\n";
-        let zip_bytes = make_zip_bytes(&[(
+        let good_zip_bytes = make_zip_bytes(&[(
             &format!("bun-linux-x64/{}", EngineManager::bun_filename()),
             fake_bun.as_bytes(),
         )]);
+        let good_sha = format!("{:x}", Sha256::digest(&good_zip_bytes));
+
+        let tampered_zip_bytes = make_zip_bytes(&[(
+            &format!("bun-linux-x64/{}", EngineManager::bun_filename()),
+            b"#!/bin/sh\necho evil\n",
+        )]);
 
         let bad_server = TinyServer::new(b"not a zip".to_vec());
-        let good_server = TinyServer::new(zip_bytes);
+        let tampered_server = TinyServer::new(tampered_zip_bytes);
+        let good_server = TinyServer::new(good_zip_bytes);
 
         let client = reqwest::Client::new();
-        let ver = ensure_bun_with_urls(
+        let ver = ensure_bun_with_sources(
             &install_root,
             &client,
             &[
-                format!("http://127.0.0.1:{}/mirror.zip", bad_server.port),
-                format!("http://127.0.0.1:{}/direct.zip", good_server.port),
+                BunDownloadSource {
+                    url: format!("http://127.0.0.1:{}/mirror-corrupt.zip", bad_server.port),
+                    expected_sha256: Some(good_sha.clone()),
+                },
+                BunDownloadSource {
+                    url: format!(
+                        "http://127.0.0.1:{}/mirror-tampered.zip",
+                        tampered_server.port
+                    ),
+                    expected_sha256: Some(good_sha.clone()),
+                },
+                BunDownloadSource {
+                    url: format!("http://127.0.0.1:{}/direct.zip", good_server.port),
+                    expected_sha256: Some(good_sha),
+                },
             ],
         )
         .await
         .unwrap();
         assert_eq!(ver, "1.2.3");
-        assert!(is_executable_regular_file(&EngineManager::bun_bin(&install_root)));
+        assert!(is_executable_regular_file(&EngineManager::bun_bin(
+            &install_root
+        )));
 
         bad_server.shutdown();
+        tampered_server.shutdown();
         good_server.shutdown();
 
         // Second call reuses existing binary without hitting any URL.
-        let reused = ensure_bun_with_urls(&install_root, &client, &[]).await.unwrap();
+        let reused = ensure_bun_with_sources(&install_root, &client, &[])
+            .await
+            .unwrap();
         assert_eq!(reused, "1.2.3");
 
         // A symlink at bin/bun must NOT be trusted/reused.
@@ -1430,6 +1978,29 @@ mod tests {
         assert!(!is_executable_regular_file(&bun_path));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compare_npm_versions_orders_semver_and_rsshub_builds() {
+        assert_eq!(compare_npm_versions("2.5.0", "2.4.0"), Ordering::Greater);
+        assert_eq!(compare_npm_versions("2.4.0", "2.5.0"), Ordering::Less);
+        assert_eq!(compare_npm_versions("2.5.0", "2.5.0"), Ordering::Equal);
+        assert_eq!(
+            compare_npm_versions("2026.11.26-8761.g2b3a546", "2026.11.26-8760.g478e287"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_npm_versions("2026.11.26-8760.g478e287", "2026.11.26-8761.g2b3a546"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_npm_versions("1.0.0", "1.0.0-alpha.1"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_npm_versions("1.0.0-alpha.2", "1.0.0-alpha.10"),
+            Ordering::Less
+        );
     }
 
     #[tokio::test]
@@ -1464,8 +2035,96 @@ mod tests {
         assert!(!res.update_available);
         assert_eq!(res.current_version.as_deref(), Some("2.5.0"));
 
+        // Installed newer version than mirror -> updateAvailable = false (never offer downgrade).
+        make_installed_v2(&install_root, "standard", "2.6.0", "#!/bin/sh\n");
+        let res = mgr.check_update_from_url(&client, &url).await.unwrap();
+        assert!(!res.update_available);
+        assert_eq!(res.current_version.as_deref(), Some("2.6.0"));
+
         server.shutdown();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_install_or_update_preserves_existing_app_and_v1_browser() {
+        let root = temp_root("staged-rollback");
+        let failing_bun =
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"1.4.5\"; exit 0; fi\nexit 1\n";
+        make_installed_v2(&root, "standard", "2.4.0", failing_bun);
+        let v1_browser = root.join("1").join("browser").join("chromium-1");
+        std::fs::create_dir_all(&v1_browser).unwrap();
+        std::fs::write(v1_browser.join("chrome"), "v1-browser").unwrap();
+
+        let mgr = EngineManager::new(root.clone());
+        let client = reqwest::Client::new();
+        let err = mgr
+            .install_or_update(&client, false, &EngineProxyMode::None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bun add rsshub@latest"));
+
+        // Previous working v2 install and v1 browser directory remain untouched.
+        assert_eq!(mgr.info().unwrap().rsshub_version, "2.4.0");
+        assert!(v1_browser.join("chrome").is_file());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bogus_browser_dir_does_not_mark_engine_as_browser_flavor() {
+        let root = temp_root("bogus-browser");
+        let fake_bun = "#!/bin/sh\n\
+            if [ \"$1\" = \"--version\" ]; then echo \"1.4.5\"; exit 0; fi\n\
+            if [ \"$1\" = \"add\" ]; then\n\
+              mkdir -p node_modules/rsshub/dist-lib\n\
+              echo '{\"name\":\"rsshub\",\"version\":\"2.5.0\"}' > node_modules/rsshub/package.json\n\
+              echo 'console.log(1)' > node_modules/rsshub/dist-lib/magpie-server.mjs\n\
+              exit 0\n\
+            fi\n\
+            exit 1\n";
+        make_installed_v2(&root, "standard", "2.4.0", fake_bun);
+        // Simulate leftover partial/empty-cache files in browser/.
+        std::fs::create_dir_all(root.join("browser")).unwrap();
+        std::fs::write(root.join("browser").join(".partial"), b"junk").unwrap();
+
+        let mgr = EngineManager::new(root.clone());
+        let client = reqwest::Client::new();
+        let info = mgr
+            .install_or_update(&client, false, &EngineProxyMode::None)
+            .await
+            .unwrap();
+        assert_eq!(info.flavor, "standard");
+        assert!(!root.join("browser").exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bun_command_applies_explicit_and_none_proxy_modes() {
+        let out_explicit = bun_command(
+            Path::new("/usr/bin/env"),
+            None,
+            &EngineProxyMode::Explicit("http://127.0.0.1:7890".into()),
+        )
+        .output()
+        .await
+        .unwrap();
+        let env_str = String::from_utf8_lossy(&out_explicit.stdout);
+        assert!(env_str.contains("HTTP_PROXY=http://127.0.0.1:7890"));
+        assert!(env_str.contains("HTTPS_PROXY=http://127.0.0.1:7890"));
+        assert!(env_str.contains("ALL_PROXY=http://127.0.0.1:7890"));
+
+        let out_none = bun_command(Path::new("/usr/bin/env"), None, &EngineProxyMode::None)
+            .output()
+            .await
+            .unwrap();
+        let none_str = String::from_utf8_lossy(&out_none.stdout);
+        for key in ["HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "PROXY_URI="] {
+            assert!(!none_str.contains(key), "unexpected {key} in None mode");
+        }
     }
 
     #[tokio::test]
@@ -1514,7 +2173,7 @@ mod tests {
         user.insert("RSSHUB_MAGPIE_HOST".to_string(), "0".to_string());
         user.insert("MY_TOKEN".to_string(), "secret".to_string());
         let dir = temp_root("env-nodir");
-        let env = build_child_env(&user, 49152, &dir).unwrap();
+        let env = build_child_env(&user, 49152, &dir, false).unwrap();
         assert_eq!(env.get("PORT").map(String::as_str), Some("49152"));
         assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
         assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
@@ -1522,8 +2181,12 @@ mod tests {
         assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
         // Empty or missing browser/ dir must not advertise PLAYWRIGHT_BROWSERS_PATH.
         std::fs::create_dir_all(dir.join("browser")).unwrap();
-        let env2 = build_child_env(&user, 49152, &dir).unwrap();
+        let env2 = build_child_env(&user, 49152, &dir, true).unwrap();
         assert!(!env2.contains_key("PLAYWRIGHT_BROWSERS_PATH"));
+        // Non-browser flavor must not advertise PLAYWRIGHT_BROWSERS_PATH even if browser/ is non-empty.
+        std::fs::create_dir_all(dir.join("browser").join("chromium-1")).unwrap();
+        let env3 = build_child_env(&user, 49152, &dir, false).unwrap();
+        assert!(!env3.contains_key("PLAYWRIGHT_BROWSERS_PATH"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1536,7 +2199,7 @@ mod tests {
             "PLAYWRIGHT_BROWSERS_PATH".to_string(),
             "/elsewhere".to_string(),
         );
-        let env = build_child_env(&user, 49152, &dir).unwrap();
+        let env = build_child_env(&user, 49152, &dir, true).unwrap();
         assert_eq!(
             env.get("PLAYWRIGHT_BROWSERS_PATH").map(String::as_str),
             Some(dir.join("browser").to_str().unwrap())
@@ -1555,7 +2218,7 @@ mod tests {
             user.insert(format!("BULK_VAR_{i}"), "v".repeat(60_000));
         }
         let dir = temp_root("env-budget");
-        let err = build_child_env(&user, 49152, &dir).unwrap_err();
+        let err = build_child_env(&user, 49152, &dir, false).unwrap_err();
         assert_eq!(err.code_str(), CODE_ENV_TOO_LARGE);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1624,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn bun_release_asset_maps_supported_platforms() {
+    fn bun_release_asset_and_sources_cover_platforms_and_shasums() {
         assert_eq!(
             bun_release_asset("macos", "aarch64").unwrap(),
             "bun-darwin-aarch64.zip"
@@ -1647,10 +2310,30 @@ mod tests {
         );
         assert!(bun_release_asset("freebsd", "x86_64").is_err());
 
-        let cn_urls = bun_download_urls("bun-darwin-aarch64.zip", true);
-        assert_eq!(cn_urls.len(), 2);
-        assert!(cn_urls[0].starts_with(BUN_CN_MIRROR_PREFIX));
-        assert!(cn_urls[1].starts_with(BUN_GITHUB_RELEASE_BASE));
+        let shasums = "9f5d08118a09fe1b1194ca956c18999fdc81a22f05027add5486ae9a60fc135c  bun-darwin-aarch64-profile.zip\n\
+                       6f5a3467ed9caec4795bf78cd476507d9f870c7d57b86c945fcb338126772ffc  bun-darwin-aarch64.zip\n";
+        let sha = parse_shasums256(shasums, "bun-darwin-aarch64.zip").unwrap();
+        assert_eq!(
+            sha,
+            "6f5a3467ed9caec4795bf78cd476507d9f870c7d57b86c945fcb338126772ffc"
+        );
+
+        let cn_verified =
+            build_bun_download_sources("bun-darwin-aarch64.zip", true, Some(("bun-v1.4.5", &sha)));
+        assert_eq!(cn_verified.len(), 2);
+        assert!(cn_verified[0].url.starts_with(BUN_CN_MIRROR_PREFIX));
+        assert_eq!(cn_verified[0].expected_sha256.as_deref(), Some(sha.as_str()));
+        assert!(cn_verified[1].url.starts_with(BUN_GITHUB_TAG_DOWNLOAD_BASE));
+        assert_eq!(cn_verified[1].expected_sha256.as_deref(), Some(sha.as_str()));
+
+        // Without an official SHA-256, CN mirror must be skipped.
+        let cn_unverified = build_bun_download_sources("bun-darwin-aarch64.zip", true, None);
+        assert_eq!(cn_unverified.len(), 1);
+        assert_eq!(
+            cn_unverified[0].url,
+            format!("{BUN_GITHUB_RELEASE_BASE}/bun-darwin-aarch64.zip")
+        );
+        assert_eq!(cn_unverified[0].expected_sha256, None);
     }
 
     /// A minimal HTTP server on a random loopback port that answers 200 with
