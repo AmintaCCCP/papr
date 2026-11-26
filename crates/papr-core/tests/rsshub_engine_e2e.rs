@@ -1,15 +1,14 @@
 //! Real-engine end-to-end refresh test.
 //!
-//! Ignored by default: it needs the engine archive produced by
-//! `scripts/build-engine.sh` (`target/engine/*.tar.gz`) and network access
-//! (the route crawls github.com). Run it explicitly with
-//! `cargo test -p papr-core --test rsshub_engine_e2e -- --ignored`.
+//! Ignored by default: it downloads Bun and installs `rsshub@latest` from npm,
+//! then fetches a real `rsshub://` route (which requires network access).
+//! Run it explicitly with:
+//! `cargo test -p papr-core --test rsshub_engine_e2e -- --ignored --nocapture`
 //!
 //! Covers the full in-app loop the unit tests only cover with fakes:
-//! engine archive install → `rsshub://` feed + installed template →
-//! `refresh_core`'s engine leg → feed-rs parse → articles in the database.
-
-use std::path::PathBuf;
+//! `install_or_update` (Bun bootstrap + `rsshub@latest` npm install) →
+//! `rsshub://` feed + installed template → `refresh_core`'s engine leg →
+//! feed-rs parse → articles in the database.
 
 use papr_core::db;
 use papr_core::ingestion::fetch;
@@ -17,27 +16,24 @@ use papr_core::ingestion::refresh::{refresh_core, RefreshScope};
 use papr_core::ingestion::rsshub::engine::EngineManager;
 use papr_core::models::SourceType;
 
-fn engine_archive() -> PathBuf {
-    let engine_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/engine");
-    std::fs::read_dir(&engine_dir)
-        .expect("target/engine missing — run scripts/build-engine.sh first")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "gz"))
-        .expect("no engine archive in target/engine — run scripts/build-engine.sh first")
-}
-
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "heavy: boots the real engine from target/engine and crawls github.com"]
+#[ignore = "heavy: downloads Bun + installs rsshub@latest from npm and crawls github.com"]
 async fn real_engine_refresh_ingests_articles() {
-    let archive = engine_archive();
-
     let engine_root = tempfile::tempdir().expect("engine root");
     let manager = EngineManager::new(engine_root.path().to_path_buf());
-    manager
-        .install_from_archive(&archive)
+
+    let dl_client = fetch::build_client(1800, "system");
+    let use_cn_mirror = std::env::var("PAPR_E2E_CN_MIRROR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let info = manager
+        .install_or_update(&dl_client, use_cn_mirror)
         .await
-        .expect("engine install from archive");
+        .expect("engine install_or_update");
+    assert_eq!(info.version, "2");
+    assert!(!info.rsshub_version.is_empty());
+    assert!(!info.bun_version.is_empty());
     assert!(manager.installed());
 
     let db_dir = tempfile::tempdir().expect("db dir");

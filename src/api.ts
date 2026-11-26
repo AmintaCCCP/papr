@@ -30,6 +30,7 @@ import type {
   RsshubCatalog,
   RsshubEngineInfo,
   RsshubEngineStatus,
+  RsshubEngineUpdateInfo,
   RsshubRouteRow,
   SmartCounts,
   Tag,
@@ -342,14 +343,14 @@ export const rsshubTestRoute = (path: string) =>
 
 export const engineStatus = () =>
   invoke<RsshubEngineStatus>("engine_status");
-/** Install the engine from a native file dialog. `null` when cancelled. */
-export const engineInstallFromDialog = () =>
-  invoke<RsshubEngineInfo | null>("engine_install_from_dialog");
-export const engineInstallFromUrl = (url: string, sha256?: string) =>
-  invoke<RsshubEngineInfo>("engine_install_from_url", {
-    url,
-    sha256: sha256?.trim() ? sha256.trim() : null,
-  });
+export const engineCheckUpdate = (useCnMirror: boolean) =>
+  invoke<RsshubEngineUpdateInfo>("engine_check_update", { useCnMirror });
+export const engineInstallOrUpdate = (useCnMirror: boolean) =>
+  invoke<RsshubEngineInfo>("engine_install_or_update", { useCnMirror });
+export const engineInstallBrowser = () =>
+  invoke<RsshubEngineInfo>("engine_install_browser");
+export const engineUninstallBrowser = () =>
+  invoke<RsshubEngineInfo>("engine_uninstall_browser");
 export const engineUninstall = () => invoke<void>("engine_uninstall");
 
 // ── settings ──

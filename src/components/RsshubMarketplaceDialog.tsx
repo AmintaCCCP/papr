@@ -129,10 +129,10 @@ export default function RsshubMarketplaceDialog({
 /* ── market tab ─────────────────────────────────────────────── */
 
 /** The installed engine's flavor decides whether requirePuppeteer routes are
- *  installable: the browser flavor (`scripts/build-engine.sh --browser`)
- *  ships a headless Chromium, the standard one gates those routes. Shared by
- *  the row badges and the route detail; cached under the same key the
- *  settings dialog uses, so installing an engine in settings updates here. */
+ *  installable: the browser flavor (Patchright Chromium installed in Settings)
+ *  supports headless browser routes, while the standard one gates them. Shared
+ *  by the row badges and the route detail; cached under the same key the
+ *  settings dialog uses, so updating the engine in settings updates here. */
 function useEngineFlavor() {
   const engine = useQuery({
     queryKey: ["rsshub-engine"],
@@ -203,27 +203,29 @@ function MarketTab({
             {...NO_AUTOCORRECT}
           />
         </div>
-        <select
-          className="s-select"
-          aria-label={t("settings.rsshub.category")}
-          value={category ?? ""}
-          onChange={(e) => setCategory(e.target.value || null)}
-        >
-          <option value="">{t("settings.rsshub.allCategories")}</option>
-          {categories.map(({ tag, count }) => (
-            <option key={tag} value={tag}>
-              {`${tag} (${count})`}
-            </option>
-          ))}
-        </select>
-        <label className="rsshub-nsfw">
-          <input
-            type="checkbox"
-            checked={hideNsfw}
-            onChange={(e) => setHideNsfw(e.target.checked)}
-          />
-          {t("settings.rsshub.hideNsfw")}
-        </label>
+        <div className="rsshub-filters">
+          <select
+            className="s-select"
+            aria-label={t("settings.rsshub.category")}
+            value={category ?? ""}
+            onChange={(e) => setCategory(e.target.value || null)}
+          >
+            <option value="">{t("settings.rsshub.allCategories")}</option>
+            {categories.map(({ tag, count }) => (
+              <option key={tag} value={tag}>
+                {`${tag} (${count})`}
+              </option>
+            ))}
+          </select>
+          <label className="rsshub-nsfw">
+            <input
+              type="checkbox"
+              checked={hideNsfw}
+              onChange={(e) => setHideNsfw(e.target.checked)}
+            />
+            {t("settings.rsshub.hideNsfw")}
+          </label>
+        </div>
       </div>
       <div className="rsshub-body">
         <div className="rsshub-list" ref={scrollRef}>

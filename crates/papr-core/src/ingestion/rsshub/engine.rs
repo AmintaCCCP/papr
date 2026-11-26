@@ -1,7 +1,7 @@
-//! The local RSSHub engine — a bundled Node + RSSHub build executed on the
-//! user's machine, so `rsshub://` subscriptions never depend on a hosted
-//! RSSHub instance (public instances rate-limit and blacklist; local execution
-//! is the whole point of the feature).
+//! The local RSSHub engine — an in-app Bun + official `rsshub@latest` npm
+//! package runtime executed on the user's machine, so `rsshub://` subscriptions
+//! never depend on a hosted RSSHub instance (public instances rate-limit and
+//! blacklist; local execution is the whole point of the feature).
 //!
 //! The manager is UI-free: the engine root directory is supplied by the
 //! caller (the desktop app passes its data dir; tests pass a temp dir).
@@ -9,11 +9,13 @@
 //! Layout on disk:
 //!
 //! ```text
-//! <engine_root>/engine.json            { version, rsshubRevision, nodeVersion, installedAt }
-//! <engine_root>/engine.log             the engine's stdout/stderr, appended per run
-//! <engine_root>/<version>/bin/node     the bundled Node runtime (node.exe on Windows)
-//! <engine_root>/<version>/app/         the RSSHub build product
-//!     package.json  dist/…  node_modules/…
+//! <engine_root>/engine.json                { version: "2", flavor, rsshubVersion, bunVersion, installedAt }
+//! <engine_root>/engine.log                 the engine's stdout/stderr, appended per run
+//! <engine_root>/bin/bun                    single-file Bun binary (bin/bun.exe on Windows)
+//! <engine_root>/app/package.json           {"name":"papr-rsshub-engine","private":true}
+//! <engine_root>/app/server.mjs             boots rsshub/dist-lib/magpie-server.mjs
+//! <engine_root>/app/node_modules/rsshub/   official npm package
+//! <engine_root>/browser/                   optional headless Chromium via patchright
 //! ```
 //!
 //! [`EngineManager::ensure`] lazily spawns the engine on a random loopback
@@ -26,7 +28,6 @@
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -42,9 +43,28 @@ use tokio::task::JoinHandle;
 pub const CODE_ENGINE_MISSING: &str = "rsshubEngineMissing";
 pub const CODE_ENGINE_START: &str = "rsshubEngineStart";
 pub const CODE_ROUTE_FETCH: &str = "rsshubRouteFetch";
-pub const CODE_ARCHIVE_INVALID: &str = "rsshubEngineArchiveInvalid";
-pub const CODE_ARCHIVE_CHECKSUM: &str = "rsshubEngineChecksum";
 pub const CODE_ENV_TOO_LARGE: &str = "rsshubEngineEnvTooLarge";
+
+/// Engine disk-layout format version ("2" for Bun + npm rsshub layout).
+const ENGINE_FORMAT_VERSION: &str = "2";
+
+const NPM_REGISTRY_DEFAULT: &str = "https://registry.npmjs.org";
+const NPM_REGISTRY_CN: &str = "https://registry.npmmirror.com";
+const BUN_GITHUB_RELEASE_BASE: &str = "https://github.com/oven-sh/bun/releases/latest/download";
+const BUN_CN_MIRROR_PREFIX: &str = "https://gh-proxy.org/";
+
+const APP_PACKAGE_JSON: &str = "{\"name\":\"papr-rsshub-engine\",\"private\":true}\n";
+const APP_SERVER_MJS: &str = r#"import { existsSync } from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+const distLib = path.join(import.meta.dirname, "node_modules", "rsshub", "dist-lib");
+const magpieServer = path.join(distLib, "magpie-server.mjs");
+if (existsSync(magpieServer)) {
+  await import(pathToFileURL(magpieServer).href);
+} else {
+  throw new Error(`RSSHub server entry not found at ${magpieServer}`);
+}
+"#;
 
 /// Health-check budget when *starting* the engine. First launch loads
 /// thousands of route modules; a cold start can take tens of seconds.
@@ -60,18 +80,16 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// Tear the engine down after this much idle time. The engine holds several
 /// hundred MB of RSS — no reason to keep it warm while the user reads.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Hard cap on an installed engine archive (a full Node + RSSHub + node_modules
-/// bundle is a few hundred MB compressed; 1 GiB leaves generous headroom while
-/// still refusing a runaway download).
-const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
-/// Hard cap on the *extracted* tree. A real install is ~1.1 GB (measured:
-/// RSSHub node_modules ≈ 900 MB + Node); the cap mainly refuses a crafted
-/// zip/tar bomb whose compressed form fits under [`MAX_ARCHIVE_BYTES`].
-const MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Hard cap on a downloaded Bun release zip archive (official zips are ~40-60 MB).
+const MAX_BUN_ZIP_BYTES: u64 = 512 * 1024 * 1024;
+/// Hard cap on the extracted single `bun` binary (guards against zip bombs).
+const MAX_BUN_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+/// Hard cap on npm registry JSON metadata responses.
+const MAX_REGISTRY_JSON_BYTES: usize = 4 * 1024 * 1024;
 
 /// Environment variables the engine process may inherit. Everything else is
 /// stripped: the child runs arbitrary scraping code with credentials the user
-/// typed into the marketplace, so it gets the minimum needed to run Node and
+/// typed into the marketplace, so it gets the minimum needed to run Bun and
 /// reach the internet (proxy variables included — routes behind a corporate
 /// proxy need the same egress as the rest of the app, and `PROXY_URI` is
 /// RSSHub's own proxy setting).
@@ -92,7 +110,7 @@ const ENV_ALLOWLIST: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
-    // Windows basics Node's `os`/`child_process` modules expect.
+    // Windows basics Bun/Node/Playwright expect.
     "SYSTEMROOT",
     "COMSPEC",
     "PATHEXT",
@@ -101,6 +119,7 @@ const ENV_ALLOWLIST: &[&str] = &[
     "SYSTEMDRIVE",
     "HOMEDRIVE",
     "HOMEPATH",
+    "USERPROFILE",
     "ALLUSERSPROFILE",
     "APPDATA",
     "LOCALAPPDATA",
@@ -124,7 +143,7 @@ const ENV_ALLOWLIST: &[&str] = &[
 /// keeps a host with a huge `ARG_MAX` from accepting environments that are
 /// almost certainly a mistake.
 const MAX_TOTAL_ENV_BYTES: usize = 1024 * 1024;
-/// Headroom subtracted from the platform's `ARG_MAX` for argv (the node
+/// Headroom subtracted from the platform's `ARG_MAX` for argv (the bun
 /// binary + entry path) and the kernel's per-string accounting slop.
 const ARGV_HEADROOM_BYTES: usize = 64 * 1024;
 /// Floor for the effective budget: even a tiny `RLIMIT_STACK`-derived
@@ -173,37 +192,34 @@ fn platform_arg_max() -> Option<usize> {
     None
 }
 
-/// The `engine.json` manifest. Written by `scripts/build-engine.sh` (camelCase)
-/// and by the installer after a successful install; snake_case aliases are
-/// accepted when reading so hand-assembled engines still load.
+/// The `engine.json` manifest. Written atomically by `install_or_update`,
+/// `install_browser`, and `uninstall_browser`. Legacy v1 field aliases are
+/// accepted when deserializing so stale manifests parse cleanly before being
+/// rejected by format version check (`version == "2"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInfo {
-    /// Engine format version — bumped when the layout changes.
+    /// Engine format version — `"2"` for the Bun + npm `rsshub` layout.
     pub version: String,
-    /// `standard` (Node + RSSHub only; browser routes are gated in the
-    /// marketplace) or `browser` (also ships a headless Chromium under
-    /// `<version dir>/browser` for `requirePuppeteer` routes). Older
-    /// manifests predate the field and read as the empty string, which
-    /// behaves exactly like `standard`.
+    /// `"standard"` (Bun + RSSHub only; browser routes are gated in the
+    /// marketplace) or `"browser"` (also ships a headless Chromium under
+    /// `<engine_root>/browser` for `requirePuppeteer` routes).
     #[serde(default)]
     pub flavor: String,
-    /// The RSSHub git revision the build was made from.
-    #[serde(alias = "rsshub_revision")]
-    pub rsshub_revision: String,
-    /// The bundled Node runtime version.
-    #[serde(alias = "node_version")]
-    pub node_version: String,
-    /// When this engine was installed into the local root. Build-time
-    /// manifests don't carry it (the installer stamps it), so reading an
-    /// archive manifest must tolerate its absence.
+    /// Installed `rsshub` npm package version.
+    #[serde(alias = "rsshubRevision", alias = "rsshub_revision")]
+    pub rsshub_version: String,
+    /// Bundled Bun runtime version.
+    #[serde(default, alias = "nodeVersion", alias = "node_version")]
+    pub bun_version: String,
+    /// RFC3339 timestamp when this engine was installed or updated.
     #[serde(default, alias = "installed_at")]
     pub installed_at: String,
 }
 
 impl EngineInfo {
-    /// True when the installed engine bundles the headless Chromium the
-    /// `requirePuppeteer` routes need (`scripts/build-engine.sh --browser`).
+    /// True when the installed engine includes headless Chromium under
+    /// `<engine_root>/browser` for `requirePuppeteer` routes.
     pub fn is_browser_flavor(&self) -> bool {
         self.flavor == "browser"
     }
@@ -219,6 +235,15 @@ pub struct EngineStatus {
     pub info: Option<EngineInfo>,
 }
 
+/// What `engine_check_update` reports to the settings UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineUpdateInfo {
+    pub current_version: Option<String>,
+    pub latest_version: String,
+    pub update_available: bool,
+}
+
 /// The live engine process and its idle bookkeeping. `None` when stopped.
 struct Running {
     child: Child,
@@ -232,11 +257,11 @@ struct Running {
 pub struct EngineManager {
     root: PathBuf,
     running: std::sync::Arc<Mutex<Option<Running>>>,
-    /// Serializes cold starts. The `running` slot must not be held across the
-    /// up-to-a-minute start budget (the `engine_status` command polls it), so
-    /// this separate lock stops concurrent `ensure()` callers — the refresh
-    /// leg's tasks and the `rsshub_test_route` command — from each spawning a
-    /// full Node process.
+    /// Serializes cold starts and install/uninstall mutations. The `running`
+    /// slot must not be held across the up-to-a-minute start budget (the
+    /// `engine_status` command polls it), so this separate lock stops
+    /// concurrent `ensure()` callers from each spawning a Bun process and stops
+    /// installs/uninstalls from racing a cold start.
     spawn_lock: std::sync::Arc<Mutex<()>>,
 }
 
@@ -255,53 +280,53 @@ impl EngineManager {
         &self.root
     }
 
-    /// The installed engine's manifest, or `None` when nothing (valid) is
-    /// installed. Small file read, safe to call from sync contexts.
+    fn bun_filename() -> &'static str {
+        if cfg!(windows) {
+            "bun.exe"
+        } else {
+            "bun"
+        }
+    }
+
+    fn bun_bin(root: &Path) -> PathBuf {
+        root.join("bin").join(Self::bun_filename())
+    }
+
+    fn app_dir(root: &Path) -> PathBuf {
+        root.join("app")
+    }
+
+    fn server_mjs(root: &Path) -> PathBuf {
+        Self::app_dir(root).join("server.mjs")
+    }
+
+    fn rsshub_dir(root: &Path) -> PathBuf {
+        Self::app_dir(root).join("node_modules").join("rsshub")
+    }
+
+    fn browser_dir(root: &Path) -> PathBuf {
+        root.join("browser")
+    }
+
+    /// The installed engine's manifest, or `None` when nothing valid (v2 layout)
+    /// is installed. Small file read, safe to call from sync contexts.
     pub fn info(&self) -> Option<EngineInfo> {
         let raw = std::fs::read_to_string(self.root.join("engine.json")).ok()?;
-        serde_json::from_str(&raw).ok()
+        let info: EngineInfo = serde_json::from_str(&raw).ok()?;
+        if info.version != ENGINE_FORMAT_VERSION {
+            return None;
+        }
+        if !is_regular_file(&Self::bun_bin(&self.root))
+            || !is_regular_file(&Self::server_mjs(&self.root))
+            || !Self::rsshub_dir(&self.root).is_dir()
+        {
+            return None;
+        }
+        Some(info)
     }
 
     pub fn installed(&self) -> bool {
         self.info().is_some()
-    }
-
-    /// The path of the installed engine's version directory.
-    fn version_dir(info: &EngineInfo, root: &Path) -> AppResult<PathBuf> {
-        // The version comes from the (untrusted) archive manifest — sanitize
-        // so a crafted `version` cannot escape the root: keep a conservative
-        // alphabet and reject anything that smells like a path segment
-        // (`..`, `.`).
-        let safe: String = info
-            .version
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-            .collect();
-        if safe.is_empty() || safe.contains("..") || safe == "." {
-            return Err(AppError::code(CODE_ARCHIVE_INVALID));
-        }
-        Ok(root.join(safe))
-    }
-
-    fn node_bin(dir: &Path) -> PathBuf {
-        if cfg!(windows) {
-            dir.join("bin").join("node.exe")
-        } else {
-            dir.join("bin").join("node")
-        }
-    }
-
-    /// Locate the RSSHub entry script inside the version dir. The tsdown
-    /// build emits `app/dist/index.js`; the candidates cover layout drift
-    /// between RSSHub revisions without making the manifest carry it.
-    fn entry_script(dir: &Path) -> Option<PathBuf> {
-        const CANDIDATES: &[&str] = &[
-            "app/dist/index.js",
-            "app/dist/index.mjs",
-            "app/dist/index.cjs",
-            "app/lib/index.js",
-        ];
-        CANDIDATES.iter().map(|c| dir.join(c)).find(|p| p.is_file())
     }
 
     /// Current status for the settings UI.
@@ -334,10 +359,6 @@ impl EngineManager {
         if let Some(port) = self.try_running().await {
             return Ok(port);
         }
-        // Serialize cold starts: concurrent callers (the refresh leg's tasks
-        // racing the `rsshub_test_route` command) queue here instead of each
-        // spawning a several-hundred-MB Node process. Whoever wakes second
-        // re-checks the fast path and reuses the winner's engine.
         let _spawn = self.spawn_lock.lock().await;
         if let Some(port) = self.try_running().await {
             return Ok(port);
@@ -369,33 +390,32 @@ impl EngineManager {
     }
 
     /// The slow path behind [`ensure`](Self::ensure): validate the install,
-    /// spawn the process, wait for health. `budget` is a parameter so tests
-    /// can exercise the failure path without waiting the full start budget.
+    /// spawn `<root>/bin/bun run <root>/app/server.mjs`, wait for health.
+    /// `budget` is a parameter so tests can exercise the failure path without
+    /// waiting the full start budget.
     async fn cold_start(
         &self,
         user_env: &BTreeMap<String, String>,
         budget: Duration,
     ) -> AppResult<u16> {
-        let info = self
+        let _info = self
             .info()
             .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
-        let dir = Self::version_dir(&info, &self.root)?;
-        let node_bin = Self::node_bin(&dir);
-        let entry = Self::entry_script(&dir).ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
-        if !node_bin.is_file() {
+        let bun_bin = Self::bun_bin(&self.root);
+        let server_mjs = Self::server_mjs(&self.root);
+        let app_dir = Self::app_dir(&self.root);
+        if !is_regular_file(&bun_bin) || !is_regular_file(&server_mjs) {
             log::error!(
-                "rsshub engine: node binary missing at {}",
-                node_bin.display()
+                "rsshub engine: runtime or entry missing under {}",
+                self.root.display()
             );
             return Err(AppError::code(CODE_ENGINE_MISSING));
         }
 
         let port = free_port()
             .map_err(|e| AppError::other(format!("rsshub engine: no free port: {e}")))?;
-        // Enforce the execve size budget before touching the log files: an
-        // over-budget environment fails the spawn with E2BIG, and the coded
-        // error here is the actionable form of that failure.
-        let child_env = build_child_env(user_env, port, &dir)?;
+        // Enforce the execve size budget before touching the log files.
+        let child_env = build_child_env(user_env, port, &self.root)?;
         let log_path = self.root.join("engine.log");
 
         // The log file is opened twice (stdout + stderr share it in append
@@ -409,9 +429,10 @@ impl EngineManager {
             .try_clone()
             .map_err(|e| AppError::other(format!("rsshub engine: open log: {e}")))?;
 
-        let mut cmd = tokio::process::Command::new(&node_bin);
-        cmd.current_dir(&dir)
-            .arg(entry)
+        let mut cmd = tokio::process::Command::new(&bun_bin);
+        cmd.current_dir(&app_dir)
+            .arg("run")
+            .arg(&server_mjs)
             .env_clear()
             .stdout(std::process::Stdio::from(log_out))
             .stderr(std::process::Stdio::from(log_err))
@@ -422,14 +443,12 @@ impl EngineManager {
 
         log::info!(
             "rsshub engine: starting {} on 127.0.0.1:{port}",
-            node_bin.display()
+            bun_bin.display()
         );
         let child = cmd.spawn().map_err(|e| map_spawn_error(&e))?;
 
         if wait_healthy(port, budget).await {
             let mut guard = self.running.lock().await;
-            // Another ensure() may have raced us to spawn; never leak two
-            // processes — kill the loser.
             if let Some(existing) = guard.as_mut() {
                 if existing
                     .child
@@ -454,10 +473,6 @@ impl EngineManager {
             return Ok(port);
         }
 
-        // Start failed — reap the child so it cannot outlive the call, and
-        // surface the coded error (the log tail lives in engine.log). The
-        // wait mirrors try_running/shutdown: kill alone can leave the
-        // process unreaped until the runtime's orphan sweep gets to it.
         let mut child = child;
         let _ = child.kill().await;
         let _ = child.wait().await;
@@ -472,23 +487,208 @@ impl EngineManager {
         }
     }
 
-    /// Stop the engine process, if running. Called on app exit.
+    /// Stop the engine process, if running. Called on app exit and before
+    /// install/uninstall/browser mutations.
     pub async fn shutdown(&self) {
         let running = self.running.lock().await.take();
         if let Some(mut r) = running {
             log::info!("rsshub engine: shutting down");
             r.watcher.abort();
             let _ = r.child.kill().await;
-            // Reap so the zombie does not linger.
             let _ = r.child.wait().await;
         }
     }
 
-    /// Remove the installed engine (and any staging remnants). Stops a
-    /// running engine first.
+    /// Query npm for the latest published `rsshub` version and compare against
+    /// the locally installed version.
+    pub async fn check_update(
+        &self,
+        client: &reqwest::Client,
+        use_cn_mirror: bool,
+    ) -> AppResult<EngineUpdateInfo> {
+        let registry = if use_cn_mirror {
+            NPM_REGISTRY_CN
+        } else {
+            NPM_REGISTRY_DEFAULT
+        };
+        let url = format!("{registry}/rsshub/latest");
+        self.check_update_from_url(client, &url).await
+    }
+
+    async fn check_update_from_url(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> AppResult<EngineUpdateInfo> {
+        let mut resp = client.get(url).send().await?.error_for_status()?;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if buf.len() + chunk.len() > MAX_REGISTRY_JSON_BYTES {
+                return Err(AppError::other(
+                    "rsshub engine: registry response exceeded size limit",
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        struct NpmLatest {
+            version: String,
+        }
+        let parsed: NpmLatest = serde_json::from_slice(&buf).map_err(|e| {
+            AppError::other(format!("rsshub engine: parse registry metadata: {e}"))
+        })?;
+        let latest_version = parsed.version.trim().to_string();
+        if latest_version.is_empty() {
+            return Err(AppError::other(
+                "rsshub engine: registry returned empty rsshub version",
+            ));
+        }
+        let current_version = self.info().map(|i| i.rsshub_version);
+        let update_available = current_version.as_deref() != Some(latest_version.as_str());
+        Ok(EngineUpdateInfo {
+            current_version,
+            latest_version,
+            update_available,
+        })
+    }
+
+    /// Install or update the Bun + `rsshub@latest` engine under `<engine_root>`.
+    pub async fn install_or_update(
+        &self,
+        client: &reqwest::Client,
+        use_cn_mirror: bool,
+    ) -> AppResult<EngineInfo> {
+        let _spawn = self.spawn_lock.lock().await;
+        self.shutdown().await;
+
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
+        cleanup_legacy_layout(&self.root)?;
+
+        let bun_version = ensure_bun(&self.root, client, use_cn_mirror).await?;
+        let bun_bin = Self::bun_bin(&self.root);
+        let app_dir = Self::app_dir(&self.root);
+        std::fs::create_dir_all(&app_dir)
+            .map_err(|e| AppError::other(format!("rsshub engine: create app dir: {e}")))?;
+
+        std::fs::write(app_dir.join("package.json"), APP_PACKAGE_JSON)
+            .map_err(|e| AppError::other(format!("rsshub engine: write package.json: {e}")))?;
+
+        let registry_arg = format!(
+            "--registry={}",
+            if use_cn_mirror {
+                NPM_REGISTRY_CN
+            } else {
+                NPM_REGISTRY_DEFAULT
+            }
+        );
+
+        let mut cmd = bun_command(&bun_bin, Some(&app_dir));
+        cmd.args(["add", "rsshub@latest", "--exact", &registry_arg])
+            .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+            .env("PUPPETEER_SKIP_DOWNLOAD", "1")
+            .env("PUPPETEER_SKIP_CHROMIUM_DOWNLOAD", "1");
+
+        log::info!(
+            "rsshub engine: installing rsshub@latest via {} ({registry_arg})",
+            bun_bin.display()
+        );
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| AppError::other(format!("rsshub engine: run bun add: {e}")))?;
+        if !output.status.success() {
+            return Err(format_cmd_failure("bun add rsshub@latest", &output));
+        }
+
+        std::fs::write(Self::server_mjs(&self.root), APP_SERVER_MJS)
+            .map_err(|e| AppError::other(format!("rsshub engine: write server.mjs: {e}")))?;
+
+        let rsshub_version = read_installed_rsshub_version(&self.root)?;
+        let flavor = detect_flavor(&self.root);
+        let info = EngineInfo {
+            version: ENGINE_FORMAT_VERSION.to_string(),
+            flavor,
+            rsshub_version,
+            bun_version,
+            installed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        write_manifest_atomic(&self.root, &info)?;
+        Ok(info)
+    }
+
+    /// Install the optional headless Chromium runtime (`patchright install chromium`)
+    /// into `<engine_root>/browser` and mark the engine flavor as `"browser"`.
+    pub async fn install_browser(&self) -> AppResult<EngineInfo> {
+        let _spawn = self.spawn_lock.lock().await;
+        self.shutdown().await;
+
+        let mut info = self
+            .info()
+            .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
+        let bun_bin = Self::bun_bin(&self.root);
+        let app_dir = Self::app_dir(&self.root);
+        if !is_regular_file(&bun_bin) || !Self::rsshub_dir(&self.root).is_dir() {
+            return Err(AppError::code(CODE_ENGINE_MISSING));
+        }
+
+        let browser_dir = Self::browser_dir(&self.root);
+        let had_browser_dir = browser_dir.exists();
+        std::fs::create_dir_all(&browser_dir)
+            .map_err(|e| AppError::other(format!("rsshub engine: create browser dir: {e}")))?;
+
+        let mut cmd = bun_command(&bun_bin, Some(&app_dir));
+        cmd.args(["x", "patchright", "install", "chromium"])
+            .env("PLAYWRIGHT_BROWSERS_PATH", &browser_dir);
+
+        log::info!("rsshub engine: installing patchright chromium");
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| AppError::other(format!("rsshub engine: run patchright install: {e}")))?;
+        if !output.status.success() {
+            if !had_browser_dir && !dir_is_non_empty(&browser_dir) {
+                let _ = std::fs::remove_dir_all(&browser_dir);
+            }
+            return Err(format_cmd_failure("patchright install chromium", &output));
+        }
+
+        if !dir_is_non_empty(&browser_dir) {
+            if !had_browser_dir {
+                let _ = std::fs::remove_dir_all(&browser_dir);
+            }
+            return Err(AppError::other(
+                "rsshub engine: patchright install chromium produced an empty browser directory",
+            ));
+        }
+
+        info.flavor = "browser".to_string();
+        write_manifest_atomic(&self.root, &info)?;
+        Ok(info)
+    }
+
+    /// Remove `<engine_root>/browser` and reset the engine flavor to `"standard"`.
+    pub async fn uninstall_browser(&self) -> AppResult<EngineInfo> {
+        let _spawn = self.spawn_lock.lock().await;
+        self.shutdown().await;
+
+        let mut info = self
+            .info()
+            .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
+        let browser_dir = Self::browser_dir(&self.root);
+        if browser_dir.exists() {
+            std::fs::remove_dir_all(&browser_dir)
+                .map_err(|e| AppError::other(format!("rsshub engine: remove browser dir: {e}")))?;
+        }
+
+        info.flavor = "standard".to_string();
+        write_manifest_atomic(&self.root, &info)?;
+        Ok(info)
+    }
+
+    /// Remove the installed engine (including any legacy v1 directories and
+    /// browser runtime). Stops a running engine first and keeps `engine.log`.
     pub async fn uninstall(&self) -> AppResult<()> {
-        // Serialize against a cold start: it may be mid-health-wait about to
-        // register a child under the root this call is about to wipe.
         let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
         let root = self.root.clone();
@@ -519,79 +719,10 @@ impl EngineManager {
         .await
         .map_err(|e| AppError::other(format!("rsshub engine: uninstall task: {e}")))?
     }
-
-    /// Install an engine from a local archive (`.tar.gz` / `.tgz` / `.zip`).
-    /// Blocking filesystem work runs on the blocking pool; a running engine is
-    /// stopped first because its version directory is replaced.
-    pub async fn install_from_archive(&self, archive: &Path) -> AppResult<EngineInfo> {
-        // Serialize against a cold start: a spawn that is mid-health-wait
-        // would otherwise register a child running from the version directory
-        // this install is about to replace (a sharing violation on Windows,
-        // a zombie engine on Unix).
-        let _spawn = self.spawn_lock.lock().await;
-        self.shutdown().await;
-        let root = self.root.clone();
-        let archive = archive.to_path_buf();
-        tokio::task::spawn_blocking(move || install_archive_blocking(&root, &archive))
-            .await
-            .map_err(|e| AppError::other(format!("rsshub engine: install task: {e}")))?
-    }
-
-    /// Download an engine archive from `url` (streamed, size-capped), verify
-    /// its sha256 when `expected_sha256` is given, then install it.
-    pub async fn install_from_url(
-        &self,
-        url: &str,
-        client: &reqwest::Client,
-        expected_sha256: Option<&str>,
-    ) -> AppResult<EngineInfo> {
-        std::fs::create_dir_all(&self.root)
-            .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
-        let tmp = self.root.join(format!(".download-{}", std::process::id()));
-        let resp = client.get(url).send().await?.error_for_status()?;
-        let total = resp.content_length().unwrap_or(0);
-        if total > MAX_ARCHIVE_BYTES {
-            return Err(AppError::code(CODE_ARCHIVE_INVALID));
-        }
-        let mut file = std::fs::File::create(&tmp)
-            .map_err(|e| AppError::other(format!("rsshub engine: download: {e}")))?;
-        let mut hasher = Sha256::new();
-        let mut downloaded: u64 = 0;
-        let mut resp = resp;
-        while let Some(chunk) = resp.chunk().await? {
-            downloaded += chunk.len() as u64;
-            if downloaded > MAX_ARCHIVE_BYTES {
-                drop(file);
-                let _ = std::fs::remove_file(&tmp);
-                return Err(AppError::code(CODE_ARCHIVE_INVALID));
-            }
-            hasher.update(&chunk);
-            std::io::copy(&mut chunk.as_ref(), &mut file)
-                .map_err(|e| AppError::other(format!("rsshub engine: download: {e}")))?;
-        }
-        drop(file);
-        let result = async {
-            if let Some(expected) = expected_sha256 {
-                let actual = format!("{:x}", hasher.finalize());
-                if !actual.eq_ignore_ascii_case(expected.trim()) {
-                    return Err(AppError::code(CODE_ARCHIVE_CHECKSUM));
-                }
-            }
-            self.install_from_archive(&tmp).await
-        }
-        .await;
-        let _ = std::fs::remove_file(&tmp);
-        result
-    }
 }
 
 /// A client for requests to the engine's loopback port (route fetches, health
-/// probes). It deliberately bypasses every configured proxy: a loopback
-/// address is never reachable *through* a proxy, and a user with `HTTP_PROXY`
-/// — or an in-app `net_proxy` setting, which `fetch::build_client` applies to
-/// every URL — would otherwise have engine requests leave the machine or fail
-/// against the proxy's own error page. The timeout is generous because a
-/// route scrape fetches the upstream site inside the request.
+/// probes). It deliberately bypasses every configured proxy.
 pub fn loopback_client() -> &'static reqwest::Client {
     static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
@@ -609,60 +740,415 @@ pub fn loopback_client() -> &'static reqwest::Client {
 /// is deliberately wider than the feed client's default.
 const ENGINE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Assemble the engine child's environment and enforce the execve size
-/// budget: allowlisted host variables first, then the user's route variables
-/// (winning on collision), then the manager's own fixed variables — which
-/// the user's route variables must NOT override (`PORT` must match the port
-/// the health check probes, and `LISTEN_INADDR_ANY=0` keeps RSSHub bound to
-/// 127.0.0.1 — its default (bind any) would expose the engine, user cookies
-/// included, to the whole network; RSSHub's `toBoolean` reads "0" as false
-/// and `lib/index.ts` then binds 127.0.0.1. The header size matches RSSHub's
-/// own production start command). When the installed engine is the browser
-/// flavor (`<version dir>/browser` exists — see `scripts/build-engine.sh
-/// --browser`), `PLAYWRIGHT_BROWSERS_PATH` is pinned to that directory so
-/// RSSHub's patchright launch resolves the *bundled* Chromium instead of
-/// hunting the host's (or trying to download one — `install` was already
-/// run at build time, and a runtime download inside the stripped child
-/// environment would be a surprise network fetch). Returns the coded
-/// [`CODE_ENV_TOO_LARGE`](CODE_ENV_TOO_LARGE) error when the merged size
-/// exceeds what this platform's `execve` accepts ([`execve_budget`]).
-fn build_child_env(
-    user_env: &BTreeMap<String, String>,
-    port: u16,
-    version_dir: &Path,
-) -> AppResult<BTreeMap<String, String>> {
-    let mut env: BTreeMap<String, String> = ENV_ALLOWLIST
+fn is_regular_file(path: &Path) -> bool {
+    path.symlink_metadata().map(|m| m.is_file()).unwrap_or(false)
+}
+
+fn is_executable_regular_file(path: &Path) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn dir_is_non_empty(path: &Path) -> bool {
+    path.is_dir()
+        && std::fs::read_dir(path)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+}
+
+fn detect_flavor(root: &Path) -> String {
+    if dir_is_non_empty(&EngineManager::browser_dir(root)) {
+        "browser".to_string()
+    } else {
+        "standard".to_string()
+    }
+}
+
+fn allowlisted_host_env() -> BTreeMap<String, String> {
+    ENV_ALLOWLIST
         .iter()
         .filter_map(|key| {
             std::env::var(key)
                 .ok()
                 .map(|value| ((*key).to_string(), value))
         })
-        .collect();
+        .collect()
+}
+
+fn bun_command(bun_bin: &Path, cwd: Option<&Path>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bun_bin);
+    cmd.env_clear().kill_on_drop(true);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in allowlisted_host_env() {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
+fn format_cmd_failure(action: &str, output: &std::process::Output) -> AppError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = match (stderr.is_empty(), stdout.is_empty()) {
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (false, false) => format!("{stderr}\n{stdout}"),
+        (true, true) => "no output".to_string(),
+    };
+    let clipped: String = detail.chars().take(1000).collect();
+    AppError::other(format!(
+        "rsshub engine: {action} failed ({}): {clipped}",
+        output.status
+    ))
+}
+
+fn cleanup_legacy_layout(root: &Path) -> AppResult<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    // Remove legacy v1 engine.json if present so a failed mid-install never
+    // leaves a stale v1 manifest around.
+    let manifest = root.join("engine.json");
+    if manifest.is_file() {
+        let is_v2 = std::fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|s| serde_json::from_str::<EngineInfo>(&s).ok())
+            .is_some_and(|i| i.version == ENGINE_FORMAT_VERSION);
+        if !is_v2 {
+            let _ = std::fs::remove_file(&manifest);
+        }
+    }
+
+    for entry in std::fs::read_dir(root)
+        .map_err(|e| AppError::other(format!("rsshub engine: read root: {e}")))?
+    {
+        let path = entry
+            .map_err(|e| AppError::other(format!("rsshub engine: read root: {e}")))?
+            .path();
+        let keep = matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("bin" | "app" | "browser" | "engine.json" | "engine.log")
+        );
+        if keep {
+            continue;
+        }
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+    Ok(())
+}
+
+fn write_manifest_atomic(root: &Path, info: &EngineInfo) -> AppResult<()> {
+    let bytes = serde_json::to_vec_pretty(info)
+        .map_err(|e| AppError::other(format!("rsshub engine: serialize manifest: {e}")))?;
+    let tmp = root.join(format!(".engine.json.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, bytes)
+        .map_err(|e| AppError::other(format!("rsshub engine: write manifest: {e}")))?;
+    let dest = root.join("engine.json");
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AppError::other(format!(
+            "rsshub engine: finalize manifest: {e}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_installed_rsshub_version(root: &Path) -> AppResult<String> {
+    let pkg_path = EngineManager::rsshub_dir(root).join("package.json");
+    let raw = std::fs::read_to_string(&pkg_path).map_err(|e| {
+        AppError::other(format!(
+            "rsshub engine: read rsshub package.json at {}: {e}",
+            pkg_path.display()
+        ))
+    })?;
+    #[derive(Deserialize)]
+    struct PkgJson {
+        version: String,
+    }
+    let pkg: PkgJson = serde_json::from_str(&raw)
+        .map_err(|e| AppError::other(format!("rsshub engine: parse rsshub package.json: {e}")))?;
+    let ver = pkg.version.trim().to_string();
+    if ver.is_empty() {
+        return Err(AppError::other(
+            "rsshub engine: rsshub package.json has empty version",
+        ));
+    }
+    Ok(ver)
+}
+
+fn bun_release_asset(os: &str, arch: &str) -> AppResult<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok("bun-darwin-aarch64.zip"),
+        ("macos", "x86_64") => Ok("bun-darwin-x64.zip"),
+        ("linux", "x86_64") => Ok("bun-linux-x64.zip"),
+        ("linux", "aarch64") => Ok("bun-linux-aarch64.zip"),
+        ("windows", "x86_64") => Ok("bun-windows-x64.zip"),
+        _ => Err(AppError::other(format!(
+            "rsshub engine: unsupported platform for Bun bootstrap: {os}/{arch}"
+        ))),
+    }
+}
+
+fn bun_download_urls(asset: &str, use_cn_mirror: bool) -> Vec<String> {
+    let direct = format!("{BUN_GITHUB_RELEASE_BASE}/{asset}");
+    if use_cn_mirror {
+        vec![format!("{BUN_CN_MIRROR_PREFIX}{direct}"), direct]
+    } else {
+        vec![direct]
+    }
+}
+
+async fn read_bun_version(bun_bin: &Path) -> AppResult<String> {
+    let output = bun_command(bun_bin, None)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| AppError::other(format!("rsshub engine: run bun --version: {e}")))?;
+    if !output.status.success() {
+        return Err(format_cmd_failure("bun --version", &output));
+    }
+    let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if ver.is_empty() {
+        return Err(AppError::other("rsshub engine: bun --version returned empty"));
+    }
+    Ok(ver)
+}
+
+/// Ensure `<root>/bin/bun(.exe)` exists as a regular executable file and return
+/// its trimmed `bun --version` string.
+async fn ensure_bun(
+    root: &Path,
+    client: &reqwest::Client,
+    use_cn_mirror: bool,
+) -> AppResult<String> {
+    let asset = bun_release_asset(std::env::consts::OS, std::env::consts::ARCH)?;
+    let urls = bun_download_urls(asset, use_cn_mirror);
+    ensure_bun_with_urls(root, client, &urls).await
+}
+
+async fn ensure_bun_with_urls(
+    root: &Path,
+    client: &reqwest::Client,
+    urls: &[String],
+) -> AppResult<String> {
+    let bun_bin = EngineManager::bun_bin(root);
+    if is_executable_regular_file(&bun_bin) {
+        if let Ok(ver) = read_bun_version(&bun_bin).await {
+            return Ok(ver);
+        }
+    }
+
+    std::fs::create_dir_all(root.join("bin"))
+        .map_err(|e| AppError::other(format!("rsshub engine: create bin dir: {e}")))?;
+
+    let expected_name = EngineManager::bun_filename();
+    let mut last_err: Option<AppError> = None;
+
+    for (idx, url) in urls.iter().enumerate() {
+        let tmp_zip = root.join(format!(
+            ".bun-download-{}-{}-{idx}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let attempt = async {
+            download_bun_zip(client, url, &tmp_zip).await?;
+            let zip_for_extract = tmp_zip.clone();
+            let bin_dest = bun_bin.clone();
+            tokio::task::spawn_blocking(move || {
+                extract_bun_from_zip(&zip_for_extract, &bin_dest, expected_name)
+            })
+            .await
+            .map_err(|e| AppError::other(format!("rsshub engine: extract bun task: {e}")))??;
+            if !is_executable_regular_file(&bun_bin) {
+                return Err(AppError::other(
+                    "rsshub engine: extracted bun binary is not a regular executable",
+                ));
+            }
+            read_bun_version(&bun_bin).await
+        }
+        .await;
+
+        let _ = std::fs::remove_file(&tmp_zip);
+        match attempt {
+            Ok(ver) => return Ok(ver),
+            Err(err) => {
+                log::warn!("rsshub engine: bun bootstrap from {url} failed: {err}");
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| AppError::other("rsshub engine: failed to bootstrap Bun runtime")))
+}
+
+async fn download_bun_zip(client: &reqwest::Client, url: &str, dest: &Path) -> AppResult<()> {
+    let mut resp = client.get(url).send().await?.error_for_status()?;
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_BUN_ZIP_BYTES)
+    {
+        return Err(AppError::other(
+            "rsshub engine: bun release archive exceeds size cap",
+        ));
+    }
+    let mut file = std::fs::File::create(dest)
+        .map_err(|e| AppError::other(format!("rsshub engine: create temp zip: {e}")))?;
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp.chunk().await? {
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > MAX_BUN_ZIP_BYTES {
+            return Err(AppError::other(
+                "rsshub engine: bun release archive exceeds size cap",
+            ));
+        }
+        file.write_all(&chunk)
+            .map_err(|e| AppError::other(format!("rsshub engine: write temp zip: {e}")))?;
+    }
+    file.flush()
+        .map_err(|e| AppError::other(format!("rsshub engine: flush temp zip: {e}")))?;
+    Ok(())
+}
+
+/// Extract ONLY the `bun(.exe)` regular file from a Bun release zip into
+/// `dest_bin`, enforcing zip-slip/traversal guards, rejecting symlinks, and
+/// capping extracted byte count.
+fn extract_bun_from_zip(zip_path: &Path, dest_bin: &Path, expected_name: &str) -> AppResult<()> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| AppError::other(format!("rsshub engine: open bun zip: {e}")))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| AppError::other(format!("rsshub engine: invalid bun zip: {e}")))?;
+
+    let bin_dir = dest_bin
+        .parent()
+        .ok_or_else(|| AppError::other("rsshub engine: invalid bin destination"))?;
+    std::fs::create_dir_all(bin_dir)
+        .map_err(|e| AppError::other(format!("rsshub engine: create bin dir: {e}")))?;
+
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| AppError::other(format!("rsshub engine: read zip entry: {e}")))?;
+        let Some(rel) = entry.enclosed_name() else {
+            return Err(AppError::other(format!(
+                "rsshub engine: unsafe path in bun zip: {:?}",
+                entry.name()
+            )));
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let is_symlink = entry.is_symlink()
+            || entry
+                .unix_mode()
+                .is_some_and(|m| (m & 0o170000) == 0o120000);
+        if is_symlink {
+            continue;
+        }
+        if rel.file_name().and_then(|n| n.to_str()) != Some(expected_name) {
+            continue;
+        }
+        if entry.size() > MAX_BUN_BINARY_BYTES {
+            return Err(AppError::other(
+                "rsshub engine: bun binary in zip exceeds size cap",
+            ));
+        }
+
+        let tmp_bin = bin_dir.join(format!(".bun-tmp-{}", std::process::id()));
+        let write_result = (|| -> AppResult<()> {
+            let mut out = std::fs::File::create(&tmp_bin)
+                .map_err(|e| AppError::other(format!("rsshub engine: create bun binary: {e}")))?;
+            let mut buf = [0u8; 64 * 1024];
+            let mut total: u64 = 0;
+            loop {
+                let n = entry
+                    .read(&mut buf)
+                    .map_err(|e| AppError::other(format!("rsshub engine: read bun binary: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                total = total.saturating_add(n as u64);
+                if total > MAX_BUN_BINARY_BYTES {
+                    return Err(AppError::other(
+                        "rsshub engine: extracted bun binary exceeds size cap",
+                    ));
+                }
+                out.write_all(&buf[..n]).map_err(|e| {
+                    AppError::other(format!("rsshub engine: write bun binary: {e}"))
+                })?;
+            }
+            out.flush()
+                .map_err(|e| AppError::other(format!("rsshub engine: flush bun binary: {e}")))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp_bin, std::fs::Permissions::from_mode(0o755)).map_err(
+                    |e| AppError::other(format!("rsshub engine: chmod bun binary: {e}")),
+                )?;
+            }
+            if dest_bin.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(dest_bin);
+            }
+            std::fs::rename(&tmp_bin, dest_bin)
+                .map_err(|e| AppError::other(format!("rsshub engine: place bun binary: {e}")))?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_bin);
+        }
+        return write_result;
+    }
+
+    Err(AppError::other(format!(
+        "rsshub engine: {expected_name} not found in downloaded zip"
+    )))
+}
+
+/// Assemble the engine child's environment and enforce the execve size
+/// budget: allowlisted host variables first, then the user's route variables
+/// (winning on collision), then the manager's own fixed variables — which
+/// the user's route variables must NOT override (`PORT` must match the port
+/// the health check probes, `LISTEN_INADDR_ANY=0` keeps RSSHub bound to
+/// 127.0.0.1, and `RSSHUB_MAGPIE_HOST=1` enables the magpie server host mode).
+/// When `<engine_root>/browser` is a non-empty directory,
+/// `PLAYWRIGHT_BROWSERS_PATH` is pinned to it so `patchright` resolves the
+/// installed Chromium instead of hunting the host or attempting a download.
+fn build_child_env(
+    user_env: &BTreeMap<String, String>,
+    port: u16,
+    engine_root: &Path,
+) -> AppResult<BTreeMap<String, String>> {
+    let mut env = allowlisted_host_env();
     env.extend(user_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env.insert("PORT".into(), port.to_string());
     env.insert("NODE_ENV".into(), "production".into());
     env.insert("LISTEN_INADDR_ANY".into(), "0".into());
-    env.insert("NODE_OPTIONS".into(), "--max-http-header-size=32768".into());
-    // The bundled Node verifies upstream TLS against its own bundled CA store
-    // and never sees the OS trust store — a MITM proxy's root installed into
-    // the system keychain (Surge's generated CA, a corporate inspector) makes
-    // every route fetch to an intercepted host fail with `self-signed
-    // certificate in certificate chain`. `NODE_USE_SYSTEM_CA` adds the OS
-    // store alongside the bundled one (supported from Node 22.19.0 and
-    // 24.6.0; on older engines the variable is simply ignored and the
-    // behaviour is unchanged), so routes reach those hosts exactly like the
-    // desktop app's own client does.
-    env.insert("NODE_USE_SYSTEM_CA".into(), "1".into());
-    let bundled_browser = version_dir.join("browser");
-    if bundled_browser.is_dir() {
-        // `to_string_lossy`: an engine root with non-UTF8 bytes is not a
-        // thing this code creates, and patchright's env parsing wants a
-        // String anyway — the lossy form keeps a pathological root from
-        // failing the whole spawn.
+    env.insert("RSSHUB_MAGPIE_HOST".into(), "1".into());
+
+    let browser_dir = EngineManager::browser_dir(engine_root);
+    if dir_is_non_empty(&browser_dir) {
         env.insert(
             "PLAYWRIGHT_BROWSERS_PATH".into(),
-            bundled_browser.to_string_lossy().into_owned(),
+            browser_dir.to_string_lossy().into_owned(),
         );
         env.insert("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD".into(), "1".into());
     }
@@ -681,8 +1167,8 @@ fn build_child_env(
 
 /// Map a spawn failure onto the coded error space: `E2BIG` means the
 /// environment/argv budget check above was still too permissive for what
-/// this kernel accepts right now (budgets are advisory limits, errno is the
-/// truth) — surface the same actionable code instead of a cryptic OS error.
+/// this kernel accepts right now — surface the same actionable code instead
+/// of a cryptic OS error.
 fn map_spawn_error(err: &std::io::Error) -> AppError {
     #[cfg(unix)]
     if err.raw_os_error().is_some_and(|code| code == E2BIG) {
@@ -704,9 +1190,6 @@ pub(crate) async fn wait_healthy(port: u16, budget: Duration) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        // A short per-request timeout: a probe answers "is a server there",
-        // and a wedged process must not hold the probe for the route-fetch
-        // budget the client defaults to.
         if let Ok(_resp) = client.get(&url).timeout(PROBE_TIMEOUT).send().await {
             return true;
         }
@@ -751,274 +1234,6 @@ fn spawn_idle_watcher(
     })
 }
 
-/// Validate an extracted staging tree: the manifest plus a node binary plus
-/// the RSSHub entry script. Returns the manifest.
-fn validate_staging(staging: &Path) -> AppResult<EngineInfo> {
-    let manifest_path = staging.join("engine.json");
-    let raw = std::fs::read_to_string(&manifest_path)
-        .map_err(|_| AppError::code(CODE_ARCHIVE_INVALID))?;
-    let info: EngineInfo =
-        serde_json::from_str(&raw).map_err(|_| AppError::code(CODE_ARCHIVE_INVALID))?;
-    let node = if cfg!(windows) {
-        staging.join("bin").join("node.exe")
-    } else {
-        staging.join("bin").join("node")
-    };
-    // The two executed files must be *regular* files, not symlinks: a link
-    // would be followed at spawn/parse time, letting a crafted archive run a
-    // host binary instead of the bundled runtime. (`is_file` follows links.)
-    let is_regular = |p: &Path| p.symlink_metadata().map(|m| m.is_file()).unwrap_or(false);
-    let entry = EngineManager::entry_script(staging);
-    if !is_regular(&node) || !entry.as_ref().is_some_and(|p| is_regular(p)) {
-        return Err(AppError::code(CODE_ARCHIVE_INVALID));
-    }
-    // A browser-flavor archive ships its headless Chromium under `browser/`
-    // (the directory `build_child_env` pins `PLAYWRIGHT_BROWSERS_PATH` at).
-    // Installing one without it would boot fine and then 500 on every
-    // `requirePuppeteer` route, so refuse the install instead.
-    if info.is_browser_flavor() {
-        let browser = staging.join("browser");
-        let populated = std::fs::read_dir(&browser)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        if !populated {
-            return Err(AppError::code(CODE_ARCHIVE_INVALID));
-        }
-    }
-    Ok(info)
-}
-
-/// Blocking installer: extract → validate → atomically swap into
-/// `<root>/<version>` → write the root manifest.
-fn install_archive_blocking(root: &Path, archive: &Path) -> AppResult<EngineInfo> {
-    std::fs::create_dir_all(root)
-        .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
-    let staging = root.join(format!(
-        ".staging-{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_millis()
-    ));
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| AppError::other(format!("rsshub engine: staging: {e}")))?;
-
-    let result = extract_archive(archive, &staging)
-        .and_then(|()| validate_staging(&staging))
-        .and_then(|info| {
-            let dest = EngineManager::version_dir(&info, root)?;
-            // Replace any previous build of the same version atomically
-            // enough for our purposes: stage fully, then a single rename.
-            if dest.exists() {
-                std::fs::remove_dir_all(&dest)
-                    .map_err(|e| AppError::other(format!("rsshub engine: replace old: {e}")))?;
-            }
-            std::fs::rename(&staging, &dest)
-                .map_err(|e| AppError::other(format!("rsshub engine: finalize: {e}")))?;
-            let manifest = EngineInfo {
-                installed_at: chrono::Utc::now().to_rfc3339(),
-                ..info
-            };
-            std::fs::write(
-                root.join("engine.json"),
-                serde_json::to_vec_pretty(&manifest)
-                    .map_err(|e| AppError::other(format!("rsshub engine: manifest: {e}")))?,
-            )
-            .map_err(|e| AppError::other(format!("rsshub engine: manifest: {e}")))?;
-            Ok(manifest)
-        });
-
-    if result.is_err() {
-        // Never leave a half-extracted staging tree behind.
-        let _ = std::fs::remove_dir_all(&staging);
-    }
-    result
-}
-
-/// Extract `archive` (tar.gz / tgz / zip, detected by magic bytes then
-/// extension) into `dest`, refusing entries that would escape it.
-fn extract_archive(archive: &Path, dest: &Path) -> AppResult<()> {
-    let mut magic = [0u8; 2];
-    let kind = std::fs::File::open(archive)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .map_err(|e| AppError::other(format!("rsshub engine: read archive: {e}")))
-        .map(|()| match magic {
-            [0x1f, 0x8b] => ArchiveKind::TarGz,
-            [0x50, 0x4b] => ArchiveKind::Zip,
-            _ => ArchiveKind::Unknown,
-        })?;
-    match kind {
-        ArchiveKind::TarGz => extract_tar_gz(archive, dest),
-        ArchiveKind::Zip => extract_zip(archive, dest),
-        ArchiveKind::Unknown => Err(AppError::code(CODE_ARCHIVE_INVALID)),
-    }
-}
-
-enum ArchiveKind {
-    TarGz,
-    Zip,
-    Unknown,
-}
-
-/// `true` when `candidate` — an archive entry path joined under `dest` —
-/// stays inside `dest` (zip-slip / tar traversal guard).
-fn stays_within(dest: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(dest)
-}
-
-/// `true` when a link entry's *target*, resolved lexically against the
-/// directory holding the link, stays inside `dest`.
-///
-/// The engine archive legitimately contains symlinks (pnpm's `node_modules`
-/// layout is built from relative links), so links cannot simply be refused —
-/// but a link whose target escapes the staging tree would let a crafted
-/// archive point `bin/node` or `app/dist/index.js` at any host executable,
-/// which the manager then runs. Absolute targets and `..`-escapes are
-/// rejected; relative targets that resolve inside the tree pass.
-fn link_stays_within(dest: &Path, link_dir: &Path, target: &Path) -> bool {
-    if target.is_absolute() {
-        return false;
-    }
-    let mut resolved = link_dir.to_path_buf();
-    for part in target.components() {
-        match part {
-            std::path::Component::Normal(p) => resolved.push(p),
-            std::path::Component::ParentDir => {
-                if !resolved.pop() {
-                    return false;
-                }
-            }
-            std::path::Component::CurDir => {}
-            // A relative link target cannot contain RootDir/Prefix, but if a
-            // crafted one does, refuse it outright.
-            _ => return false,
-        }
-    }
-    stays_within(dest, &resolved)
-}
-
-/// Running total of extracted bytes, shared by both extractors. Refuses a
-/// compressed bomb whose declared sizes blow past [`MAX_EXTRACTED_BYTES`].
-#[derive(Default)]
-struct ExtractBudget(u64);
-
-impl ExtractBudget {
-    /// Charge `n` bytes; `false` when the cap is exceeded.
-    fn charge(&mut self, n: u64) -> bool {
-        self.0 = self.0.saturating_add(n);
-        self.0 <= MAX_EXTRACTED_BYTES
-    }
-}
-
-fn extract_tar_gz(archive: &Path, dest: &Path) -> AppResult<()> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| AppError::other(format!("rsshub engine: open archive: {e}")))?;
-    let gz = flate2::read::GzDecoder::new(file);
-    let mut tar = tar::Archive::new(gz);
-    tar.set_preserve_permissions(true);
-    let mut budget = ExtractBudget::default();
-    for entry in tar
-        .entries()
-        .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?
-    {
-        let mut entry =
-            entry.map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?;
-        let path = entry
-            .path()
-            .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?
-            .into_owned();
-        let target = dest.join(&path);
-        if !stays_within(dest, &target) {
-            log::warn!("rsshub engine: skipping archive entry outside root: {path:?}");
-            continue;
-        }
-        // Link entries need their target validated too — `unpack` would
-        // happily create a symlink pointing anywhere on the host, and a link
-        // on `bin/node` or the entry script would redirect execution. Real
-        // archives only ever carry in-tree relative links, so an escaping
-        // link fails the install instead of being silently skipped.
-        let header_type = entry.header().entry_type();
-        if header_type.is_symlink() || header_type.is_hard_link() {
-            let link_target = entry
-                .link_name()
-                .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?
-                .ok_or_else(|| AppError::code(CODE_ARCHIVE_INVALID))?;
-            let link_dir = target.parent().unwrap_or(dest).to_path_buf();
-            if !link_stays_within(dest, &link_dir, &link_target) {
-                log::warn!(
-                    "rsshub engine: refusing link entry escaping the root: {path:?} -> {link_target:?}"
-                );
-                return Err(AppError::code(CODE_ARCHIVE_INVALID));
-            }
-            entry
-                .unpack(&target)
-                .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-            continue;
-        }
-        let entry_size = entry
-            .header()
-            .size()
-            .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?;
-        if !budget.charge(entry_size) {
-            log::warn!("rsshub engine: archive expands past the extraction cap");
-            return Err(AppError::code(CODE_ARCHIVE_INVALID));
-        }
-        entry
-            .unpack(&target)
-            .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-    }
-    Ok(())
-}
-
-fn extract_zip(archive: &Path, dest: &Path) -> AppResult<()> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| AppError::other(format!("rsshub engine: open archive: {e}")))?;
-    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?;
-    let mut budget = ExtractBudget::default();
-    for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| AppError::other(format!("rsshub engine: archive: {e}")))?;
-        let Some(rel) = entry.enclosed_name() else {
-            log::warn!(
-                "rsshub engine: skipping unsafe zip entry: {:?}",
-                entry.name()
-            );
-            continue;
-        };
-        let target = dest.join(rel);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-        } else {
-            // The zip crate reports the *declared* uncompressed size up front;
-            // counting actual copied bytes guards against a lying header.
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-            }
-            let mut out = std::fs::File::create(&target)
-                .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                let n = entry
-                    .read(&mut chunk)
-                    .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-                if n == 0 {
-                    break;
-                }
-                if !budget.charge(n as u64) {
-                    log::warn!("rsshub engine: archive expands past the extraction cap");
-                    return Err(AppError::code(CODE_ARCHIVE_INVALID));
-                }
-                out.write_all(&chunk[..n])
-                    .map_err(|e| AppError::other(format!("rsshub engine: unpack: {e}")))?;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,233 +1247,247 @@ mod tests {
         dir
     }
 
-    /// Build a valid engine tree and tar.gz it, returning (archive, manifest).
-    fn make_targz(root: &Path, node_file_body: &str) -> (PathBuf, EngineInfo) {
-        let build = root.join("build");
-        let app = build.join("app").join("dist");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(build.join("bin")).unwrap();
-        std::fs::write(build.join("bin").join("node"), node_file_body).unwrap();
-        std::fs::write(app.join("index.js"), "// entry\n").unwrap();
-        let info = EngineInfo {
-            version: "1".into(),
-            flavor: "standard".into(),
-            rsshub_revision: "abcdef123456".into(),
-            node_version: "v22.0.0".into(),
-            installed_at: "2026-01-01T00:00:00Z".into(),
-        };
+    fn make_installed_v2(root: &Path, flavor: &str, rsshub_ver: &str, bun_script: &str) {
+        let bin_dir = root.join("bin");
+        let app_dir = root.join("app");
+        let rsshub_dir = app_dir.join("node_modules").join("rsshub");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&rsshub_dir).unwrap();
+
+        let bun = EngineManager::bun_bin(root);
+        std::fs::write(&bun, bun_script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(app_dir.join("package.json"), APP_PACKAGE_JSON).unwrap();
+        std::fs::write(app_dir.join("server.mjs"), APP_SERVER_MJS).unwrap();
         std::fs::write(
-            build.join("engine.json"),
-            serde_json::to_vec(&info).unwrap(),
+            rsshub_dir.join("package.json"),
+            format!(r#"{{"name":"rsshub","version":"{rsshub_ver}"}}"#),
         )
         .unwrap();
 
-        let archive = root.join("engine.tar.gz");
-        let tar_gz = std::fs::File::create(&archive).unwrap();
-        let enc = flate2::write::GzEncoder::new(tar_gz, flate2::Compression::fast());
-        let mut tar = tar::Builder::new(enc);
-        // Archive entries are relative, rooted at the build dir.
-        tar.append_dir_all(".", &build).unwrap();
-        tar.into_inner().unwrap().finish().unwrap();
-        (archive, info)
-    }
+        if flavor == "browser" {
+            std::fs::create_dir_all(root.join("browser").join("chromium-1")).unwrap();
+        }
 
-    fn make_zip(root: &Path) -> PathBuf {
-        let build = root.join("build-zip");
-        let app = build.join("app").join("dist");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(build.join("bin")).unwrap();
-        std::fs::write(build.join("bin").join("node"), "binary").unwrap();
-        std::fs::write(app.join("index.js"), "// entry\n").unwrap();
         let info = EngineInfo {
             version: "2".into(),
-            flavor: "standard".into(),
-            rsshub_revision: "rev".into(),
-            node_version: "v22".into(),
-            installed_at: "x".into(),
-        };
-        std::fs::write(
-            build.join("engine.json"),
-            serde_json::to_vec(&info).unwrap(),
-        )
-        .unwrap();
-        let archive = root.join("engine.zip");
-        let file = std::fs::File::create(&archive).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::SimpleFileOptions = Default::default();
-        for rel in ["engine.json", "bin/node", "app/dist/index.js"] {
-            zip.start_file(rel, opts).unwrap();
-            zip.write_all(&std::fs::read(build.join(rel)).unwrap())
-                .unwrap();
-        }
-        zip.finish().unwrap();
-        archive
-    }
-
-    #[tokio::test]
-    async fn install_from_targz_lays_out_and_reports() {
-        let root = temp_root("targz");
-        let (archive, built) = make_targz(&root, "binary");
-        let mgr = EngineManager::new(root.join("install"));
-        let info = mgr.install_from_archive(&archive).await.unwrap();
-        // The archive's manifest carries the build data; the installer stamps
-        // its own `installed_at`, so that field is expected to differ.
-        assert_eq!(info.version, built.version);
-        assert_eq!(info.rsshub_revision, built.rsshub_revision);
-        assert_eq!(info.node_version, built.node_version);
-        assert_ne!(info.installed_at, built.installed_at);
-        let stored = mgr.info().unwrap();
-        assert_eq!(stored, info);
-        let dir = root.join("install").join("1");
-        assert!(dir.join("bin").join("node").is_file());
-        assert!(dir.join("app").join("dist").join("index.js").is_file());
-        assert_eq!(
-            EngineManager::entry_script(&dir),
-            Some(dir.join("app").join("dist").join("index.js"))
-        );
-        assert!(mgr.installed());
-        mgr.uninstall().await.unwrap();
-        assert!(!mgr.installed());
-        assert!(!dir.exists());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_from_zip_works() {
-        let root = temp_root("zip");
-        let archive = make_zip(&root);
-        let mgr = EngineManager::new(root.join("install"));
-        let info = mgr.install_from_archive(&archive).await.unwrap();
-        assert_eq!(info.version, "2");
-        assert!(
-            root.join("install")
-                .join("2")
-                .join("bin")
-                .join("node.exe")
-                .is_file()
-                || root
-                    .join("install")
-                    .join("2")
-                    .join("bin")
-                    .join("node")
-                    .is_file()
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_rejects_garbage_archive() {
-        let root = temp_root("garbage");
-        let bad = root.join("bad.bin");
-        std::fs::write(&bad, b"this is not an archive").unwrap();
-        let mgr = EngineManager::new(root.join("install"));
-        let err = mgr.install_from_archive(&bad).await.unwrap_err();
-        assert_eq!(err.code_str(), CODE_ARCHIVE_INVALID);
-        assert!(!mgr.installed());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A staging tree for `validate_staging`: manifest + node + entry, with
-    /// the manifest's flavor and an optional populated `browser/` dir.
-    fn make_staging(root: &Path, tag: &str, flavor: &str, with_browser: bool) -> PathBuf {
-        let staging = root.join(format!("staging-{tag}"));
-        let app = staging.join("app").join("dist");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(staging.join("bin")).unwrap();
-        // `node_bin` picks the platform-correct name (node.exe on Windows),
-        // matching what `validate_staging` looks for.
-        std::fs::write(EngineManager::node_bin(&staging), "binary").unwrap();
-        std::fs::write(app.join("index.js"), "// entry\n").unwrap();
-        let info = EngineInfo {
-            version: "1".into(),
             flavor: flavor.into(),
-            rsshub_revision: "rev".into(),
-            node_version: "v24".into(),
-            installed_at: "x".into(),
+            rsshub_version: rsshub_ver.into(),
+            bun_version: "1.2.0".into(),
+            installed_at: "2026-11-26T00:00:00Z".into(),
         };
-        std::fs::write(
-            staging.join("engine.json"),
-            serde_json::to_vec(&info).unwrap(),
-        )
-        .unwrap();
-        if with_browser {
-            // One registry entry — validate_staging only asks that the
-            // directory exists and is populated, matching what the
-            // `patchright install` step produces.
-            std::fs::create_dir_all(staging.join("browser").join("chromium-1")).unwrap();
+        write_manifest_atomic(root, &info).unwrap();
+    }
+
+    fn make_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(buf);
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        for (name, content) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(content).unwrap();
         }
-        staging
+        zip.finish().unwrap().into_inner()
     }
 
     #[test]
-    fn validate_staging_requires_browser_dir_for_browser_flavor() {
-        let root = temp_root("validate-browser");
-        // flavor=browser without a populated browser/ dir: would boot fine
-        // and then 500 on every requirePuppeteer route — refuse the install.
-        let missing = make_staging(&root, "missing", "browser", false);
-        assert_eq!(
-            validate_staging(&missing).unwrap_err().code_str(),
-            CODE_ARCHIVE_INVALID
-        );
-        // Populated: accepted.
-        let ok = make_staging(&root, "ok", "browser", true);
-        assert!(validate_staging(&ok).is_ok());
-        // The standard flavor never needs a browser dir (and must not gain
-        // the requirement).
-        let standard = make_staging(&root, "standard", "standard", false);
-        assert!(validate_staging(&standard).is_ok());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_replaces_same_version() {
-        let root = temp_root("replace");
-        let (archive, _) = make_targz(&root, "v1 body");
-        let mgr = EngineManager::new(root.join("install"));
-        mgr.install_from_archive(&archive).await.unwrap();
-        // Rebuild the archive with different content, same version.
-        let (archive2, _) = make_targz(&root, "v2 body");
-        mgr.install_from_archive(&archive2).await.unwrap();
-        let body = std::fs::read_to_string(root.join("install").join("1").join("bin").join("node"))
-            .unwrap();
-        assert_eq!(body, "v2 body");
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_from_url_verifies_checksum() {
-        let root = temp_root("url");
-        let (archive, _) = make_targz(&root, "binary");
-        let expected = {
-            let mut f = std::fs::File::open(&archive).unwrap();
-            let mut hasher = Sha256::new();
-            std::io::copy(&mut f, &mut hasher).unwrap();
-            format!("{:x}", hasher.finalize())
-        };
-        let body = std::fs::read(&archive).unwrap();
-        let server = tiny_server(body);
-        let url = format!("http://127.0.0.1:{}/engine.tar.gz", server.port);
-        let client = reqwest::Client::new();
-        let mgr = EngineManager::new(root.join("install"));
-        // Wrong checksum is refused before extraction.
-        let err = mgr
-            .install_from_url(&url, &client, Some("deadbeef"))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code_str(), CODE_ARCHIVE_CHECKSUM);
-        // Correct checksum installs.
-        let info = mgr
-            .install_from_url(&url, &client, Some(&expected))
-            .await
-            .unwrap();
+    fn engine_info_deserializes_legacy_aliases_and_camel_case() {
+        let json = r#"{
+            "version": "1",
+            "flavor": "standard",
+            "rsshubRevision": "abcdef",
+            "nodeVersion": "v22.0.0",
+            "installedAt": "2026-01-01T00:00:00Z"
+        }"#;
+        let info: EngineInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.version, "1");
+        assert_eq!(info.rsshub_version, "abcdef");
+        assert_eq!(info.bun_version, "v22.0.0");
+
+        let v2 = EngineInfo {
+            version: "2".into(),
+            flavor: "browser".into(),
+            rsshub_version: "2026.11.20".into(),
+            bun_version: "1.3.0".into(),
+            installed_at: "2026-11-26T00:00:00Z".into(),
+        };
+        let serialized = serde_json::to_string(&v2).unwrap();
+        assert!(serialized.contains("\"rsshubVersion\":\"2026.11.20\""));
+        assert!(serialized.contains("\"bunVersion\":\"1.3.0\""));
+        assert!(serialized.contains("\"installedAt\":\"2026-11-26T00:00:00Z\""));
+        assert!(v2.is_browser_flavor());
+    }
+
+    #[tokio::test]
+    async fn legacy_v1_layout_is_treated_as_uninstalled_and_cleaned_up() {
+        let root = temp_root("v1-cleanup");
+        let v1_dir = root.join("1").join("bin");
+        std::fs::create_dir_all(&v1_dir).unwrap();
+        std::fs::write(v1_dir.join("node"), "old-node").unwrap();
+        std::fs::write(root.join("engine.log"), "keep-me\n").unwrap();
+        std::fs::write(
+            root.join("engine.json"),
+            r#"{"version":"1","flavor":"standard","rsshubRevision":"abc","nodeVersion":"v22"}"#,
+        )
+        .unwrap();
+
+        let mgr = EngineManager::new(root.clone());
+        assert!(!mgr.installed());
+        assert!(mgr.info().is_none());
+
+        cleanup_legacy_layout(&root).unwrap();
+        assert!(!root.join("1").exists());
+        assert!(!root.join("engine.json").exists());
+        assert!(root.join("engine.log").is_file());
+
+        // Uninstall also removes v1 layouts cleanly while preserving engine.log.
+        std::fs::create_dir_all(root.join("1")).unwrap();
+        mgr.uninstall().await.unwrap();
+        assert!(!root.join("1").exists());
+        assert!(root.join("engine.log").is_file());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn extract_bun_from_zip_extracts_only_bun_and_guards_zip_slip() {
+        let root = temp_root("zip-extract");
+        let zip_path = root.join("bun.zip");
+        let dest_bin = root.join("install").join("bin").join(EngineManager::bun_filename());
+
+        let good_zip = make_zip_bytes(&[
+            ("bun-darwin-aarch64/README.md", b"ignored"),
+            (
+                &format!("bun-darwin-aarch64/{}", EngineManager::bun_filename()),
+                b"bun-binary-bytes",
+            ),
+        ]);
+        std::fs::write(&zip_path, good_zip).unwrap();
+        extract_bun_from_zip(&zip_path, &dest_bin, EngineManager::bun_filename()).unwrap();
+        assert_eq!(std::fs::read(&dest_bin).unwrap(), b"bun-binary-bytes");
+        assert!(!root.join("install").join("bin").join("README.md").exists());
+
+        // Zip-slip / path traversal entry must be rejected.
+        let evil_zip = make_zip_bytes(&[(
+            &format!("../../{}", EngineManager::bun_filename()),
+            b"evil",
+        )]);
+        std::fs::write(&zip_path, evil_zip).unwrap();
+        let err = extract_bun_from_zip(&zip_path, &dest_bin, EngineManager::bun_filename())
+            .unwrap_err();
+        assert!(err.to_string().contains("unsafe path"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_bun_reuses_valid_binary_and_falls_back_from_broken_mirror() {
+        let root = temp_root("ensure-bun");
+        let install_root = root.join("install");
+        std::fs::create_dir_all(install_root.join("bin")).unwrap();
+
+        let fake_bun = "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"1.2.3\"; exit 0; fi\n";
+        let zip_bytes = make_zip_bytes(&[(
+            &format!("bun-linux-x64/{}", EngineManager::bun_filename()),
+            fake_bun.as_bytes(),
+        )]);
+
+        let bad_server = TinyServer::new(b"not a zip".to_vec());
+        let good_server = TinyServer::new(zip_bytes);
+
+        let client = reqwest::Client::new();
+        let ver = ensure_bun_with_urls(
+            &install_root,
+            &client,
+            &[
+                format!("http://127.0.0.1:{}/mirror.zip", bad_server.port),
+                format!("http://127.0.0.1:{}/direct.zip", good_server.port),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(ver, "1.2.3");
+        assert!(is_executable_regular_file(&EngineManager::bun_bin(&install_root)));
+
+        bad_server.shutdown();
+        good_server.shutdown();
+
+        // Second call reuses existing binary without hitting any URL.
+        let reused = ensure_bun_with_urls(&install_root, &client, &[]).await.unwrap();
+        assert_eq!(reused, "1.2.3");
+
+        // A symlink at bin/bun must NOT be trusted/reused.
+        let bun_path = EngineManager::bun_bin(&install_root);
+        let outside = root.join("outside-bun");
+        std::fs::write(&outside, fake_bun).unwrap();
+        std::fs::remove_file(&bun_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &bun_path).unwrap();
+        assert!(!is_executable_regular_file(&bun_path));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_update_compares_installed_against_registry() {
+        let root = temp_root("check-update");
+        let install_root = root.join("install");
+        let server = TinyServer::new(br#"{"name":"rsshub","version":"2.5.0"}"#.to_vec());
+        let url = format!("http://127.0.0.1:{}/rsshub/latest", server.port);
+        let client = reqwest::Client::new();
+        let mgr = EngineManager::new(install_root.clone());
+
+        // Not installed yet -> updateAvailable = true, currentVersion = None.
+        let res = mgr.check_update_from_url(&client, &url).await.unwrap();
+        assert_eq!(
+            res,
+            EngineUpdateInfo {
+                current_version: None,
+                latest_version: "2.5.0".into(),
+                update_available: true,
+            }
+        );
+
+        // Installed older version -> updateAvailable = true.
+        make_installed_v2(&install_root, "standard", "2.4.0", "#!/bin/sh\n");
+        let res = mgr.check_update_from_url(&client, &url).await.unwrap();
+        assert!(res.update_available);
+        assert_eq!(res.current_version.as_deref(), Some("2.4.0"));
+
+        // Installed matching version -> updateAvailable = false.
+        make_installed_v2(&install_root, "standard", "2.5.0", "#!/bin/sh\n");
+        let res = mgr.check_update_from_url(&client, &url).await.unwrap();
+        assert!(!res.update_available);
+        assert_eq!(res.current_version.as_deref(), Some("2.5.0"));
+
         server.shutdown();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
+    async fn uninstall_browser_removes_browser_dir_and_resets_flavor() {
+        let root = temp_root("uninstall-browser");
+        make_installed_v2(&root, "browser", "2.5.0", "#!/bin/sh\n");
+        let mgr = EngineManager::new(root.clone());
+        assert!(mgr.info().unwrap().is_browser_flavor());
+        assert!(root.join("browser").is_dir());
+
+        let updated = mgr.uninstall_browser().await.unwrap();
+        assert_eq!(updated.flavor, "standard");
+        assert!(!updated.is_browser_flavor());
+        assert!(!root.join("browser").exists());
+        assert_eq!(mgr.info().unwrap().flavor, "standard");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
     async fn wait_healthy_accepts_any_http_response() {
-        let server = tiny_server(b"ok".to_vec());
+        let server = TinyServer::new(b"ok".to_vec());
         assert!(wait_healthy(server.port, Duration::from_secs(3)).await);
         server.shutdown();
     }
@@ -1280,33 +1509,26 @@ mod tests {
 
     #[test]
     fn build_child_env_layers_host_user_and_fixed_vars() {
-        // The manager's own variables survive a colliding user entry: PORT,
-        // NODE_ENV, LISTEN_INADDR_ANY and NODE_OPTIONS are not user-overrideable.
         let mut user = BTreeMap::new();
         user.insert("PORT".to_string(), "99999".to_string());
+        user.insert("RSSHUB_MAGPIE_HOST".to_string(), "0".to_string());
         user.insert("MY_TOKEN".to_string(), "secret".to_string());
         let dir = temp_root("env-nodir");
         let env = build_child_env(&user, 49152, &dir).unwrap();
         assert_eq!(env.get("PORT").map(String::as_str), Some("49152"));
         assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
         assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
+        assert_eq!(env.get("RSSHUB_MAGPIE_HOST").map(String::as_str), Some("1"));
         assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
-        // The system trust store joins the bundled CAs, so routes reach hosts
-        // behind a keychain-installed MITM proxy's root.
-        assert_eq!(env.get("NODE_USE_SYSTEM_CA").map(String::as_str), Some("1"));
-        // A standard engine (no `browser/` dir) must not advertise a browser
-        // registry — patchright would then look for a browser that is not
-        // there instead of failing the route cleanly.
-        assert!(!env.contains_key("PLAYWRIGHT_BROWSERS_PATH"));
+        // Empty or missing browser/ dir must not advertise PLAYWRIGHT_BROWSERS_PATH.
+        std::fs::create_dir_all(dir.join("browser")).unwrap();
+        let env2 = build_child_env(&user, 49152, &dir).unwrap();
+        assert!(!env2.contains_key("PLAYWRIGHT_BROWSERS_PATH"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn build_child_env_pins_the_bundled_browser_registry() {
-        // The browser flavor's `<version dir>/browser` pins
-        // PLAYWRIGHT_BROWSERS_PATH on the fixed layer — a user route variable
-        // of the same name must not redirect patchright away from the
-        // bundled Chromium.
         let dir = temp_root("env-browser");
         std::fs::create_dir_all(dir.join("browser").join("chromium-1")).unwrap();
         let mut user = BTreeMap::new();
@@ -1328,9 +1550,6 @@ mod tests {
 
     #[test]
     fn build_child_env_refuses_budget_overrun() {
-        // Individually valid entries (each well under the per-value ceiling)
-        // must still trip the *total* budget instead of failing execve with
-        // E2BIG later.
         let mut user = BTreeMap::new();
         for i in 0..24 {
             user.insert(format!("BULK_VAR_{i}"), "v".repeat(60_000));
@@ -1343,21 +1562,13 @@ mod tests {
 
     #[test]
     fn budget_tracks_the_platform_arg_max() {
-        // A generous ARG_MAX (macOS: 1 MiB) is capped by the sanity ceiling;
-        // Linux's big-stack 2 MiB case likewise.
         assert_eq!(
             budget_for(Some(1024 * 1024)),
             MAX_TOTAL_ENV_BYTES - ARGV_HEADROOM_BYTES
         );
         assert_eq!(budget_for(Some(4 * 1024 * 1024)), MAX_TOTAL_ENV_BYTES);
-        // A small RLIMIT_STACK (512 KiB → ARG_MAX 128 KiB on Linux) shrinks
-        // the budget instead of letting the spawn fail with E2BIG; the floor
-        // keeps it above zero. The Linux kernel floors ARG_MAX at 32 pages
-        // (128 KiB), which stays above the floor budget.
         assert_eq!(budget_for(Some(32 * 4096)), MIN_ENV_BUDGET_BYTES);
-        // No portable ARG_MAX (non-Unix, or a failed sysconf): the ceiling.
         assert_eq!(budget_for(None), MAX_TOTAL_ENV_BYTES);
-        // The live budget never exceeds what this process's execve accepts.
         if let Some(arg_max) = platform_arg_max() {
             assert!(execve_budget() <= arg_max);
         }
@@ -1377,18 +1588,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ensure_reports_start_failure_when_process_dies() {
-        // A "node" that exits immediately: the health budget expires and
-        // ensure() must surface the coded start failure, not hang.
         let root = temp_root("die");
-        let (archive, _) = make_targz(&root, "binary");
-        let mgr = EngineManager::new(root.join("install"));
-        mgr.install_from_archive(&archive).await.unwrap();
-        // Replace the bundled node with a script that exits at once.
-        let dir = root.join("install").join("1");
-        let node = dir.join("bin").join("node");
-        std::fs::write(&node, "#!/bin/sh\nexit 1\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_installed_v2(&root, "standard", "2.0.0", "#!/bin/sh\nexit 1\n");
+        let mgr = EngineManager::new(root.clone());
 
         let err = mgr
             .cold_start(&BTreeMap::new(), Duration::from_secs(3))
@@ -1402,28 +1604,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ensure_boots_a_fake_engine_and_reuses_it() {
-        // A "node" that listens on $PORT and answers any request: the whole
-        // ensure() state machine — spawn, health, reuse — without RSSHub.
         let root = temp_root("fake");
-        let (archive, _) = make_targz(&root, "binary");
-        let mgr = EngineManager::new(root.join("install"));
-        mgr.install_from_archive(&archive).await.unwrap();
-        let dir = root.join("install").join("1");
-        let node = dir.join("bin").join("node");
-        // The fake engine: a shell wrapper around a python one-liner that
-        // replies 200 to everything on the port we hand it. macOS/Linux dev
-        // machines and CI all ship python3.
-        std::fs::write(
-            &node,
-            "#!/bin/sh\nexec python3 -c \"import os,http.server\n\
+        let fake_bun = "#!/bin/sh\nexec python3 -c \"import os,http.server\n\
              class H(http.server.BaseHTTPRequestHandler):\n\
              \x20 def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n\
              \x20 def log_message(self, *a): pass\n\
-             http.server.HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()\"\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+             http.server.HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()\"\n";
+        make_installed_v2(&root, "standard", "2.0.0", fake_bun);
+        let mgr = EngineManager::new(root.clone());
 
         let port = mgr.ensure(&BTreeMap::new()).await.unwrap();
         assert_eq!(mgr.status().await.port, Some(port));
@@ -1436,141 +1624,37 @@ mod tests {
     }
 
     #[test]
-    fn version_dir_is_sanitized() {
-        let root = Path::new("/tmp/eng");
-        let evil = EngineInfo {
-            version: "sub/../../../etc".into(),
-            flavor: "standard".into(),
-            rsshub_revision: "r".into(),
-            node_version: "n".into(),
-            installed_at: "i".into(),
-        };
-        // Slashes are dropped, but the `..` sequence is rejected outright.
-        assert!(EngineManager::version_dir(&evil, root).is_err());
-        let dotdot = EngineInfo {
-            version: "..".into(),
-            ..evil.clone()
-        };
-        assert!(EngineManager::version_dir(&dotdot, root).is_err());
-        let ok = EngineInfo {
-            version: "1.2.3-beta_1".into(),
-            ..evil.clone()
-        };
+    fn bun_release_asset_maps_supported_platforms() {
         assert_eq!(
-            EngineManager::version_dir(&ok, root).unwrap(),
-            root.join("1.2.3-beta_1")
+            bun_release_asset("macos", "aarch64").unwrap(),
+            "bun-darwin-aarch64.zip"
         );
-    }
+        assert_eq!(
+            bun_release_asset("macos", "x86_64").unwrap(),
+            "bun-darwin-x64.zip"
+        );
+        assert_eq!(
+            bun_release_asset("linux", "x86_64").unwrap(),
+            "bun-linux-x64.zip"
+        );
+        assert_eq!(
+            bun_release_asset("linux", "aarch64").unwrap(),
+            "bun-linux-aarch64.zip"
+        );
+        assert_eq!(
+            bun_release_asset("windows", "x86_64").unwrap(),
+            "bun-windows-x64.zip"
+        );
+        assert!(bun_release_asset("freebsd", "x86_64").is_err());
 
-    /// A tar.gz containing one symlink entry. `target` is the link's target.
-    fn tar_with_symlink(root: &Path, link: &str, target: &str) -> PathBuf {
-        let build = root.join("build-link");
-        std::fs::create_dir_all(build.join("bin")).unwrap();
-        std::fs::write(build.join("bin").join("node"), "binary").unwrap();
-        let app = build.join("app").join("dist");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::write(app.join("index.js"), "// entry\n").unwrap();
-        let info = EngineInfo {
-            version: "1".into(),
-            flavor: "standard".into(),
-            rsshub_revision: "rev".into(),
-            node_version: "v22".into(),
-            installed_at: "x".into(),
-        };
-        std::fs::write(
-            build.join("engine.json"),
-            serde_json::to_vec(&info).unwrap(),
-        )
-        .unwrap();
-
-        let archive = root.join(format!("link-{}.tar.gz", link.replace('/', "_")));
-        let f = std::fs::File::create(&archive).unwrap();
-        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
-        let mut tar = tar::Builder::new(enc);
-        tar.append_dir_all(".", &build).unwrap();
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_mode(0o777);
-        header.set_size(0);
-        header.set_path(Path::new(link)).unwrap();
-        header.set_link_name(Path::new(target)).unwrap();
-        header.set_cksum();
-        tar.append(&header, std::io::empty()).unwrap();
-        tar.into_inner().unwrap().finish().unwrap();
-        archive
-    }
-
-    #[tokio::test]
-    async fn install_rejects_symlink_escaping_the_staging_tree() {
-        let root = temp_root("symlink-escape");
-        let archive = tar_with_symlink(&root, "bin/node-evil", "/etc/passwd");
-        let mgr = EngineManager::new(root.join("install"));
-        let err = mgr.install_from_archive(&archive).await.unwrap_err();
-        assert_eq!(err.code_str(), CODE_ARCHIVE_INVALID);
-        // The failing install leaves no half-extracted version dir, so the
-        // absolute-target symlink is never live on disk.
-        assert!(!root.join("install").join("1").exists());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_rejects_dotdot_symlink_targets() {
-        let root = temp_root("symlink-dotdot");
-        let archive = tar_with_symlink(&root, "app/dist/escape.js", "../../../outside.js");
-        let mgr = EngineManager::new(root.join("install"));
-        let err = mgr.install_from_archive(&archive).await.unwrap_err();
-        assert_eq!(err.code_str(), CODE_ARCHIVE_INVALID);
-        // The failing install leaves no half-extracted version dir.
-        assert!(!root.join("install").join("1").exists());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn install_keeps_relative_symlinks_inside_the_tree() {
-        // Real pnpm archives are full of relative links — they must survive.
-        let root = temp_root("symlink-ok");
-        let archive = tar_with_symlink(&root, "app/dist/linked.js", "index.js");
-        let mgr = EngineManager::new(root.join("install"));
-        mgr.install_from_archive(&archive).await.unwrap();
-        assert!(root
-            .join("install")
-            .join("1")
-            .join("app")
-            .join("dist")
-            .join("linked.js")
-            .symlink_metadata()
-            .is_ok());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn link_guard_decides_lexically() {
-        let dest = Path::new("/tmp/eng");
-        let inside = dest.join("bin");
-        assert!(link_stays_within(dest, &inside, Path::new("node")));
-        assert!(link_stays_within(
-            dest,
-            &inside,
-            Path::new("../app/dist/index.js")
-        ));
-        assert!(!link_stays_within(
-            dest,
-            &inside,
-            Path::new("../../../etc/passwd")
-        ));
-        // An absolute target is always refused — on every platform.
-        assert!(!link_stays_within(dest, &inside, Path::new("/etc/passwd")));
-    }
-
-    #[test]
-    fn extract_budget_refuses_overruns() {
-        let mut b = ExtractBudget::default();
-        assert!(b.charge(MAX_EXTRACTED_BYTES));
-        assert!(!b.charge(1));
+        let cn_urls = bun_download_urls("bun-darwin-aarch64.zip", true);
+        assert_eq!(cn_urls.len(), 2);
+        assert!(cn_urls[0].starts_with(BUN_CN_MIRROR_PREFIX));
+        assert!(cn_urls[1].starts_with(BUN_GITHUB_RELEASE_BASE));
     }
 
     /// A minimal HTTP server on a random loopback port that answers 200 with
-    /// a fixed body — the fake engine for health-check / download tests.
+    /// a fixed body — the fake engine/registry/mirror for tests.
     struct TinyServer {
         port: u16,
         shutdown: std::sync::mpsc::Sender<()>,
@@ -1578,47 +1662,45 @@ mod tests {
     }
 
     impl TinyServer {
+        fn new(body: Vec<u8>) -> Self {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut buf = [0u8; 4096];
+                            let _ = std::io::Read::read(&mut stream, &mut buf);
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
+                            let _ = std::io::Write::write_all(&mut stream, &body);
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            TinyServer {
+                port,
+                shutdown: tx,
+                handle,
+            }
+        }
+
         fn shutdown(self) {
             let _ = self.shutdown.send(());
             self.handle.join().ok();
-        }
-    }
-
-    fn tiny_server(body: Vec<u8>) -> TinyServer {
-        use std::net::TcpListener;
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            // Poll the listener in non-blocking mode with a stop signal —
-            // simple and portable, no async runtime needed here.
-            loop {
-                if rx.try_recv().is_ok() {
-                    return;
-                }
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let _ = std::io::Read::read(&mut stream, &mut buf);
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
-                        let _ = std::io::Write::write_all(&mut stream, &body);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-        TinyServer {
-            port,
-            shutdown: tx,
-            handle,
         }
     }
 }
