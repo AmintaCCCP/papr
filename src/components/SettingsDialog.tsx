@@ -1176,6 +1176,38 @@ function useEnginePendingAction(): EngineAction {
   );
 }
 
+// Same reason as above: a check that finishes after the user switches panes
+// must still show its result on return. The mirror travels with the result so
+// a stale check made against the other registry is ignored.
+type EngineUpdateResult = {
+  mirror: boolean;
+  info: RsshubEngineUpdateInfo;
+} | null;
+
+let engineUpdateResult: EngineUpdateResult = null;
+const engineUpdateListeners = new Set<() => void>();
+
+function setEngineUpdateResult(next: EngineUpdateResult) {
+  engineUpdateResult = next;
+  engineUpdateListeners.forEach((fn) => fn());
+}
+
+const subscribeEngineUpdateResult = (fn: () => void) => {
+  engineUpdateListeners.add(fn);
+  return () => {
+    engineUpdateListeners.delete(fn);
+  };
+};
+const getEngineUpdateResult = () => engineUpdateResult;
+
+function useEngineUpdateResult(): EngineUpdateResult {
+  return useSyncExternalStore(
+    subscribeEngineUpdateResult,
+    getEngineUpdateResult,
+    getEngineUpdateResult,
+  );
+}
+
 function RsshubEngineGroup() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1190,22 +1222,22 @@ function RsshubEngineGroup() {
       return false;
     }
   });
-  const [updateInfo, setUpdateInfo] = useState<RsshubEngineUpdateInfo | null>(
-    null,
-  );
+  const updateResult = useEngineUpdateResult();
   const busyAction = useEnginePendingAction();
 
   const info = status.data?.info ?? null;
   const installed = status.data?.installed ?? false;
   const hasBrowser = info?.flavor === "browser";
   const busy = busyAction !== null;
+  const updateInfo =
+    updateResult?.mirror === cnMirror ? updateResult.info : null;
 
   const refresh = () =>
     qc.invalidateQueries({ queryKey: ["rsshub-engine"] });
 
   const toggleCnMirror = (next: boolean) => {
     setCnMirror(next);
-    setUpdateInfo(null);
+    setEngineUpdateResult(null);
     try {
       localStorage.setItem(RSSHUB_CN_MIRROR_KEY, String(next));
     } catch {
@@ -1228,17 +1260,21 @@ function RsshubEngineGroup() {
     }
   };
 
-  const installOrUpdate = () =>
-    runAction(installed ? "update" : "install", async () => {
+  const installOrUpdate = () => {
+    // Without a settled status we do not know whether this is a first install
+    // (which may resolve `latest`) or an update the user never confirmed.
+    if (!status.isSuccess) return;
+    void runAction(installed ? "update" : "install", async () => {
       await api.engineInstallOrUpdate(cnMirror, updateInfo?.latestVersion);
-      setUpdateInfo(null);
+      setEngineUpdateResult(null);
       await refresh();
     });
+  };
 
   const checkUpdate = () =>
     runAction("check", async () => {
       const res = await api.engineCheckUpdate(cnMirror);
-      setUpdateInfo(res);
+      setEngineUpdateResult({ mirror: cnMirror, info: res });
     });
 
   const installBrowser = () =>
@@ -1256,7 +1292,7 @@ function RsshubEngineGroup() {
   const uninstall = () =>
     runAction("uninstall", async () => {
       await api.engineUninstall();
-      setUpdateInfo(null);
+      setEngineUpdateResult(null);
       await refresh();
     });
 
@@ -1264,6 +1300,8 @@ function RsshubEngineGroup() {
     if (busyAction === "install" || busyAction === "update") {
       return t("settings.rsshub.engineInstallingHint");
     }
+    if (status.isError) return t("settings.rsshub.engineStatusError");
+    if (status.isPending) return t("settings.rsshub.engineStatusLoading");
     if (!installed) return t("settings.rsshub.engineNotInstalledDesc");
     const state = t(
       status.data?.running
@@ -1338,10 +1376,18 @@ function RsshubEngineGroup() {
                 <Icon name="trash" size={13} />
               </button>
             </>
+          ) : status.isError ? (
+            <button
+              className="s-btn"
+              onClick={() => void status.refetch()}
+            >
+              <Icon name="refresh" size={12} />
+              {t("settings.rsshub.engineStatusRetry")}
+            </button>
           ) : (
             <button
               className="s-btn primary"
-              disabled={busy}
+              disabled={busy || status.isPending}
               onClick={installOrUpdate}
             >
               <Icon name="arrow-down" size={12} />

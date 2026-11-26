@@ -290,6 +290,11 @@ pub struct EngineManager {
     /// concurrent `ensure()` callers from each spawning a Bun process and stops
     /// installs/uninstalls from racing a cold start.
     spawn_lock: std::sync::Arc<Mutex<()>>,
+    /// Serializes install/uninstall mutations with each other while leaving
+    /// `spawn_lock` free: a long download or Chromium install must not block a
+    /// cold start (`ensure()` waits on `spawn_lock`). The mutation takes
+    /// `spawn_lock` only for the brief stop-and-publish step.
+    install_lock: std::sync::Arc<Mutex<()>>,
 }
 
 impl EngineManager {
@@ -300,6 +305,7 @@ impl EngineManager {
             root,
             running: std::sync::Arc::new(Mutex::new(None)),
             spawn_lock: std::sync::Arc::new(Mutex::new(())),
+            install_lock: std::sync::Arc::new(Mutex::new(())),
         }
     }
 
@@ -607,7 +613,9 @@ impl EngineManager {
         proxy: &EngineProxyMode,
         target_version: Option<&str>,
     ) -> AppResult<EngineInfo> {
-        let _spawn = self.spawn_lock.lock().await;
+        // Only serializes other installs; the running engine keeps serving and
+        // `ensure()` keeps working during the download.
+        let _install = self.install_lock.lock().await;
 
         std::fs::create_dir_all(&self.root)
             .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
@@ -672,7 +680,7 @@ impl EngineManager {
                 "rsshub engine: installing {rsshub_spec} in staging via {} ({registry_arg})",
                 bun_bin.display()
             );
-            let output = run_bun(cmd, "run bun add").await?;
+            let output = run_bun(cmd, "run bun add", BUN_INSTALL_BUDGET).await?;
             if !output.status.success() {
                 return Err(format_cmd_failure(&format!("bun add {rsshub_spec}"), &output));
             }
@@ -712,7 +720,7 @@ impl EngineManager {
             let v1_browser_dir = self.root.join("1").join("browser");
             let mut browser_plan = BrowserPlan::None;
             let flavor = if browser_dir.exists() {
-                if verify_browser_usable(&bun_bin, &staging_app, &browser_dir).await {
+                if verify_browser_usable(&bun_bin, &staging_app, &browser_dir).await? {
                     "browser".to_string()
                 } else if had_v2_browser {
                     log::info!(
@@ -727,7 +735,7 @@ impl EngineManager {
                         )
                         .await
                         .is_ok()
-                        && verify_browser_usable(&bun_bin, &staging_app, &staging_browser).await
+                        && verify_browser_usable(&bun_bin, &staging_app, &staging_browser).await?
                     {
                         browser_plan = BrowserPlan::SwapStaging(staging_browser.clone());
                         "browser".to_string()
@@ -744,7 +752,7 @@ impl EngineManager {
                     "standard".to_string()
                 }
             } else if v1_browser_dir.exists() {
-                if verify_browser_usable(&bun_bin, &staging_app, &v1_browser_dir).await {
+                if verify_browser_usable(&bun_bin, &staging_app, &v1_browser_dir).await? {
                     browser_plan = BrowserPlan::MigrateV1(v1_browser_dir);
                     "browser".to_string()
                 } else {
@@ -766,6 +774,7 @@ impl EngineManager {
             };
             // Everything is staged and validated: only now stop the running
             // engine, so a failed download or `bun add` leaves it serving.
+            let _spawn = self.spawn_lock.lock().await;
             self.shutdown().await;
             publish_staged_install(&self.root, &staging_app, browser_plan, &info, &stamp)?;
             Ok(info)
@@ -785,8 +794,9 @@ impl EngineManager {
     /// Install the optional headless Chromium runtime (`patchright install chromium`)
     /// into `<engine_root>/browser` and mark the engine flavor as `"browser"`.
     pub async fn install_browser(&self, proxy: &EngineProxyMode) -> AppResult<EngineInfo> {
-        let _spawn = self.spawn_lock.lock().await;
-        self.shutdown().await;
+        // The Chromium download can take minutes; the engine keeps serving (and
+        // cold starts stay free) until the staged browser is verified.
+        let _install = self.install_lock.lock().await;
 
         let mut info = self
             .info()
@@ -809,12 +819,14 @@ impl EngineManager {
 
         let result = async {
             run_patchright_install_chromium(&bun_bin, &app_dir, &staging_browser, proxy).await?;
-            if !verify_browser_usable(&bun_bin, &app_dir, &staging_browser).await {
+            if !verify_browser_usable(&bun_bin, &app_dir, &staging_browser).await? {
                 return Err(AppError::other(
                     "rsshub engine: patchright install chromium did not produce a usable Chromium binary",
                 ));
             }
             info.flavor = "browser".to_string();
+            let _spawn = self.spawn_lock.lock().await;
+            self.shutdown().await;
             swap_browser_dir_and_manifest(&self.root, &staging_browser, &info, &stamp)?;
             Ok(info)
         }
@@ -828,6 +840,7 @@ impl EngineManager {
 
     /// Remove `<engine_root>/browser` and reset the engine flavor to `"standard"`.
     pub async fn uninstall_browser(&self) -> AppResult<EngineInfo> {
+        let _install = self.install_lock.lock().await;
         let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
 
@@ -875,6 +888,7 @@ impl EngineManager {
     /// Remove the installed engine (including any legacy v1 directories and
     /// browser runtime). Stops a running engine first and keeps `engine.log`.
     pub async fn uninstall(&self) -> AppResult<()> {
+        let _install = self.install_lock.lock().await;
         let _spawn = self.spawn_lock.lock().await;
         self.shutdown().await;
         let root = self.root.clone();
@@ -1109,7 +1123,7 @@ async fn run_patchright_install_chromium(
         .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir);
 
     log::info!("rsshub engine: installing patchright chromium");
-    let output = run_bun(cmd, "run patchright install").await?;
+    let output = run_bun(cmd, "run patchright install", BUN_INSTALL_BUDGET).await?;
     if !output.status.success() {
         return Err(format_cmd_failure("patchright install chromium", &output));
     }
@@ -1118,19 +1132,26 @@ async fn run_patchright_install_chromium(
 
 /// Probe whether `browser_dir` contains a Chromium executable that `patchright`
 /// inside `app_dir` can actually resolve and find on disk.
-async fn verify_browser_usable(bun_bin: &Path, app_dir: &Path, browser_dir: &Path) -> bool {
+///
+/// A hung probe is an error, not "unusable": mapping it to `false` would send
+/// the caller down the Chromium-refresh path and could delete a working
+/// browser.
+async fn verify_browser_usable(
+    bun_bin: &Path,
+    app_dir: &Path,
+    browser_dir: &Path,
+) -> AppResult<bool> {
     if !dir_is_non_empty(browser_dir) || !is_regular_file(bun_bin) {
-        return false;
+        return Ok(false);
     }
     let mut cmd = bun_command(bun_bin, Some(app_dir), &EngineProxyMode::None);
     cmd.env("PLAYWRIGHT_BROWSERS_PATH", browser_dir).args([
         "-e",
         "import { chromium } from 'patchright'; import { existsSync } from 'node:fs'; const p = chromium.executablePath(); if (!p || !existsSync(p)) process.exit(1);",
     ]);
-    cmd.output()
+    run_bun(cmd, "probe chromium", BUN_PROBE_BUDGET)
         .await
         .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 fn allowlisted_host_env() -> BTreeMap<String, String> {
@@ -1200,12 +1221,15 @@ fn bun_command(
 /// keep the settings page's action pending forever. Generous enough for a slow
 /// network; `kill_on_drop` reaps the child when the timeout fires.
 const BUN_INSTALL_BUDGET: Duration = Duration::from_secs(15 * 60);
+/// Probes (`bun --version`, Chromium resolution) only load local files.
+const BUN_PROBE_BUDGET: Duration = Duration::from_secs(60);
 
 async fn run_bun(
     mut cmd: tokio::process::Command,
     action: &str,
+    budget: Duration,
 ) -> AppResult<std::process::Output> {
-    tokio::time::timeout(BUN_INSTALL_BUDGET, cmd.output())
+    tokio::time::timeout(budget, cmd.output())
         .await
         .map_err(|_| AppError::other(format!("rsshub engine: {action} timed out")))?
         .map_err(|e| AppError::other(format!("rsshub engine: {action}: {e}")))
@@ -1502,11 +1526,9 @@ async fn fetch_official_bun_release_digest(
 }
 
 async fn read_bun_version(bun_bin: &Path) -> AppResult<String> {
-    let output = bun_command(bun_bin, None, &EngineProxyMode::None)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|e| AppError::other(format!("rsshub engine: run bun --version: {e}")))?;
+    let mut cmd = bun_command(bun_bin, None, &EngineProxyMode::None);
+    cmd.arg("--version");
+    let output = run_bun(cmd, "run bun --version", BUN_PROBE_BUDGET).await?;
     if !output.status.success() {
         return Err(format_cmd_failure("bun --version", &output));
     }
