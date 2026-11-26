@@ -461,6 +461,11 @@ impl EngineManager {
             .arg("run")
             .arg(&server_mjs)
             .env_clear()
+            // Keep an open stdin pipe held by `Running.child`: `magpie-server.mjs`
+            // exits immediately on stdin EOF/close when `RSSHUB_MAGPIE_HOST=1`,
+            // which otherwise kills the engine at launch inside GUI apps whose
+            // inherited stdin is `/dev/null`.
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::from(log_out))
             .stderr(std::process::Stdio::from(log_err))
             .kill_on_drop(true);
@@ -2281,6 +2286,36 @@ mod tests {
         // Second ensure reuses the same process (same port), no restart.
         let again = mgr.ensure(&BTreeMap::new()).await.unwrap();
         assert_eq!(again, port);
+        mgr.shutdown().await;
+        assert!(!mgr.status().await.running);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_keeps_stdin_open_when_child_exits_on_stdin_eof() {
+        let root = temp_root("stdin-eof");
+        let fake_bun = "#!/bin/sh\nexec python3 -c \"import os,sys,threading,http.server\n\
+             def watch():\n\
+             \x20 sys.stdin.read()\n\
+             \x20 os._exit(0)\n\
+             threading.Thread(target=watch, daemon=True).start()\n\
+             class H(http.server.BaseHTTPRequestHandler):\n\
+             \x20 def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n\
+             \x20 def log_message(self, *a): pass\n\
+             http.server.HTTPServer(('127.0.0.1', int(os.environ['PORT'])), H).serve_forever()\"\n";
+        make_installed_v2(&root, "standard", "2.0.0", fake_bun);
+        let mgr = EngineManager::new(root.clone());
+
+        let port = mgr.ensure(&BTreeMap::new()).await.unwrap();
+        assert!(mgr.status().await.running);
+        assert_eq!(mgr.status().await.port, Some(port));
+
+        // Remains healthy across repeated ensure calls instead of exiting on stdin EOF.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(mgr.ensure(&BTreeMap::new()).await.unwrap(), port);
+        assert!(mgr.status().await.running);
+
         mgr.shutdown().await;
         assert!(!mgr.status().await.running);
         std::fs::remove_dir_all(&root).unwrap();
