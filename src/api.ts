@@ -345,8 +345,11 @@ export const engineStatus = () =>
   invoke<RsshubEngineStatus>("engine_status");
 export const engineCheckUpdate = (useCnMirror: boolean) =>
   invoke<RsshubEngineUpdateInfo>("engine_check_update", { useCnMirror });
-export const engineInstallOrUpdate = (useCnMirror: boolean) =>
-  invoke<RsshubEngineInfo>("engine_install_or_update", { useCnMirror });
+export const engineInstallOrUpdate = (useCnMirror: boolean, targetVersion?: string) =>
+  invoke<RsshubEngineInfo>("engine_install_or_update", {
+    useCnMirror,
+    targetVersion: targetVersion ?? null,
+  });
 export const engineInstallBrowser = () =>
   invoke<RsshubEngineInfo>("engine_install_browser");
 export const engineUninstallBrowser = () =>

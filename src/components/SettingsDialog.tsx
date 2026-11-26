@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
@@ -1140,6 +1141,41 @@ const RSSHUB_CN_MIRROR_KEY = "papr.rsshubCnMirror";
  * official `rsshub` npm package into the app data dir and executes `rsshub://`
  * subscriptions on this machine. No hosted instance is ever contacted.
  */
+type EngineAction =
+  | null
+  | "install"
+  | "update"
+  | "check"
+  | "browserInstall"
+  | "browserUninstall"
+  | "uninstall";
+
+// Module scope, not component state: switching settings sections unmounts the
+// group, and an in-flight install must not become clickable again on return.
+let enginePendingAction: EngineAction = null;
+const engineActionListeners = new Set<() => void>();
+
+function setEnginePendingAction(next: EngineAction) {
+  enginePendingAction = next;
+  engineActionListeners.forEach((fn) => fn());
+}
+
+const subscribeEnginePendingAction = (fn: () => void) => {
+  engineActionListeners.add(fn);
+  return () => {
+    engineActionListeners.delete(fn);
+  };
+};
+const getEnginePendingAction = () => enginePendingAction;
+
+function useEnginePendingAction(): EngineAction {
+  return useSyncExternalStore(
+    subscribeEnginePendingAction,
+    getEnginePendingAction,
+    getEnginePendingAction,
+  );
+}
+
 function RsshubEngineGroup() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1157,15 +1193,7 @@ function RsshubEngineGroup() {
   const [updateInfo, setUpdateInfo] = useState<RsshubEngineUpdateInfo | null>(
     null,
   );
-  const [busyAction, setBusyAction] = useState<
-    | null
-    | "install"
-    | "update"
-    | "check"
-    | "browserInstall"
-    | "browserUninstall"
-    | "uninstall"
-  >(null);
+  const busyAction = useEnginePendingAction();
 
   const info = status.data?.info ?? null;
   const installed = status.data?.installed ?? false;
@@ -1189,20 +1217,20 @@ function RsshubEngineGroup() {
     kind: NonNullable<typeof busyAction>,
     fn: () => Promise<void>,
   ) => {
-    if (busy) return;
-    setBusyAction(kind);
+    if (enginePendingAction !== null) return;
+    setEnginePendingAction(kind);
     try {
       await fn();
     } catch (e) {
       reportError(e);
     } finally {
-      setBusyAction(null);
+      setEnginePendingAction(null);
     }
   };
 
   const installOrUpdate = () =>
     runAction(installed ? "update" : "install", async () => {
-      await api.engineInstallOrUpdate(cnMirror);
+      await api.engineInstallOrUpdate(cnMirror, updateInfo?.latestVersion);
       setUpdateInfo(null);
       await refresh();
     });

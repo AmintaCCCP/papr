@@ -587,23 +587,49 @@ impl EngineManager {
         })
     }
 
-    /// Install or update the Bun + `rsshub@latest` engine under `<engine_root>`.
+    /// Install or update the Bun + `rsshub` engine under `<engine_root>`.
+    ///
+    /// `target_version` is the version the user confirmed in the settings UI;
+    /// `None` (first install) resolves `latest` at install time. A confirmed
+    /// version is installed exactly and verified after staging, and an install
+    /// that would downgrade the current engine is rejected.
     ///
     /// Installs into an isolated staging directory first and only publishes
     /// the new `app/`, `browser/`, and `engine.json` once validated; legacy v1
     /// directories (including `1/browser`) and any previous working v2 layout
-    /// stay untouched if any step fails.
+    /// stay untouched if any step fails. The running engine keeps serving from
+    /// the old install until the moment of publish (a publish failure stops it,
+    /// and the next `ensure()` cold-starts the previous install).
     pub async fn install_or_update(
         &self,
         client: &reqwest::Client,
         use_cn_mirror: bool,
         proxy: &EngineProxyMode,
+        target_version: Option<&str>,
     ) -> AppResult<EngineInfo> {
         let _spawn = self.spawn_lock.lock().await;
-        self.shutdown().await;
 
         std::fs::create_dir_all(&self.root)
             .map_err(|e| AppError::other(format!("rsshub engine: create root: {e}")))?;
+
+        let target_version = target_version.map(str::trim).filter(|v| !v.is_empty());
+        // A version, not an npm spec: reject aliases (`npm:…`), git/file URLs
+        // and anything else `bun add` would resolve to another package.
+        if let Some(v) = target_version {
+            let valid = v.len() <= 64
+                && v.starts_with(|c: char| c.is_ascii_digit())
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+            if !valid {
+                return Err(AppError::other(format!(
+                    "rsshub engine: invalid rsshub version {v:?}"
+                )));
+            }
+        }
+        let rsshub_spec = match target_version {
+            Some(v) => format!("rsshub@{v}"),
+            None => "rsshub@latest".to_string(),
+        };
 
         let prev_info = self.info();
         let had_v2_browser = prev_info.as_ref().is_some_and(|i| i.is_browser_flavor());
@@ -637,21 +663,18 @@ impl EngineManager {
             );
 
             let mut cmd = bun_command(&bun_bin, Some(&staging_app), proxy);
-            cmd.args(["add", "rsshub@latest", "--exact", &registry_arg])
+            cmd.args(["add", &rsshub_spec, "--exact", &registry_arg])
                 .env("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
                 .env("PUPPETEER_SKIP_DOWNLOAD", "1")
                 .env("PUPPETEER_SKIP_CHROMIUM_DOWNLOAD", "1");
 
             log::info!(
-                "rsshub engine: installing rsshub@latest in staging via {} ({registry_arg})",
+                "rsshub engine: installing {rsshub_spec} in staging via {} ({registry_arg})",
                 bun_bin.display()
             );
-            let output = cmd
-                .output()
-                .await
-                .map_err(|e| AppError::other(format!("rsshub engine: run bun add: {e}")))?;
+            let output = run_bun(cmd, "run bun add").await?;
             if !output.status.success() {
-                return Err(format_cmd_failure("bun add rsshub@latest", &output));
+                return Err(format_cmd_failure(&format!("bun add {rsshub_spec}"), &output));
             }
 
             let staged_server = staging_app.join("server.mjs");
@@ -668,6 +691,21 @@ impl EngineManager {
                 return Err(AppError::other(
                     "rsshub engine: staged install is missing server entrypoint",
                 ));
+            }
+
+            if let Some(want) = target_version {
+                if compare_npm_versions(&rsshub_version, want) != Ordering::Equal {
+                    return Err(AppError::other(format!(
+                        "rsshub engine: registry installed rsshub {rsshub_version}, expected {want}"
+                    )));
+                }
+            }
+            if let Some(cur) = prev_info.as_ref().map(|i| i.rsshub_version.as_str()) {
+                if compare_npm_versions(&rsshub_version, cur) == Ordering::Less {
+                    return Err(AppError::other(format!(
+                        "rsshub engine: refusing to downgrade rsshub {cur} -> {rsshub_version}"
+                    )));
+                }
             }
 
             let browser_dir = Self::browser_dir(&self.root);
@@ -726,6 +764,9 @@ impl EngineManager {
                 bun_version,
                 installed_at: chrono::Utc::now().to_rfc3339(),
             };
+            // Everything is staged and validated: only now stop the running
+            // engine, so a failed download or `bun add` leaves it serving.
+            self.shutdown().await;
             publish_staged_install(&self.root, &staging_app, browser_plan, &info, &stamp)?;
             Ok(info)
         }
@@ -794,13 +835,40 @@ impl EngineManager {
             .info()
             .ok_or_else(|| AppError::code(CODE_ENGINE_MISSING))?;
         let browser_dir = Self::browser_dir(&self.root);
-        if browser_dir.exists() {
-            std::fs::remove_dir_all(&browser_dir)
-                .map_err(|e| AppError::other(format!("rsshub engine: remove browser dir: {e}")))?;
-        }
+        // Move the directory aside first: if the manifest write fails (e.g.
+        // disk full) the old manifest still says `browser`, so the directory
+        // must come back rather than leave the flavor pointing at nothing.
+        let backup = self.root.join(format!(
+            ".browser-removing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let moved = if browser_dir.exists() {
+            std::fs::rename(&browser_dir, &backup)
+                .map_err(|e| AppError::other(format!("rsshub engine: detach browser dir: {e}")))?;
+            true
+        } else {
+            false
+        };
 
         info.flavor = "standard".to_string();
-        write_manifest_atomic(&self.root, &info)?;
+        if let Err(e) = write_manifest_atomic(&self.root, &info) {
+            if moved {
+                if let Err(restore) = std::fs::rename(&backup, &browser_dir) {
+                    log::error!("rsshub engine: restore browser dir failed: {restore}");
+                    let _ = std::fs::remove_dir_all(&backup);
+                    return Err(AppError::other(format!(
+                        "{e}; additionally failed to restore Chromium: {restore}"
+                    )));
+                }
+            }
+            return Err(e);
+        }
+        if moved {
+            if let Err(e) = std::fs::remove_dir_all(&backup) {
+                log::warn!("rsshub engine: remove browser backup failed: {e}");
+            }
+        }
         Ok(info)
     }
 
@@ -894,6 +962,28 @@ enum BrowserPlan {
     RemoveExistingAfterPublish,
 }
 
+/// Windows locks a process's current directory, so a Chromium grandchild that
+/// briefly outlives `shutdown()` can make these renames fail transiently.
+/// Retry for up to ~1 s before giving up.
+fn rename_with_retry(from: &Path, to: &Path, action: &str) -> AppResult<()> {
+    let mut last = None;
+    for attempt in 0..5 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(AppError::other(format!(
+        "rsshub engine: {action}: {}",
+        last.expect("at least one attempt")
+    )))
+}
+
 fn publish_staged_install(
     root: &Path,
     staging_app: &Path,
@@ -910,17 +1000,14 @@ fn publish_staged_install(
 
     let had_app = app_dir.exists();
     if had_app {
-        std::fs::rename(&app_dir, &backup_app)
-            .map_err(|e| AppError::other(format!("rsshub engine: backup existing app: {e}")))?;
+        rename_with_retry(&app_dir, &backup_app, "backup existing app")?;
     }
 
-    if let Err(e) = std::fs::rename(staging_app, &app_dir) {
+    if let Err(e) = rename_with_retry(staging_app, &app_dir, "publish staged app") {
         if had_app {
             let _ = std::fs::rename(&backup_app, &app_dir);
         }
-        return Err(AppError::other(format!(
-            "rsshub engine: publish staged app: {e}"
-        )));
+        return Err(e);
     }
 
     let mut migrated_from: Option<PathBuf> = None;
@@ -935,19 +1022,13 @@ fn publish_staged_install(
         }
         BrowserPlan::SwapStaging(staging_browser) => {
             if browser_dir.exists() {
-                std::fs::rename(&browser_dir, &backup_browser).map_err(|e| {
-                    AppError::other(format!("rsshub engine: backup existing browser: {e}"))
-                })?;
+                rename_with_retry(&browser_dir, &backup_browser, "backup existing browser")?;
                 swapped_browser = true;
             }
-            std::fs::rename(&staging_browser, &browser_dir).map_err(|e| {
-                AppError::other(format!("rsshub engine: publish staged browser: {e}"))
-            })
+            rename_with_retry(&staging_browser, &browser_dir, "publish staged browser")
         }
         BrowserPlan::MigrateV1(v1_browser) => {
-            std::fs::rename(&v1_browser, &browser_dir).map_err(|e| {
-                AppError::other(format!("rsshub engine: migrate v1 browser: {e}"))
-            })?;
+            rename_with_retry(&v1_browser, &browser_dir, "migrate v1 browser")?;
             migrated_from = Some(v1_browser);
             Ok(())
         }
@@ -1028,10 +1109,7 @@ async fn run_patchright_install_chromium(
         .env("PLAYWRIGHT_BROWSERS_PATH", browser_dir);
 
     log::info!("rsshub engine: installing patchright chromium");
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| AppError::other(format!("rsshub engine: run patchright install: {e}")))?;
+    let output = run_bun(cmd, "run patchright install").await?;
     if !output.status.success() {
         return Err(format_cmd_failure("patchright install chromium", &output));
     }
@@ -1073,6 +1151,9 @@ fn bun_command(
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bun_bin);
     cmd.env_clear().kill_on_drop(true);
+    // Every bun subprocess may talk TLS (registry, Chromium download); trust
+    // the OS store so enterprise MITM roots work, with verification intact.
+    cmd.env("NODE_USE_SYSTEM_CA", "1");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -1096,6 +1177,9 @@ fn bun_command(
         }
         EngineProxyMode::Explicit(url) => {
             cmd.env_remove("PROXY_URI");
+            // The Rust client's `Proxy::all` ignores NO_PROXY, so bun must too.
+            cmd.env_remove("NO_PROXY");
+            cmd.env_remove("no_proxy");
             for k in [
                 "HTTP_PROXY",
                 "HTTPS_PROXY",
@@ -1109,6 +1193,22 @@ fn bun_command(
         }
     }
     cmd
+}
+
+/// Upper bound for an install subprocess (npm install / Chromium download).
+/// Without one, a registry that accepts the connection and then stalls would
+/// keep the settings page's action pending forever. Generous enough for a slow
+/// network; `kill_on_drop` reaps the child when the timeout fires.
+const BUN_INSTALL_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+async fn run_bun(
+    mut cmd: tokio::process::Command,
+    action: &str,
+) -> AppResult<std::process::Output> {
+    tokio::time::timeout(BUN_INSTALL_BUDGET, cmd.output())
+        .await
+        .map_err(|_| AppError::other(format!("rsshub engine: {action} timed out")))?
+        .map_err(|e| AppError::other(format!("rsshub engine: {action}: {e}")))
 }
 
 fn format_cmd_failure(action: &str, output: &std::process::Output) -> AppError {
@@ -1671,6 +1771,10 @@ fn build_child_env(
     env.insert("NODE_ENV".into(), "production".into());
     env.insert("LISTEN_INADDR_ANY".into(), "0".into());
     env.insert("RSSHUB_MAGPIE_HOST".into(), "1".into());
+    // Bun does not trust the OS store by default; routes behind an enterprise
+    // proxy whose root CA is only in the system keychain need this. TLS
+    // verification stays on.
+    env.insert("NODE_USE_SYSTEM_CA".into(), "1".into());
 
     let browser_dir = EngineManager::browser_dir(engine_root);
     if is_browser_flavor && dir_is_non_empty(&browser_dir) {
@@ -2064,7 +2168,7 @@ mod tests {
         let mgr = EngineManager::new(root.clone());
         let client = reqwest::Client::new();
         let err = mgr
-            .install_or_update(&client, false, &EngineProxyMode::None)
+            .install_or_update(&client, false, &EngineProxyMode::None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("bun add rsshub@latest"));
@@ -2097,7 +2201,7 @@ mod tests {
         let mgr = EngineManager::new(root.clone());
         let client = reqwest::Client::new();
         let info = mgr
-            .install_or_update(&client, false, &EngineProxyMode::None)
+            .install_or_update(&client, false, &EngineProxyMode::None, None)
             .await
             .unwrap();
         assert_eq!(info.flavor, "standard");
@@ -2121,6 +2225,7 @@ mod tests {
         assert!(env_str.contains("HTTP_PROXY=http://127.0.0.1:7890"));
         assert!(env_str.contains("HTTPS_PROXY=http://127.0.0.1:7890"));
         assert!(env_str.contains("ALL_PROXY=http://127.0.0.1:7890"));
+        assert!(env_str.contains("NODE_USE_SYSTEM_CA=1"));
 
         let out_none = bun_command(Path::new("/usr/bin/env"), None, &EngineProxyMode::None)
             .output()
@@ -2130,6 +2235,58 @@ mod tests {
         for key in ["HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "http_proxy=", "https_proxy=", "all_proxy=", "PROXY_URI="] {
             assert!(!none_str.contains(key), "unexpected {key} in None mode");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_refuses_version_mismatch_and_downgrade() {
+        // Fake bun that "installs" whatever version the script reports.
+        let bun_writing = |ver: &'static str| {
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then echo \"1.4.5\"; exit 0; fi\n\
+                 if [ \"$1\" = \"add\" ]; then\n\
+                   mkdir -p node_modules/rsshub/dist-lib\n\
+                   echo '{{\"name\":\"rsshub\",\"version\":\"{ver}\"}}' > node_modules/rsshub/package.json\n\
+                   echo 'console.log(1)' > node_modules/rsshub/dist-lib/magpie-server.mjs\n\
+                   exit 0\n\
+                 fi\n\
+                 exit 1\n"
+            )
+        };
+
+        let root = temp_root("version-pin");
+        make_installed_v2(&root, "standard", "2.4.0", &bun_writing("2.5.0"));
+        let mgr = EngineManager::new(root.clone());
+        let client = reqwest::Client::new();
+
+        // An npm spec (alias / remote source) is rejected before reaching bun.
+        for bad in ["npm:evil@1.0.0", "git+https://evil", "file:/tmp/x", "2.5.0/x"] {
+            let err = mgr
+                .install_or_update(&client, false, &EngineProxyMode::None, Some(bad))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("invalid rsshub version"), "{bad}: {err}");
+        }
+
+        // Confirmed 2.6.0 but the registry resolved 2.5.0.
+        let err = mgr
+            .install_or_update(&client, false, &EngineProxyMode::None, Some("2.6.0"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("expected 2.6.0"), "{err}");
+        assert_eq!(mgr.info().unwrap().rsshub_version, "2.4.0");
+
+        // Confirmed an older version than what is installed.
+        std::fs::write(EngineManager::bun_bin(&root), bun_writing("2.3.0")).unwrap();
+        let err = mgr
+            .install_or_update(&client, false, &EngineProxyMode::None, Some("2.3.0"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to downgrade"), "{err}");
+        assert_eq!(mgr.info().unwrap().rsshub_version, "2.4.0");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
@@ -2183,6 +2340,7 @@ mod tests {
         assert_eq!(env.get("NODE_ENV").map(String::as_str), Some("production"));
         assert_eq!(env.get("LISTEN_INADDR_ANY").map(String::as_str), Some("0"));
         assert_eq!(env.get("RSSHUB_MAGPIE_HOST").map(String::as_str), Some("1"));
+        assert_eq!(env.get("NODE_USE_SYSTEM_CA").map(String::as_str), Some("1"));
         assert_eq!(env.get("MY_TOKEN").map(String::as_str), Some("secret"));
         // Empty or missing browser/ dir must not advertise PLAYWRIGHT_BROWSERS_PATH.
         std::fs::create_dir_all(dir.join("browser")).unwrap();

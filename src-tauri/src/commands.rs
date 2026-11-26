@@ -742,8 +742,11 @@ pub async fn engine_status(state: State<'_, AppState>) -> AppResult<rsshub::engi
     Ok(state.engine.status().await)
 }
 
-/// Check npm for a newer `rsshub` package version. Uses a download client
-/// configured with the user's proxy settings.
+/// Check npm for a newer `rsshub` package version. Uses the regular settings
+/// client (`net_timeout_sec`, clamped to at most 5 minutes): a registry lookup
+/// is a few KB, so it must not inherit the download client's 30-minute budget,
+/// which would leave the settings page stuck on "checking" with
+/// install/uninstall disabled if the registry stalls after accepting.
 #[tauri::command]
 pub async fn engine_check_update(
     state: State<'_, AppState>,
@@ -751,18 +754,22 @@ pub async fn engine_check_update(
 ) -> AppResult<rsshub::engine::EngineUpdateInfo> {
     let client = {
         let conn = state.db.lock().await;
-        fetch::build_download_client(&conn)
+        fetch::build_client_from_settings(&conn)
     };
     state.engine.check_update(&client, use_cn_mirror).await
 }
 
-/// Install or update the local Bun + `rsshub@latest` engine. Uses a dedicated
+/// Install or update the local Bun + `rsshub` engine. Uses a dedicated
 /// download client with a generous timeout and passes the user's proxy setting
 /// to both the Rust downloader and the `bun add` subprocess.
+///
+/// `target_version` is the version the user confirmed from
+/// `engine_check_update`; omit it for a first install to resolve `latest`.
 #[tauri::command]
 pub async fn engine_install_or_update(
     state: State<'_, AppState>,
     use_cn_mirror: bool,
+    target_version: Option<String>,
 ) -> AppResult<rsshub::engine::EngineInfo> {
     let (client, proxy) = {
         let conn = state.db.lock().await;
@@ -774,7 +781,7 @@ pub async fn engine_install_or_update(
     };
     state
         .engine
-        .install_or_update(&client, use_cn_mirror, &proxy)
+        .install_or_update(&client, use_cn_mirror, &proxy, target_version.as_deref())
         .await
 }
 

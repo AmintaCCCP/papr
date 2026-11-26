@@ -35,7 +35,7 @@ async fn real_engine_refresh_ingests_articles() {
         .unwrap_or(false);
 
     let info = manager
-        .install_or_update(&dl_client, use_cn_mirror, &proxy_mode)
+        .install_or_update(&dl_client, use_cn_mirror, &proxy_mode, None)
         .await
         .expect("engine install_or_update");
     assert_eq!(info.version, "2");
