@@ -68,11 +68,10 @@ export interface RsshubRouteRow {
 /** What engine_status reports (mirrors rsshub::engine::EngineStatus). */
 export interface RsshubEngineInfo {
   version: string;
-  /** "standard" (Node + RSSHub only) or "browser" (also ships a headless
-   *  Chromium for requirePuppeteer routes). Empty on pre-flavor engines. */
+  /** "standard" or "browser" (with patchright Chromium installed). */
   flavor: string;
-  rsshubRevision: string;
-  nodeVersion: string;
+  rsshubVersion: string;
+  bunVersion: string;
   installedAt: string;
 }
 export interface RsshubEngineStatus {
@@ -80,6 +79,11 @@ export interface RsshubEngineStatus {
   running: boolean;
   port: number | null;
   info: RsshubEngineInfo | null;
+}
+export interface RsshubEngineUpdateInfo {
+  currentVersion: string | null;
+  latestVersion: string;
+  updateAvailable: boolean;
 }
 
 /** A configured email-newsletter source (mirrors commands::NewsletterSource). */

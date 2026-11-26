@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
@@ -49,6 +50,7 @@ import { NO_AUTOCORRECT } from "../lib/inputProps";
 import { errorText } from "../lib/errors";
 import type {
   Feed,
+  RsshubEngineUpdateInfo,
   Rule,
   RuleAction,
   RuleCondition,
@@ -268,10 +270,12 @@ function Row({
 function Toggle({
   checked,
   onChange,
+  disabled,
   "aria-label": ariaLabel,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
   "aria-label"?: string;
 }) {
   return (
@@ -279,6 +283,7 @@ function Toggle({
       type="checkbox"
       className="s-toggle"
       checked={checked}
+      disabled={disabled}
       aria-label={ariaLabel}
       onChange={(e) => onChange(e.target.checked)}
     />
@@ -1129,11 +1134,80 @@ function SubscriptionsSection({
   );
 }
 
+const RSSHUB_CN_MIRROR_KEY = "papr.rsshubCnMirror";
+
 /**
- * The local RSSHub engine (route marketplace): installs the bundled
- * Node + RSSHub runtime into the app data dir and executes `rsshub://`
+ * The local RSSHub engine (route marketplace): installs the Bun runtime and
+ * official `rsshub` npm package into the app data dir and executes `rsshub://`
  * subscriptions on this machine. No hosted instance is ever contacted.
  */
+type EngineAction =
+  | null
+  | "install"
+  | "update"
+  | "check"
+  | "browserInstall"
+  | "browserUninstall"
+  | "uninstall";
+
+// Module scope, not component state: switching settings sections unmounts the
+// group, and an in-flight install must not become clickable again on return.
+let enginePendingAction: EngineAction = null;
+const engineActionListeners = new Set<() => void>();
+
+function setEnginePendingAction(next: EngineAction) {
+  enginePendingAction = next;
+  engineActionListeners.forEach((fn) => fn());
+}
+
+const subscribeEnginePendingAction = (fn: () => void) => {
+  engineActionListeners.add(fn);
+  return () => {
+    engineActionListeners.delete(fn);
+  };
+};
+const getEnginePendingAction = () => enginePendingAction;
+
+function useEnginePendingAction(): EngineAction {
+  return useSyncExternalStore(
+    subscribeEnginePendingAction,
+    getEnginePendingAction,
+    getEnginePendingAction,
+  );
+}
+
+// Same reason as above: a check that finishes after the user switches panes
+// must still show its result on return. The mirror travels with the result so
+// a stale check made against the other registry is ignored.
+type EngineUpdateResult = {
+  mirror: boolean;
+  info: RsshubEngineUpdateInfo;
+} | null;
+
+let engineUpdateResult: EngineUpdateResult = null;
+const engineUpdateListeners = new Set<() => void>();
+
+function setEngineUpdateResult(next: EngineUpdateResult) {
+  engineUpdateResult = next;
+  engineUpdateListeners.forEach((fn) => fn());
+}
+
+const subscribeEngineUpdateResult = (fn: () => void) => {
+  engineUpdateListeners.add(fn);
+  return () => {
+    engineUpdateListeners.delete(fn);
+  };
+};
+const getEngineUpdateResult = () => engineUpdateResult;
+
+function useEngineUpdateResult(): EngineUpdateResult {
+  return useSyncExternalStore(
+    subscribeEngineUpdateResult,
+    getEngineUpdateResult,
+    getEngineUpdateResult,
+  );
+}
+
 function RsshubEngineGroup() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1141,53 +1215,103 @@ function RsshubEngineGroup() {
     queryKey: ["rsshub-engine"],
     queryFn: api.engineStatus,
   });
-  const [url, setUrl] = useState("");
-  const [sha, setSha] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [cnMirror, setCnMirror] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(RSSHUB_CN_MIRROR_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
+  const updateResult = useEngineUpdateResult();
+  const busyAction = useEnginePendingAction();
+
   const info = status.data?.info ?? null;
   const installed = status.data?.installed ?? false;
+  const hasBrowser = info?.flavor === "browser";
+  const busy = busyAction !== null;
+  const updateInfo =
+    updateResult?.mirror === cnMirror ? updateResult.info : null;
 
   const refresh = () =>
     qc.invalidateQueries({ queryKey: ["rsshub-engine"] });
 
-  const installDialog = async () => {
-    setBusy(true);
+  const toggleCnMirror = (next: boolean) => {
+    setCnMirror(next);
+    setEngineUpdateResult(null);
     try {
-      const res = await api.engineInstallFromDialog();
-      if (res) refresh();
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setBusy(false);
+      localStorage.setItem(RSSHUB_CN_MIRROR_KEY, String(next));
+    } catch {
+      // ignore storage errors
     }
   };
 
-  const installFromUrl = async () => {
-    if (!url.trim() || busy) return;
-    setBusy(true);
+  const runAction = async (
+    kind: NonNullable<typeof busyAction>,
+    fn: () => Promise<void>,
+  ) => {
+    if (enginePendingAction !== null) return;
+    setEnginePendingAction(kind);
     try {
-      await api.engineInstallFromUrl(url.trim(), sha.trim() || undefined);
-      setUrl("");
-      setSha("");
-      refresh();
+      await fn();
     } catch (e) {
       reportError(e);
     } finally {
-      setBusy(false);
+      setEnginePendingAction(null);
     }
   };
 
-  const uninstall = async () => {
-    setBusy(true);
-    try {
+  const installOrUpdate = () => {
+    // Without a settled status we do not know whether this is a first install
+    // (which may resolve `latest`) or an update the user never confirmed.
+    if (!status.isSuccess) return;
+    void runAction(installed ? "update" : "install", async () => {
+      await api.engineInstallOrUpdate(cnMirror, updateInfo?.latestVersion);
+      setEngineUpdateResult(null);
+      await refresh();
+    });
+  };
+
+  const checkUpdate = () =>
+    runAction("check", async () => {
+      const res = await api.engineCheckUpdate(cnMirror);
+      setEngineUpdateResult({ mirror: cnMirror, info: res });
+    });
+
+  const installBrowser = () =>
+    runAction("browserInstall", async () => {
+      await api.engineInstallBrowser();
+      await refresh();
+    });
+
+  const uninstallBrowser = () =>
+    runAction("browserUninstall", async () => {
+      await api.engineUninstallBrowser();
+      await refresh();
+    });
+
+  const uninstall = () =>
+    runAction("uninstall", async () => {
       await api.engineUninstall();
-      refresh();
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setBusy(false);
+      setEngineUpdateResult(null);
+      await refresh();
+    });
+
+  const engineDesc = (() => {
+    if (busyAction === "install" || busyAction === "update") {
+      return t("settings.rsshub.engineInstallingHint");
     }
-  };
+    if (status.isError) return t("settings.rsshub.engineStatusError");
+    if (status.isPending) return t("settings.rsshub.engineStatusLoading");
+    if (!installed) return t("settings.rsshub.engineNotInstalledDesc");
+    const state = t(
+      status.data?.running
+        ? "settings.rsshub.engineRunning"
+        : "settings.rsshub.engineIdle",
+    );
+    return hasBrowser
+      ? `${state} · ${t("settings.rsshub.engineFlavorBrowser")}`
+      : state;
+  })();
 
   return (
     <div className="settings-group" style={{ marginBottom: 18 }}>
@@ -1197,47 +1321,12 @@ function RsshubEngineGroup() {
         label={
           installed
             ? t("settings.rsshub.engineVersion", {
-                version: info?.version ?? "",
-                revision: info?.rsshubRevision?.slice(0, 7) ?? "",
-                node: info?.nodeVersion ?? "",
+                rsshub: info?.rsshubVersion ?? "",
+                bun: info?.bunVersion ?? "",
               })
             : t("settings.rsshub.engineNotInstalled")
         }
-        desc={
-          installed
-            ? t(
-                status.data?.running
-                  ? "settings.rsshub.engineRunning"
-                  : "settings.rsshub.engineIdle",
-              ) +
-              // The flavor decides whether requirePuppeteer routes run, so
-              // surface it right where the engine's state is read.
-              (info?.flavor === "browser"
-                ? ` · ${t("settings.rsshub.engineFlavorBrowser")}`
-                : "")
-            : t("settings.rsshub.engineNotInstalledDesc")
-        }
-      >
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button className="s-btn" disabled={busy} onClick={installDialog}>
-            <Icon name="arrow-down" size={12} />
-            {t(installed ? "settings.rsshub.engineReinstall" : "settings.rsshub.engineInstall")}
-          </button>
-          {installed && (
-            <button
-              className="icon-btn"
-              title={t("settings.rsshub.engineUninstall")}
-              disabled={busy}
-              onClick={uninstall}
-            >
-              <Icon name="trash" size={13} />
-            </button>
-          )}
-        </div>
-      </Row>
-      <Row
-        label={t("settings.rsshub.engineUrlLabel")}
-        desc={t("settings.rsshub.engineUrlDesc")}
+        desc={engineDesc}
       >
         <div
           style={{
@@ -1245,52 +1334,123 @@ function RsshubEngineGroup() {
             gap: 8,
             alignItems: "center",
             flexWrap: "wrap",
+            justifyContent: "flex-end",
           }}
         >
-          <input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://…/rsshub-engine-darwin-arm64.tar.gz"
-            {...NO_AUTOCORRECT}
-            style={{
-              width: 240,
-              padding: "5px 9px",
-              borderRadius: 7,
-              border: "1px solid var(--hair-strong)",
-              background: "var(--panel)",
-              fontFamily: "inherit",
-              fontSize: 12.5,
-              color: "var(--ink)",
-              outline: 0,
-            }}
-          />
-          <input
-            value={sha}
-            onChange={(e) => setSha(e.target.value)}
-            placeholder={t("settings.rsshub.engineShaPlaceholder")}
-            aria-label={t("settings.rsshub.engineShaPlaceholder")}
-            {...NO_AUTOCORRECT}
-            style={{
-              width: 150,
-              padding: "5px 9px",
-              borderRadius: 7,
-              border: "1px solid var(--hair-strong)",
-              background: "var(--panel)",
-              fontFamily: "inherit",
-              fontSize: 12.5,
-              color: "var(--ink)",
-              outline: 0,
-            }}
-          />
-          <button
-            className="s-btn"
-            disabled={busy || !url.trim()}
-            onClick={installFromUrl}
-          >
-            {t("settings.rsshub.engineInstall")}
-          </button>
+          {installed ? (
+            <>
+              {updateInfo && !updateInfo.updateAvailable && (
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                  {t("settings.rsshub.engineUpToDate")}
+                </span>
+              )}
+              {updateInfo?.updateAvailable && (
+                <button
+                  className="s-btn primary"
+                  disabled={busy}
+                  onClick={installOrUpdate}
+                >
+                  <Icon name="arrow-down" size={12} />
+                  {t(
+                    busyAction === "update"
+                      ? "settings.rsshub.engineUpdating"
+                      : "settings.rsshub.engineUpdateTo",
+                    { version: updateInfo.latestVersion },
+                  )}
+                </button>
+              )}
+              <button className="s-btn" disabled={busy} onClick={checkUpdate}>
+                <Icon name="refresh" size={12} />
+                {t(
+                  busyAction === "check"
+                    ? "settings.rsshub.engineChecking"
+                    : "settings.rsshub.engineCheckUpdate",
+                )}
+              </button>
+              <button
+                className="icon-btn"
+                title={t("settings.rsshub.engineUninstall")}
+                disabled={busy}
+                onClick={uninstall}
+              >
+                <Icon name="trash" size={13} />
+              </button>
+            </>
+          ) : status.isError ? (
+            <button
+              className="s-btn"
+              onClick={() => void status.refetch()}
+            >
+              <Icon name="refresh" size={12} />
+              {t("settings.rsshub.engineStatusRetry")}
+            </button>
+          ) : (
+            <button
+              className="s-btn primary"
+              disabled={busy || status.isPending}
+              onClick={installOrUpdate}
+            >
+              <Icon name="arrow-down" size={12} />
+              {t(
+                busyAction === "install"
+                  ? "settings.rsshub.engineInstalling"
+                  : "settings.rsshub.engineInstall",
+              )}
+            </button>
+          )}
         </div>
       </Row>
+      <Row
+        label={t("settings.rsshub.cnMirrorLabel")}
+        desc={t("settings.rsshub.cnMirrorDesc")}
+      >
+        <Toggle
+          checked={cnMirror}
+          disabled={busy}
+          onChange={toggleCnMirror}
+        />
+      </Row>
+      {installed && (
+        <Row
+          label={t("settings.rsshub.browserLabel")}
+          desc={
+            busyAction === "browserInstall"
+              ? t("settings.rsshub.browserInstallingHint")
+              : t(
+                  hasBrowser
+                    ? "settings.rsshub.browserInstalledDesc"
+                    : "settings.rsshub.browserMissingDesc",
+                )
+          }
+        >
+          {hasBrowser ? (
+            <button
+              className="s-btn"
+              disabled={busy}
+              onClick={uninstallBrowser}
+            >
+              {t(
+                busyAction === "browserUninstall"
+                  ? "settings.rsshub.browserRemoving"
+                  : "settings.rsshub.browserRemove",
+              )}
+            </button>
+          ) : (
+            <button
+              className="s-btn"
+              disabled={busy}
+              onClick={installBrowser}
+            >
+              <Icon name="arrow-down" size={12} />
+              {t(
+                busyAction === "browserInstall"
+                  ? "settings.rsshub.browserInstalling"
+                  : "settings.rsshub.browserInstall",
+              )}
+            </button>
+          )}
+        </Row>
+      )}
     </div>
   );
 }
@@ -1729,19 +1889,21 @@ function BuiltinCard({
               : "settings.integrations.notConfigured",
           )}
         </span>
-        <button
-          className="icon-btn"
-          title={t("settings.integrations.configure")}
-          aria-expanded={open}
-          onClick={() => setOpen((o) => !o)}
-        >
-          <Icon name="settings" size={13} />
-        </button>
-        <Toggle
-          checked={cfg.enabled}
-          onChange={(v) => onChange({ ...cfg, enabled: v })}
-          aria-label={t(meta.nameKey)}
-        />
+        <div className="s-service-actions">
+          <button
+            className="icon-btn"
+            title={t("settings.integrations.configure")}
+            aria-expanded={open}
+            onClick={() => setOpen((o) => !o)}
+          >
+            <Icon name="settings" size={13} />
+          </button>
+          <Toggle
+            checked={cfg.enabled}
+            onChange={(v) => onChange({ ...cfg, enabled: v })}
+            aria-label={t(meta.nameKey)}
+          />
+        </div>
       </div>
       {open && (
         <div className="integ-fields">
@@ -1882,13 +2044,15 @@ function ParsersSection({ onOpenMarketplace }: { onOpenMarketplace: () => void }
                 ? t("settings.rsshub.entryCount", { count: routeCount })
                 : t("settings.rsshub.entryEngineMissing")}
             </span>
-            <button
-              className="s-btn"
-              onClick={onOpenMarketplace}
-              aria-label={t("settings.rsshub.entryOpen")}
-            >
-              {t("settings.rsshub.entryOpen")}
-            </button>
+            <div className="s-service-actions">
+              <button
+                className="s-btn"
+                onClick={onOpenMarketplace}
+                aria-label={t("settings.rsshub.entryOpen")}
+              >
+                {t("settings.rsshub.entryOpen")}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1948,18 +2112,20 @@ function ParserCard({
               : "settings.integrations.notConfigured",
           )}
         </span>
-        <button
-          className="icon-btn"
-          title={t("settings.integrations.configure")}
-          onClick={onConfigure}
-        >
-          <Icon name="settings" size={13} />
-        </button>
-        <Toggle
-          checked={cfg.enabled}
-          onChange={(v) => onChange({ ...cfg, enabled: v })}
-          aria-label={t(meta.nameKey)}
-        />
+        <div className="s-service-actions">
+          <button
+            className="icon-btn"
+            title={t("settings.integrations.configure")}
+            onClick={onConfigure}
+          >
+            <Icon name="settings" size={13} />
+          </button>
+          <Toggle
+            checked={cfg.enabled}
+            onChange={(v) => onChange({ ...cfg, enabled: v })}
+            aria-label={t(meta.nameKey)}
+          />
+        </div>
       </div>
     </div>
   );

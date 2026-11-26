@@ -735,65 +735,80 @@ fn normalize_route_path(path: &str) -> String {
     format!("/{trimmed}")
 }
 
-/// The engine's settings-page status: installed version/revision and whether
-/// the process is currently running.
+/// The engine's settings-page status: installed version and whether the
+/// process is currently running.
 #[tauri::command]
 pub async fn engine_status(state: State<'_, AppState>) -> AppResult<rsshub::engine::EngineStatus> {
     Ok(state.engine.status().await)
 }
 
-/// Install the engine from a local archive picked in a native dialog (the
-/// settings card's primary path — no JS dialog plugin needed). `None` when
-/// the user cancels.
+/// Check npm for a newer `rsshub` package version. Uses the regular settings
+/// client (`net_timeout_sec`, clamped to at most 5 minutes): a registry lookup
+/// is a few KB, so it must not inherit the download client's 30-minute budget,
+/// which would leave the settings page stuck on "checking" with
+/// install/uninstall disabled if the registry stalls after accepting.
 #[tauri::command]
-pub async fn engine_install_from_dialog(
-    app: AppHandle,
-) -> AppResult<Option<rsshub::engine::EngineInfo>> {
-    // `blocking_pick_file` parks its caller until the user closes the dialog
-    // — run it on the blocking pool so a tokio worker is not held hostage
-    // while the dialog sits open.
-    let app_for_dialog = app.clone();
-    let picked = tauri::async_runtime::spawn_blocking(move || {
-        app_for_dialog
-            .dialog()
-            .file()
-            .add_filter("RSSHub engine archive", &["tar.gz", "tgz", "zip"])
-            .blocking_pick_file()
-    })
-    .await
-    .map_err(|e| AppError::other(format!("engine dialog task: {e}")))?;
-    let Some(path) = picked else {
-        return Ok(None); // user cancelled
-    };
-    let path = path
-        .into_path()
-        .map_err(|_| AppError::other("engine dialog returned a non-file path"))?;
-    let engine = app.state::<AppState>().engine.clone();
-    engine.install_from_archive(&path).await.map(Some)
-}
-
-/// Download and install the engine from a URL, optionally verifying the
-/// archive's sha256 (`sha256sum` of the artifact, hex). Uses a dedicated
-/// download client — the shared feed client's whole-request timeout (30 s by
-/// default) would abort a >100 MB archive mid-transfer.
-#[tauri::command]
-pub async fn engine_install_from_url(
+pub async fn engine_check_update(
     state: State<'_, AppState>,
-    url: String,
-    sha256: Option<String>,
-) -> AppResult<rsshub::engine::EngineInfo> {
+    use_cn_mirror: bool,
+) -> AppResult<rsshub::engine::EngineUpdateInfo> {
     let client = {
         let conn = state.db.lock().await;
-        fetch::build_download_client(&conn)
+        fetch::build_client_from_settings(&conn)
+    };
+    state.engine.check_update(&client, use_cn_mirror).await
+}
+
+/// Install or update the local Bun + `rsshub` engine. Uses a dedicated
+/// download client with a generous timeout and passes the user's proxy setting
+/// to both the Rust downloader and the `bun add` subprocess.
+///
+/// `target_version` is the version the user confirmed from
+/// `engine_check_update`; omit it for a first install to resolve `latest`.
+#[tauri::command]
+pub async fn engine_install_or_update(
+    state: State<'_, AppState>,
+    use_cn_mirror: bool,
+    target_version: Option<String>,
+) -> AppResult<rsshub::engine::EngineInfo> {
+    let (client, proxy) = {
+        let conn = state.db.lock().await;
+        let proxy_setting = db::get_setting(&conn, "net_proxy").ok().flatten();
+        (
+            fetch::build_download_client(&conn),
+            rsshub::engine::EngineProxyMode::from_setting(proxy_setting.as_deref()),
+        )
     };
     state
         .engine
-        .install_from_url(&url, &client, sha256.as_deref())
+        .install_or_update(&client, use_cn_mirror, &proxy, target_version.as_deref())
         .await
 }
 
-/// Remove the installed engine (and its archives) from disk. Subscriptions
-/// keep their rows but error on refresh until an engine is back.
+/// Install the optional headless Chromium runtime (`patchright install chromium`)
+/// into `<engine_root>/browser` so `requirePuppeteer` routes work locally.
+#[tauri::command]
+pub async fn engine_install_browser(
+    state: State<'_, AppState>,
+) -> AppResult<rsshub::engine::EngineInfo> {
+    let proxy = {
+        let conn = state.db.lock().await;
+        let proxy_setting = db::get_setting(&conn, "net_proxy").ok().flatten();
+        rsshub::engine::EngineProxyMode::from_setting(proxy_setting.as_deref())
+    };
+    state.engine.install_browser(&proxy).await
+}
+
+/// Remove the optional headless Chromium runtime from `<engine_root>/browser`.
+#[tauri::command]
+pub async fn engine_uninstall_browser(
+    state: State<'_, AppState>,
+) -> AppResult<rsshub::engine::EngineInfo> {
+    state.engine.uninstall_browser().await
+}
+
+/// Remove the installed engine from disk. Subscriptions keep their rows but
+/// error on refresh until an engine is reinstalled.
 #[tauri::command]
 pub async fn engine_uninstall(state: State<'_, AppState>) -> AppResult<()> {
     state.engine.uninstall().await
