@@ -582,16 +582,17 @@
 
   let listSeq = 0;
   let loadingMore = false;
-  async function loadArticles(reset = true, preserveScroll = false) {
-    if (!reset && loadingMore) return;
-    const seq = reset ? ++listSeq : listSeq;
-    if (reset) {
-      state.loadingList = true;
-    } else {
-      loadingMore = true;
-    }
-    const offset = reset ? 0 : state.articles.length;
-    const limit = preserveScroll ? Math.max(40, state.articles.length) : 40;
+  const PAGE_LIMIT = 100; // server-side cap for /api/articles
+
+  // Rows the current filter still returns from the server. Opening an article
+  // marks it read, which shrinks the server's unread set — so the offset for
+  // "Load more" must count matching rows, not the raw loaded length, or the
+  // next page skips unread articles.
+  function matchesCurrentQuery(a) {
+    return !((state.query.kind === "unread" || state.unreadOnly) && a.isRead);
+  }
+
+  function articleParams(limit, offset) {
     const params = new URLSearchParams({
       kind: state.query.kind,
       unreadOnly: String(state.unreadOnly),
@@ -600,18 +601,46 @@
     });
     if (state.query.value != null) params.set("value", String(state.query.value));
     if (state.search.trim()) params.set("search", state.search.trim());
+    return params;
+  }
+
+  // Fetch `count` rows from `offset` in server-sized pages: one request is
+  // clamped to 100, so refreshing a longer loaded list must be batched instead
+  // of replacing it with a truncated first page.
+  async function fetchArticles(count, offset) {
+    const rows = [];
+    while (rows.length < count) {
+      const limit = Math.min(PAGE_LIMIT, count - rows.length);
+      const page = await apiFetch(`/api/articles?${articleParams(limit, offset + rows.length)}`);
+      rows.push(...page);
+      if (page.length < limit) break;
+    }
+    return rows;
+  }
+
+  async function loadArticles(reset = true, preserveScroll = false) {
+    if (!reset && loadingMore) return;
+    const seq = reset ? ++listSeq : listSeq;
+    if (reset) {
+      state.loadingList = true;
+    } else {
+      loadingMore = true;
+    }
+    const offset = reset ? 0 : state.articles.filter(matchesCurrentQuery).length;
+    const count = reset && preserveScroll ? Math.max(40, state.articles.length) : 40;
 
     try {
-      const rows = await apiFetch(`/api/articles?${params.toString()}`);
+      const rows = await fetchArticles(count, offset);
       if (seq !== listSeq) return;
       if (reset) {
         const prevScroll = $("article-list").scrollTop;
         state.articles = rows;
         $("article-list").scrollTop = preserveScroll ? prevScroll : 0;
       } else {
-        state.articles = state.articles.concat(rows);
+        const seen = new Set(state.articles.map((a) => a.id));
+        state.articles = state.articles.concat(rows.filter((a) => !seen.has(a.id)));
       }
-      state.hasMore = rows.length === limit;
+      state.hasMore = rows.length === count;
       renderArticleList();
     } catch (e) {
       if (seq === listSeq) showToast(e.message);
@@ -999,9 +1028,9 @@
         body: "{}",
       }).catch(() => {});
     }
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
-    }
+    // No service worker: the LAN server is plain HTTP, and browsers only
+    // install SWs on secure origins. "Add to Home Screen" still gives the
+    // standalone UI from the manifest.
     bindEvents();
     await loadBootstrap(false);
     await loadArticles(true);

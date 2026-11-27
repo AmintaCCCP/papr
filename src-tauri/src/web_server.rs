@@ -5,6 +5,14 @@
 //! Pairing uses a short-lived one-time code (`?pair=...`) exchanged for a
 //! bearer/cookie session; ordinary `/api/*` routes never accept URL query
 //! credentials. Mutations emit `"mobile-sync"` to the desktop webview.
+//!
+//! Transport is deliberately plaintext HTTP on the local network: a random
+//! LAN address cannot present a certificate the phone already trusts, and iOS
+//! refuses to install a service worker on an untrusted origin anyway. Read the
+//! session token as a bearer credential — pair only on networks you trust, and
+//! the server is meant to be stopped when not in use. Consequently there is no
+//! service-worker/offline mode; "Add to Home Screen" gets the standalone UI
+//! from the manifest only.
 
 use crate::commands::{
     build_translate_selection, escape_preview_text, extract_fulltext_with_state, load_ai_config,
@@ -40,6 +48,11 @@ pub const DEFAULT_PORT: u16 = 14320;
 const MAX_JSON_BODY_BYTES: usize = 64 * 1024;
 const PAIR_CODE_TTL: Duration = Duration::from_secs(600);
 const MAX_IMAGE_REDIRECTS: usize = 5;
+/// Concurrent connections kept alive for the phone; extra sockets are dropped
+/// immediately instead of piling up tasks inside the desktop process.
+const MAX_CONNECTIONS: usize = 64;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_SERVER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -47,7 +60,6 @@ const INDEX_HTML: &str = include_str!("../mobile-web/index.html");
 const STYLES_CSS: &str = include_str!("../mobile-web/styles.css");
 const APP_JS: &str = include_str!("../mobile-web/app.js");
 const MANIFEST_JSON: &str = include_str!("../mobile-web/manifest.webmanifest");
-const SW_JS: &str = include_str!("../mobile-web/sw.js");
 const ICON_SVG: &str = include_str!("../icons/papr-icon.svg");
 const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../icons/128x128@2x.png");
 const ICON_128_PNG: &[u8] = include_bytes!("../icons/128x128.png");
@@ -293,12 +305,24 @@ pub(crate) async fn start_server_locked(app: &AppHandle, port: u16) -> AppResult
     };
     let pair_code = random_code(12);
 
+    // Commit the "started" intent BEFORE switching listeners: if the write
+    // fails, the new socket is dropped, the old server (if any) keeps serving
+    // and saved state still matches what is actually running.
+    {
+        let mut conn = state.db.lock().await;
+        let tx = conn.transaction()?;
+        db::set_setting(&tx, "web_server_enabled", "1")?;
+        db::set_setting(&tx, "web_server_port", &port.to_string())?;
+        tx.commit()?;
+    }
+
     stop_server_await(app).await;
 
     let server_id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = watch::channel(false);
     let app_clone = app.clone();
     let token_clone = token.clone();
+    let conn_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let join = tauri::async_runtime::spawn(async move {
         let mut consecutive_errs: u32 = 0;
@@ -313,15 +337,28 @@ pub(crate) async fn start_server_locked(app: &AppHandle, port: u16) -> AppResult
                     match accept_res {
                         Ok((stream, _)) => {
                             consecutive_errs = 0;
+                            let permit = match conn_slots.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    log::debug!(
+                                        "mobile web connection limit reached; dropping socket"
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             let io = TokioIo::new(stream);
                             let app_req = app_clone.clone();
                             let tok_req = token_clone.clone();
                             let mut conn_rx = rx.clone();
                             tauri::async_runtime::spawn(async move {
+                                let _permit = permit; // released when the connection ends
                                 let svc = service_fn(move |req| {
                                     handle_request(app_req.clone(), tok_req.clone(), req)
                                 });
-                                let conn = http1::Builder::new().serve_connection(io, svc);
+                                let conn = http1::Builder::new()
+                                    .header_read_timeout(HEADER_READ_TIMEOUT)
+                                    .serve_connection(io, svc);
                                 tokio::select! {
                                     res = conn => {
                                         if let Err(err) = res {
@@ -421,24 +458,22 @@ pub async fn web_server_start(
 ) -> AppResult<WebServerStatus> {
     let port = port.filter(|&p| p >= 1024).unwrap_or(DEFAULT_PORT);
     let _op = state.web_server_lock.lock().await;
-    let status = start_server_locked(&app, port).await?;
-    {
-        let mut conn = state.db.lock().await;
-        let tx = conn.transaction()?;
-        db::set_setting(&tx, "web_server_enabled", "1")?;
-        db::set_setting(&tx, "web_server_port", &port.to_string())?;
-        tx.commit()?;
-    }
-    Ok(status)
+    start_server_locked(&app, port).await
 }
 
 #[tauri::command]
 pub async fn web_server_stop(app: AppHandle, state: State<'_, AppState>) -> AppResult<WebServerStatus> {
     let _op = state.web_server_lock.lock().await;
+    // Persist the disabled flag first: if that write fails we return an error
+    // and leave the server running, so runtime and saved state still agree —
+    // the next launch will not silently reopen a server the user stopped.
+    {
+        let conn = state.db.lock().await;
+        db::set_setting(&conn, "web_server_enabled", "0")?;
+    }
     stop_server_await(&app).await;
     let port = {
         let conn = state.db.lock().await;
-        db::set_setting(&conn, "web_server_enabled", "0")?;
         read_saved_port(&conn)
     };
     Ok(build_status(false, port, None, None))
@@ -517,6 +552,11 @@ fn is_global_ip(ip: IpAddr) -> bool {
                 && !(a == 192 && b == 0)
         }
         IpAddr::V6(v6) => {
+            // `::ffff:127.0.0.1` and friends are loopback/private in disguise;
+            // judge them by the embedded IPv4 address, not by IPv6 flags.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_global_ip(IpAddr::V4(v4));
+            }
             let seg0 = v6.segments()[0];
             !v6.is_loopback()
                 && !v6.is_multicast()
@@ -571,6 +611,10 @@ async fn fetch_public_image_bytes(raw_url: &str, page_url: Option<&str>) -> AppR
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(20))
+            // `resolve_to_addrs` binds only this client's DNS answer; an HTTP
+            // proxy from the environment would re-resolve the host elsewhere,
+            // so the pinned addresses must connect directly.
+            .no_proxy()
             .resolve_to_addrs(&host, &addrs)
             .build()
             .map_err(|e| AppError::other(format!("image client: {e}")))?;
@@ -702,10 +746,13 @@ async fn read_json_body<T: for<'de> Deserialize<'de>>(req: Request<Incoming>) ->
     if !is_json {
         return Err(AppError::other("Content-Type must be application/json"));
     }
-    let collected = Limited::new(req.into_body(), MAX_JSON_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|e| AppError::other(format!("read body: {e}")))?;
+    let collected = tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        Limited::new(req.into_body(), MAX_JSON_BODY_BYTES).collect(),
+    )
+    .await
+    .map_err(|_| AppError::other("read body: timed out"))?
+    .map_err(|e| AppError::other(format!("read body: {e}")))?;
     let bytes = collected.to_bytes();
     if bytes.is_empty() {
         serde_json::from_slice(b"{}").map_err(|e| AppError::other(format!("invalid json: {e}")))
@@ -780,13 +827,6 @@ async fn handle_request(
                     "application/manifest+json; charset=utf-8",
                     MANIFEST_JSON,
                     "no-cache",
-                ))
-            }
-            "/sw.js" => {
-                return Ok(text_resp(
-                    StatusCode::OK,
-                    "application/javascript; charset=utf-8",
-                    SW_JS,
                 ))
             }
             "/apple-touch-icon.png" => {

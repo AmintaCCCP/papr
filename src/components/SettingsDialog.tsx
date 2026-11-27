@@ -1496,10 +1496,12 @@ function MobileWebGroup({ onToast }: { onToast: (m: string) => void }) {
         const validPort = Number.isFinite(parsed) && parsed >= 1024 && parsed <= 65535 ? parsed : 14320;
         await api.webServerStart(validPort);
       }
-      await qc.invalidateQueries({ queryKey: ["web-server-status"] });
     } catch (e) {
       reportError(e);
     } finally {
+      // Refresh even on failure: a start that persisted but failed to answer
+      // still leaves the server running, so the UI must show the real state.
+      await qc.invalidateQueries({ queryKey: ["web-server-status"] });
       setBusy(false);
     }
   };
