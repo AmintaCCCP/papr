@@ -2,15 +2,26 @@ name: Build
 
 # Desktop packaging: builds the Tauri bundles (dmg/app, msi/nsis, AppImage/
 # deb) for every platform and uploads them as workflow artifacts. No release
-# is created — every push to any branch gets a compiled client per target,
+# is created — every code push to any branch gets a compiled client per target,
 # and the workflow can still be dispatched manually to package a subset of
 # platforms or to grab an installable build of a specific branch.
+#
+# The web frontend (tsc + vite) is built once in `frontend` and shared as the
+# `frontend-dist` artifact; every platform leg downloads it instead of running
+# `pnpm build` again. The legs only run cargo/tauri.
 
 on:
-  # Every commit, on every branch (`**` covers branch names with slashes).
-  # Tag pushes are excluded — the Release workflow owns those.
+  # Every code commit, on every branch (`**` covers branch names with slashes).
+  # Tag pushes are excluded — the Release workflow owns those. Docs-only pushes
+  # skip the build entirely: nothing in dist/bundles depends on them, and each
+  # pushed leg is another chance to lose a hosted macOS runner (see retry.yml).
   push:
     branches: ["**"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "assets/**"
+      - "skills/**"
   workflow_dispatch:
     inputs:
       platforms:
@@ -31,11 +42,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # One frontend build for all platform legs. Kept separate so the dist artifact
+  # is produced exactly once per run instead of once per leg.
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (tsc + vite)
+        run: pnpm build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v6
+        with:
+          name: frontend-dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 3
+
   # Resolve the picker into the matrix legs. Kept as its own job because the
   # selection must happen before matrix expansion; the leg list mirrors the
-  # Release workflow's build targets.
+  # Release workflow's build targets. macOS is one leg per arch: arm64 builds
+  # natively on macos-15, x64 natively on macos-15-intel (no cross-compile, and
+  # rust-cache keys stop colliding between the two architectures).
   plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
     steps:
@@ -46,14 +95,19 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
+          mac='[
+            {"platform":"macos-15","target":"aarch64-apple-darwin"},
+            {"platform":"macos-15-intel","target":"x86_64-apple-darwin"}
+          ]'
           all='[
-            {"platform":"macos-15","target":"macos"},
+            {"platform":"macos-15","target":"aarch64-apple-darwin"},
+            {"platform":"macos-15-intel","target":"x86_64-apple-darwin"},
             {"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"},
             {"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}
           ]'
           case "$PLATFORMS" in
             macos)
-              matrix='[{"platform":"macos-15","target":"macos"}]'
+              matrix=$mac
               ;;
             linux)
               matrix='[{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]'
@@ -75,9 +129,10 @@ jobs:
           echo "matrix=$(echo "$matrix" | jq -c .)" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: plan
+    needs: [plan, frontend]
     permissions:
       contents: read
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -85,6 +140,15 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
+
+      # tauri.conf.json's frontendDist is ../dist, i.e. the repo-root dist this
+      # artifact unpacks to. The build below disables beforeBuildCommand so the
+      # vendored dist is what gets bundled.
+      - name: Download frontend dist
+        uses: actions/download-artifact@v6
+        with:
+          name: frontend-dist
+          path: dist
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -106,7 +170,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ startsWith(matrix.platform, 'macos') && matrix.target || '' }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -114,6 +178,8 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
 
+      # tauri-action shells out to `pnpm tauri build`, so node_modules must
+      # exist even though the frontend is not rebuilt here.
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -141,9 +207,11 @@ jobs:
           # Multi-line values (the minisign key, the base64 p12) go through
           # the heredoc form of GITHUB_ENV.
           export_value() {
-            echo "$2<<__SECRET_EOF__" >> "$GITHUB_ENV"
-            printf '%s\n' "$1" >> "$GITHUB_ENV"
-            echo "__SECRET_EOF__" >> "$GITHUB_ENV"
+            {
+              echo "$2<<__SECRET_EOF__"
+              printf '%s\n' "$1"
+              echo "__SECRET_EOF__"
+            } >> "$GITHUB_ENV"
           }
 
           if [ -n "$IN_SIGNING_KEY" ]; then
@@ -170,60 +238,25 @@ jobs:
       # No tagName / releaseName — tauri-action builds the bundles and stops
       # there; no GitHub release is created or touched. When the updater key
       # is configured, test builds sign exactly like release builds do.
-      # Build both macOS architectures sequentially on a single runner so they
-      # do not compete for limited hosted macOS runner capacity.
-      - name: Build desktop bundles (aarch64-apple-darwin)
-        if: matrix.target == 'macos'
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: --target aarch64-apple-darwin ${{ env.EXTRA_BUILD_ARGS }}
-
-      - name: Build desktop bundles (x86_64-apple-darwin)
-        if: matrix.target == 'macos'
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: --target x86_64-apple-darwin ${{ env.EXTRA_BUILD_ARGS }}
-
+      # `beforeBuildCommand: ""` keeps the pre-built dist: without it every
+      # leg would re-run `pnpm build` and defeat the shared artifact.
       - name: Build desktop bundles
-        if: matrix.target != 'macos'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: ${{ env.EXTRA_BUILD_ARGS }}
+          args: >-
+            ${{ startsWith(matrix.platform, 'macos') && format('--target {0}', matrix.target) || '' }}
+            --config {"build":{"beforeBuildCommand":""}} ${{ env.EXTRA_BUILD_ARGS }}
 
       # upload-artifact can't consume tauri-action's artifactPaths output —
       # it is a JSON-array string, which v4 treats as one literal glob and
       # finds nothing. Glob the bundle outputs directly instead; cargo puts
       # them under the root target dir on every platform, with cross-target
-      # mac builds adding the triple as an extra path segment.
-      - name: Upload bundles (aarch64-apple-darwin)
-        if: matrix.target == 'macos'
-        uses: actions/upload-artifact@v6
-        with:
-          name: papr-desktop-aarch64-apple-darwin
-          path: |
-            target/aarch64-apple-darwin/release/bundle/**
-          if-no-files-found: error
-
-      - name: Upload bundles (x86_64-apple-darwin)
-        if: matrix.target == 'macos'
-        uses: actions/upload-artifact@v6
-        with:
-          name: papr-desktop-x86_64-apple-darwin
-          path: |
-            target/x86_64-apple-darwin/release/bundle/**
-          if-no-files-found: error
-
+      # builds (macOS arms) adding the triple as an extra path segment.
       - name: Upload bundles
-        if: matrix.target != 'macos'
         uses: actions/upload-artifact@v6
         with:
           name: papr-desktop-${{ matrix.target }}
-          path: |
-            target/release/bundle/**
+          path: ${{ startsWith(matrix.platform, 'macos') && format('target/{0}/release/bundle/**', matrix.target) || 'target/release/bundle/**' }}
           if-no-files-found: error
