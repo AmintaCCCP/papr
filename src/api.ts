@@ -579,3 +579,18 @@ export const runIntegration = (args: {
   config: Record<string, unknown>;
   articleId: number;
 }) => invoke<RunIntegrationOutcome>("run_integration", args);
+
+// ── mobile web server ──
+export interface WebServerStatus {
+  running: boolean;
+  port: number;
+  token: string | null;
+  url: string | null;
+  urls: string[];
+}
+export const webServerStatus = () =>
+  invoke<WebServerStatus>("web_server_status");
+export const webServerStart = (port?: number) =>
+  invoke<WebServerStatus>("web_server_start", { port: port ?? null });
+export const webServerStop = () =>
+  invoke<WebServerStatus>("web_server_stop");

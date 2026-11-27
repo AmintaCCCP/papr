@@ -508,6 +508,17 @@
       }
     },
     "sync": {
+      "mobileWebTitle": "モバイル Web サービス",
+      "mobileWebDesc": "ローカル Web サーバーを起動し、スマホで QR コードを読み取るか URL を開いて同期閲覧できます（iOS PWA 対応）。",
+      "mobileWebStart": "サーバー起動",
+      "mobileWebStop": "サーバー停止",
+      "mobileWebRunning": "稼働中",
+      "mobileWebStopped": "停止中",
+      "mobileWebPort": "ポート",
+      "mobileWebUrl": "アクセス URL",
+      "mobileWebCopy": "URL をコピー",
+      "mobileWebCopied": "URL をコピーしました",
+      "mobileWebScanHint": "スマホのカメラで読み取るか、Safari で上の URL を開いてください",
       "greader": "GReader 同期",
       "provider": "サービス",
       "providerFreshrss": "FreshRSS",

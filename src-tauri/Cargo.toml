@@ -94,11 +94,21 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
 log = "0.4"
+rand = { workspace = true }
+# Local mobile web server (LAN HTTP + API)
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
 # integrations: HTML→Markdown for Outline / Obsidian, Basic auth for
 # Instapaper, encodeURIComponent-style templating for custom webhooks.
 htmd = "0.5.6"
 base64 = "0.23.1"
 percent-encoding = "2.3.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # macOS-only: used in setup() to turn off the WKWebview's opaque white backing
 # (wry only does this under its `transparent` feature, which we don't enable),
