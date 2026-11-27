@@ -7,32 +7,76 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Build the web frontend once and hand it to every platform leg, instead of
+  # running tsc + vite four times in parallel.
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (tsc + vite)
+        run: pnpm build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v6
+        with:
+          name: frontend-dist
+          path: dist
+          if-no-files-found: error
+          # Re-run failed jobs is available for 30 days; dist must outlive it.
+          retention-days: 30
+
   release:
+    needs: frontend
     permissions:
       contents: write
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
+        # Linux + Windows. The two macOS legs are a separate job below so the
+        # arm64 one can start before x64, like in the Build workflow.
         include:
-          - platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-            cli_target: aarch64-apple-darwin
-          - platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-            cli_target: x86_64-apple-darwin
           - platform: ubuntu-22.04
+            os: linux
             args: ""
             cli_target: x86_64-unknown-linux-gnu
           - platform: windows-latest
+            os: windows
             args: ""
             cli_target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
-    steps:
+    steps: &release-steps
       - uses: actions/checkout@v5
 
+      # tauri.conf.json points frontendDist at ../dist; the build below disables
+      # beforeBuildCommand so this vendored copy is what gets bundled.
+      - name: Download frontend dist
+        uses: actions/download-artifact@v6
+        with:
+          name: frontend-dist
+          path: dist
+
       - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.os == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -50,13 +94,12 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.cli_target }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -87,20 +130,21 @@ jobs:
           releaseBody: "See the assets below to download and install this version."
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          # Quoted as one shell-style argument: tauri-action tokenizes `args`
+          # with string-argv and must hand Tauri a single valid JSON value.
+          args: ${{ matrix.args }} --config '{"build":{"beforeBuildCommand":""}}'
 
       # ---------------------------------------------------------------------
       # papr CLI — built from the same workspace, signed/notarized on macOS,
       # and uploaded to the same draft release tauri-action just created.
       # ---------------------------------------------------------------------
-      - name: Add Rust target for the CLI
-        run: rustup target add ${{ matrix.cli_target }}
-
+      # Each leg runs on its native runner, so cli_target is the host triple —
+      # no `rustup target add` needed.
       - name: Build papr CLI
         run: cargo build --release -p papr-cli --target ${{ matrix.cli_target }}
 
       - name: Sign & notarize papr CLI (macOS)
-        if: matrix.platform == 'macos-latest'
+        if: matrix.os == 'macos'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -147,14 +191,14 @@ jobs:
             --team-id "$APPLE_TEAM_ID" --wait
 
       - name: Package CLI (Unix)
-        if: matrix.platform != 'windows-latest'
+        if: matrix.os != 'windows'
         run: |
           set -euo pipefail
           tar -czf "papr-${{ matrix.cli_target }}.tar.gz" \
             -C "target/${{ matrix.cli_target }}/release" papr
 
       - name: Package CLI (Windows)
-        if: matrix.platform == 'windows-latest'
+        if: matrix.os == 'windows'
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.cli_target }}/release/papr.exe" `
@@ -174,9 +218,35 @@ jobs:
           asset=$(echo papr-${{ matrix.cli_target }}.*)
           gh release upload "$RELEASE_TAG" "$asset" --clobber --repo "$GH_REPO"
 
+  # macOS legs, arm64 first: `max-parallel: 1` lets the arm64 leg get the
+  # scarce hosted macOS runner before x64 competes for one. Both run on the
+  # newest image and build natively — no cross-compilation. Steps are shared
+  # with the job above via the YAML anchor so the two cannot drift apart.
+  release-macos:
+    needs: frontend
+    permissions:
+      contents: write
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: macos-26
+            os: macos
+            args: "--target aarch64-apple-darwin"
+            cli_target: aarch64-apple-darwin
+          - platform: macos-26-intel
+            os: macos
+            args: "--target x86_64-apple-darwin"
+            cli_target: x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+    steps: *release-steps
+
   finalize-appimage:
-    needs: release
+    needs: [release, release-macos]
     runs-on: ubuntu-22.04
+    timeout-minutes: 40
     permissions:
       contents: write
     steps:
