@@ -357,6 +357,10 @@ pub(crate) async fn start_server_locked(app: &AppHandle, port: u16) -> AppResult
                                     handle_request(app_req.clone(), tok_req.clone(), req)
                                 });
                                 let conn = http1::Builder::new()
+                                    // hyper requires a timer before it accepts any
+                                    // timeout; without one, setting a timeout panics
+                                    // on the first connection.
+                                    .timer(hyper_util::rt::TokioTimer::new())
                                     .header_read_timeout(HEADER_READ_TIMEOUT)
                                     .serve_connection(io, svc);
                                 tokio::select! {
