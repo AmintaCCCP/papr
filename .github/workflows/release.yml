@@ -40,7 +40,8 @@ jobs:
           name: frontend-dist
           path: dist
           if-no-files-found: error
-          retention-days: 3
+          # Re-run failed jobs is available for 30 days; dist must outlive it.
+          retention-days: 30
 
   release:
     needs: frontend
@@ -138,7 +139,9 @@ jobs:
           releaseBody: "See the assets below to download and install this version."
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }} --config {"build":{"beforeBuildCommand":""}}
+          # Quoted as one shell-style argument: tauri-action tokenizes `args`
+          # with string-argv and must hand Tauri a single valid JSON value.
+          args: ${{ matrix.args }} --config '{"build":{"beforeBuildCommand":""}}'
 
       # ---------------------------------------------------------------------
       # papr CLI — built from the same workspace, signed/notarized on macOS,

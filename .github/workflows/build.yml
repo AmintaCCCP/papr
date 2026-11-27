@@ -75,7 +75,9 @@ jobs:
           name: frontend-dist
           path: dist
           if-no-files-found: error
-          retention-days: 3
+          # A failed platform leg can be re-run manually for up to 30 days;
+          # keep dist around for that whole window so the re-run still has it.
+          retention-days: 30
 
   # Resolve the picker into the matrix legs. Kept as its own job because the
   # selection must happen before matrix expansion; the leg list mirrors the
@@ -245,9 +247,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # tauri-action runs `args` through string-argv, so the JSON is quoted
+          # as one shell-style argument: whatever the tokenizer does with bare
+          # quotes, the config never splits or loses its inner quotes.
           args: >-
             ${{ startsWith(matrix.platform, 'macos') && format('--target {0}', matrix.target) || '' }}
-            --config {"build":{"beforeBuildCommand":""}} ${{ env.EXTRA_BUILD_ARGS }}
+            --config '{"build":{"beforeBuildCommand":""}}' ${{ env.EXTRA_BUILD_ARGS }}
 
       # upload-artifact can't consume tauri-action's artifactPaths output —
       # it is a JSON-array string, which v4 treats as one literal glob and

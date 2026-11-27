@@ -30,8 +30,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
+          # Never resurrect a run the branch has already moved past: a newer
+          # push (or dispatch) will produce its own run and its own retry, and
+          # re-running the stale one only burns runner legs.
+          newer=$(gh api --method GET \
+            "repos/$REPO/actions/workflows/$WORKFLOW_ID/runs" \
+            -f branch="$BRANCH" -f per_page=1 \
+            --jq '.workflow_runs[0].id // empty')
+          if [ -n "$newer" ] && [ "$newer" != "$RUN_ID" ]; then
+            echo "superseded by newer run $newer on $BRANCH"
+            exit 0
+          fi
+
           cancelled=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
             --jq '[.jobs[] | select(.conclusion == "cancelled")] | length')
           if [ "$cancelled" -eq 0 ]; then
