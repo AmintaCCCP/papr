@@ -81,14 +81,16 @@ jobs:
 
   # Resolve the picker into the matrix legs. Kept as its own job because the
   # selection must happen before matrix expansion; the leg list mirrors the
-  # Release workflow's build targets. macOS is one leg per arch: arm64 builds
-  # natively on macos-15, x64 natively on macos-15-intel (no cross-compile, and
-  # rust-cache keys stop colliding between the two architectures).
+  # Release workflow's build targets. macOS is one leg per arch on the newest
+  # image: arm64 on macos-26, x64 on macos-26-intel (native builds, no
+  # cross-compile, separate rust-cache keys). The mac legs go to their own job
+  # below so arm64 can run before x64.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
+      macos: ${{ steps.pick.outputs.macos }}
     steps:
       - id: pick
         # Via env, not inline interpolation, so no value from the dispatch
@@ -98,28 +100,28 @@ jobs:
         run: |
           set -euo pipefail
           mac='[
-            {"platform":"macos-15","target":"aarch64-apple-darwin"},
-            {"platform":"macos-15-intel","target":"x86_64-apple-darwin"}
+            {"platform":"macos-26","target":"aarch64-apple-darwin"},
+            {"platform":"macos-26-intel","target":"x86_64-apple-darwin"}
           ]'
-          all='[
-            {"platform":"macos-15","target":"aarch64-apple-darwin"},
-            {"platform":"macos-15-intel","target":"x86_64-apple-darwin"},
-            {"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"},
-            {"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}
-          ]'
+          linux='{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}'
+          windows='{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}'
           case "$PLATFORMS" in
             macos)
-              matrix=$mac
+              non_mac='[]'
+              macos=$mac
               ;;
             linux)
-              matrix='[{"platform":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]'
+              non_mac="[$linux]"
+              macos='[]'
               ;;
             windows)
-              matrix='[{"platform":"windows-latest","target":"x86_64-pc-windows-msvc"}]'
+              non_mac="[$windows]"
+              macos='[]'
               ;;
             # Push events carry no input at all — same as picking "all".
             all | "")
-              matrix=$all
+              non_mac="[$linux,$windows]"
+              macos=$mac
               ;;
             *)
               echo "::error::unknown platform selection: $PLATFORMS"
@@ -127,11 +129,16 @@ jobs:
               ;;
           esac
           # Job outputs are single-line only — compact whichever branch above
-          # produced the matrix (the pretty-printed `all` literal spans lines).
-          echo "matrix=$(echo "$matrix" | jq -c .)" >> "$GITHUB_OUTPUT"
+          # produced the matrices (the pretty-printed literals span lines).
+          echo "matrix=$(echo "$non_mac" | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "macos=$(echo "$macos" | jq -c .)" >> "$GITHUB_OUTPUT"
 
+  # Linux + Windows legs. Independent of the mac queue, so they run in
+  # parallel while the mac legs take turns below.
   build:
     needs: [plan, frontend]
+    # An empty picker result expands to zero legs; skip instead of erroring.
+    if: needs.plan.outputs.matrix != '[]'
     permissions:
       contents: read
     timeout-minutes: 45
@@ -140,7 +147,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.platform }}
-    steps:
+    steps: &desktop-steps
       - uses: actions/checkout@v5
 
       # tauri.conf.json's frontendDist is ../dist, i.e. the repo-root dist this
@@ -257,11 +264,30 @@ jobs:
       # upload-artifact can't consume tauri-action's artifactPaths output —
       # it is a JSON-array string, which v4 treats as one literal glob and
       # finds nothing. Glob the bundle outputs directly instead; cargo puts
-      # them under the root target dir on every platform, with cross-target
-      # builds (macOS arms) adding the triple as an extra path segment.
+      # them under the root target dir on every platform, and legs that pass
+      # --target (both macOS ones) add the triple as an extra path segment.
       - name: Upload bundles
         uses: actions/upload-artifact@v6
         with:
           name: papr-desktop-${{ matrix.target }}
           path: ${{ startsWith(matrix.platform, 'macos') && format('target/{0}/release/bundle/**', matrix.target) || 'target/release/bundle/**' }}
           if-no-files-found: error
+
+  # macOS legs, arm64 first. `max-parallel: 1` makes the x64 leg wait for the
+  # arm64 one instead of both competing for a scarce hosted macOS runner; arm64
+  # is the architecture that matters now that Intel Macs are being phased out.
+  # Steps are shared with `build` above via the YAML anchor, so the two jobs
+  # cannot drift apart.
+  build-macos:
+    needs: [plan, frontend]
+    if: needs.plan.outputs.macos != '[]'
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.macos) }}
+    runs-on: ${{ matrix.platform }}
+    steps: *desktop-steps

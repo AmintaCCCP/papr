@@ -51,18 +51,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is one leg per architecture on its native runner: arm64 on
-        # macos-15, x64 on macos-15-intel. Cross-compiling both on one arm
-        # runner doubled the job time and shared a single rust cache.
+        # Linux + Windows. The two macOS legs are a separate job below so the
+        # arm64 one can start before x64, like in the Build workflow.
         include:
-          - platform: macos-15
-            os: macos
-            args: "--target aarch64-apple-darwin"
-            cli_target: aarch64-apple-darwin
-          - platform: macos-15-intel
-            os: macos
-            args: "--target x86_64-apple-darwin"
-            cli_target: x86_64-apple-darwin
           - platform: ubuntu-22.04
             os: linux
             args: ""
@@ -73,7 +64,7 @@ jobs:
             cli_target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
-    steps:
+    steps: &release-steps
       - uses: actions/checkout@v5
 
       # tauri.conf.json points frontendDist at ../dist; the build below disables
@@ -227,8 +218,33 @@ jobs:
           asset=$(echo papr-${{ matrix.cli_target }}.*)
           gh release upload "$RELEASE_TAG" "$asset" --clobber --repo "$GH_REPO"
 
+  # macOS legs, arm64 first: `max-parallel: 1` lets the arm64 leg get the
+  # scarce hosted macOS runner before x64 competes for one. Both run on the
+  # newest image and build natively — no cross-compilation. Steps are shared
+  # with the job above via the YAML anchor so the two cannot drift apart.
+  release-macos:
+    needs: frontend
+    permissions:
+      contents: write
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: macos-26
+            os: macos
+            args: "--target aarch64-apple-darwin"
+            cli_target: aarch64-apple-darwin
+          - platform: macos-26-intel
+            os: macos
+            args: "--target x86_64-apple-darwin"
+            cli_target: x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+    steps: *release-steps
+
   finalize-appimage:
-    needs: release
+    needs: [release, release-macos]
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     permissions:
