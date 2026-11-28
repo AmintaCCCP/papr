@@ -1870,15 +1870,116 @@ button { font-family: inherit; }
   padding-bottom: 14px;
   border-bottom: 1px solid var(--hair);
 }
-.briefing-prose {
-  font-size: 14.5px;
-  line-height: 1.75;
+/* The briefing body reads like reader body text: it consumes the same
+   --reader-* typography variables the .article-body rules use (font family,
+   size, leading; the column width comes from .briefing-article). Scoped as
+   .reader-content .briefing-prose — the compound selector out-specifies the
+   generic .ai-prose chat rules further down this file, so inside the briefing
+   article the reader typography wins while chat bubbles keep their compact
+   look. Everything colours from the theme's ink/hair vars, so dark mode
+   follows without extra overrides. */
+.reader-content .briefing-prose {
+  font-family: var(--reader-font);
+  font-size: calc(var(--reader-size, 17px) + var(--reader-font-adjust, 0px));
+  line-height: var(--reader-leading, 1.65);
+  letter-spacing: 0.003em;
+  color: var(--ink);
+  overflow-wrap: break-word;
 }
-.briefing-prose h2 {
-  margin-top: 1.4em;
-  margin-bottom: 0.5em;
-  font-size: 16px;
+.reader-content .briefing-prose p { margin: 0 0 1.05em; }
+.reader-content .briefing-prose h1,
+.reader-content .briefing-prose h2,
+.reader-content .briefing-prose h3,
+.reader-content .briefing-prose h4 {
+  font-family: var(--reader-font);
+  color: var(--ink);
+  line-height: 1.25;
 }
+.reader-content .briefing-prose h1 {
+  font-size: 26px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 1.8em 0 0.6em;
+}
+.reader-content .briefing-prose h2 {
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 1.8em 0 0.6em;
+}
+.reader-content .briefing-prose h3 {
+  font-size: 18px;
+  font-weight: 650;
+  margin: 1.5em 0 0.4em;
+}
+.reader-content .briefing-prose h4 {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 1.4em 0 0.4em;
+}
+.reader-content .briefing-prose blockquote {
+  margin: 1.4em 0;
+  padding: 4px 0 4px 20px;
+  border-left: 2px solid var(--accent);
+  color: var(--ink-2);
+  font-style: italic;
+}
+.reader-content .briefing-prose code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  padding: 1px 6px;
+  background: var(--hover);
+  border-radius: 4px;
+}
+.reader-content .briefing-prose pre {
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  padding: 16px 18px;
+  border-radius: 8px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+.reader-content .briefing-prose pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+.reader-content .briefing-prose a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+.reader-content .briefing-prose ul,
+.reader-content .briefing-prose ol {
+  padding-left: 1.3em;
+  margin: 0 0 1em;
+}
+.reader-content .briefing-prose li { margin: 0.3em 0; }
+.reader-content .briefing-prose hr {
+  border: 0;
+  border-top: 1px solid var(--hair);
+  margin: 2em 0;
+}
+.reader-content .briefing-prose table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.2em 0;
+  font-size: 0.92em;
+}
+.reader-content .briefing-prose th,
+.reader-content .briefing-prose td {
+  border: 1px solid var(--hair);
+  padding: 6px 10px;
+}
+.reader-content .briefing-prose > :last-child { margin-bottom: 0; }
 .ai-head {
   padding: 14px 16px 11px;
   display: flex;
