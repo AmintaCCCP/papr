@@ -116,6 +116,7 @@ describe("AIChatPanel (Global)", () => {
       selectedArticleId: 7,
       aiActiveSessionId: null,
       aiPinnedContexts: [],
+      aiPendingPrompt: null,
     });
   });
   afterEach(() => cleanup());
@@ -223,5 +224,25 @@ describe("AIChatPanel (Global)", () => {
     expect(container.querySelector(".ai-chat")).toBeNull();
     const opened = renderPanel(true);
     expect(opened.container.querySelector(".ai-chat--docked")).not.toBeNull();
+  });
+
+  it("auto-sends a prompt queued while the panel is already open and idle", async () => {
+    // The reader's empty-state "summarize this timeline" action sets
+    // aiPendingPrompt without toggling open/busy — the queue itself must
+    // trigger the send, or the prompt would sit until some later interaction.
+    h.aiGlobalChat.mockResolvedValue(undefined);
+    const { container } = renderPanel(true);
+    await waitFor(() => expect(h.getArticle).toHaveBeenCalledWith(7));
+
+    await act(async () => {
+      useUi.setState({ aiPendingPrompt: "Summarize this timeline" });
+    });
+    await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalledTimes(1));
+    const [, , , history, question] = h.aiGlobalChat.mock.calls[0];
+    expect(question).toBe("Summarize this timeline");
+    expect(history).toEqual([]);
+    // Consuming is one-shot: the queue is empty afterwards.
+    expect(useUi.getState().aiPendingPrompt).toBeNull();
+    expect(container.textContent).toContain("Summarize this timeline");
   });
 });

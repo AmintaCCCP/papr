@@ -722,6 +722,15 @@
   // (state.articles), so "next" honours the current category / unread filter.
   // The open article is marked read exactly like a tap on a card (openArticle
   // handles that), and the buttons disable at the loaded list's edges.
+  function hasHorizontalOverflow(el) {
+    const scroll = $("reader-scroll");
+    while (el && el !== scroll) {
+      if (el.scrollWidth > el.clientWidth + 1) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+
   function adjacentArticleId(delta) {
     const a = state.currentArticle;
     if (!a) return null;
@@ -894,7 +903,10 @@
     // Horizontal swipe in the reading area mirrors the side shortcuts:
     // swipe right → previous, swipe left → next. Only a decisive horizontal
     // gesture fires (|dx| ≥ 64px and at least twice |dy|), so vertical
-    // scrolling and text selection are untouched.
+    // scrolling and text selection are untouched. A gesture starting inside
+    // horizontally scrollable content (a wide code block) pans that element
+    // instead of paging — it is excluded at touchstart, when the hit target
+    // is still known.
     let navTouch = null;
     $("reader-scroll").addEventListener(
       "touchstart",
@@ -903,14 +915,18 @@
           navTouch = null;
           return;
         }
-        navTouch = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        navTouch = {
+          x: e.touches[0].clientX,
+          y: e.touches[0].clientY,
+          inHScroller: hasHorizontalOverflow(e.target),
+        };
       },
       { passive: true },
     );
     $("reader-scroll").addEventListener(
       "touchend",
       (e) => {
-        if (!navTouch) return;
+        if (!navTouch || navTouch.inHScroller) return;
         const dx = e.changedTouches[0].clientX - navTouch.x;
         const dy = e.changedTouches[0].clientY - navTouch.y;
         navTouch = null;

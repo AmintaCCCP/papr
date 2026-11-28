@@ -2237,7 +2237,11 @@ pub async fn ai_rate_articles(
     );
     let user = format!("Rate these {} articles:\n\n{corpus}", articles.len());
     let http = state.http();
-    let text = ai::complete_chat(&http, &cfg, &system, &user, ai::MAX_TOKENS).await?;
+    // The reply is one JSON array entry per input article — up to 40 of them.
+    // The translation-budget MAX_TOKENS (1024) truncates that once a model
+    // pretty-prints, and a truncated array can never parse, so give it the
+    // chat budget instead.
+    let text = ai::complete_chat(&http, &cfg, &system, &user, ai::CHAT_MAX_TOKENS).await?;
     parse_ai_ratings(&text).ok_or_else(|| AppError::code("aiRateUnparseable"))
 }
 
@@ -4223,6 +4227,42 @@ mod tests {
             summary_user_turn("Title", "Body text"),
             "Title: Title\n\nBody text"
         );
+    }
+
+    // --- parse_ai_ratings: the strict-JSON rating reply survives real models ---
+
+    #[test]
+    fn parse_ai_ratings_reads_a_bare_array_and_clamps() {
+        let got = parse_ai_ratings(r#"[{"id":11,"score":7.5},{"id":12,"score":42}]"#).unwrap();
+        assert_eq!(
+            got.iter().map(|r| (r.id, r.score)).collect::<Vec<_>>(),
+            vec![(11, 7.5), (12, 10.0)] // 42 clamps to the documented 0-10
+        );
+    }
+
+    #[test]
+    fn parse_ai_ratings_slices_a_fence_and_prose_out() {
+        // The prompt forbids prose and markdown fences, but models add them
+        // anyway — the parser slices from the first '[' to the last ']'.
+        let text = "Sure, here are the scores:\n```json\n\
+                    [{\"id\":3,\"score\":12.5},{\"id\":4,\"score\":-2}]\n```\n\
+                    Let me know if you need anything else.";
+        let got = parse_ai_ratings(text).unwrap();
+        assert_eq!(
+            got.iter().map(|r| (r.id, r.score)).collect::<Vec<_>>(),
+            vec![(3, 10.0), (4, 0.0)]
+        );
+    }
+
+    #[test]
+    fn parse_ai_ratings_rejects_replies_without_a_json_array() {
+        // Plain prose: no '[' to slice from.
+        assert!(parse_ai_ratings("I could not rate those articles.").is_none());
+        // A JSON object of scalars carries no ratings array.
+        assert!(parse_ai_ratings(r#"{"error":"rate limit"}"#).is_none());
+        // Bracketed but not a JSON array of {id, score} (e.g. a truncated
+        // reply, or scores as strings) must not half-parse.
+        assert!(parse_ai_ratings(r#"[{"id":1,"score":"high"}]"#).is_none());
     }
 
     // --- preview-translation helpers: the plain-text round-trip the list uses ---

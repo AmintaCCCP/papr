@@ -101,6 +101,9 @@ export default function AIChatPanel({
   const activeSessionId = useUi((s) => s.aiActiveSessionId);
   const setActiveSessionId = useUi((s) => s.setAiActiveSessionId);
   const pinnedContexts = useUi((s) => s.aiPinnedContexts);
+  // Watched so the drain effect below re-runs when a prompt is queued while
+  // the panel is already open — the queue is the trigger, not just open/busy.
+  const aiPendingPrompt = useUi((s) => s.aiPendingPrompt);
   const addAiContext = useUi((s) => s.addAiContext);
   const removeAiContext = useUi((s) => s.removeAiContext);
   const clearAiContexts = useUi((s) => s.clearAiContexts);
@@ -200,14 +203,16 @@ export default function AIChatPanel({
   // this timeline" action) is sent once, when the panel is open and idle.
   // The queue (aiPendingPrompt in the store) survives until then, so a click
   // that lands while a reply is still streaming fires as soon as it finishes.
-  // The guards are the real dependencies: consuming is one-shot, so re-runs
-  // on other renders only ever find an empty queue.
+  // `aiPendingPrompt` must be a dependency: when the panel is ALREADY open and
+  // idle, neither open/busy/loadingSession changes when a prompt is queued, and
+  // without it the queued prompt would sit unsent until some later interaction.
+  // Consuming is one-shot, so re-runs on other renders only find an empty queue.
   useEffect(() => {
     if (!open || busy || loadingSession) return;
     const pending = useUi.getState().consumeAiPendingPrompt();
     if (pending) sendQuestion(pending);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, busy, loadingSession]);
+  }, [open, busy, loadingSession, aiPendingPrompt]);
 
   useEffect(() => {
     return () => {
