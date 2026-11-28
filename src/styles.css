@@ -3100,6 +3100,15 @@ button { font-family: inherit; }
   background: var(--hover); padding: 1px 5px; border-radius: 4px;
 }
 .ai-prose strong { color: var(--ink); font-weight: 600; }
+/* Assistant-reply links: text-coloured with an accent underline (matching
+   .article-body a / .briefing-prose a) instead of the browser default blue. */
+.ai-prose a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
 
 /* list loading skeleton */
 .sk-art { padding: var(--row-py) var(--list-px); border-bottom: 1px solid var(--hair); }

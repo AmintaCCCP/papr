@@ -519,6 +519,14 @@ body {
   margin-bottom: 0;
 }
 
+/* Match .reader-content a — AI-summary links were falling back to the
+   browser default blue with underline. */
+.ai-summary-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .ai-summary-body ul,
 .ai-summary-body ol {
   margin: 4px 0 8px;
