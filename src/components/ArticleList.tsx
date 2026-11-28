@@ -8,6 +8,7 @@ import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
 import { listTranslationKey, useListTranslation } from "../listTranslation";
 import { resolveRowTranslation } from "../lib/rowTranslation";
+import { applyIdOrder, currentListKey } from "../lib/currentList";
 import { relTime } from "../lib/feedMeta";
 import { isMac, modCombo } from "../lib/platform";
 import { reportError, toast } from "../toast";
@@ -96,10 +97,22 @@ export default function ArticleList({ onToast }: Props) {
       (firstParam as number) > 0 ? Math.max(0, (firstParam as number) - PAGE) : undefined,
   });
 
-  const items: ArticleSummary[] = useMemo(
-    () => browse.data?.pages.flat() ?? [],
-    [browse.data],
-  );
+  // The displayed window. When the AI importance ordering is active for this
+  // exact list context (set from the reader's empty-state quick action), the
+  // scored rows are shown score-descending ahead of the rest — a client-side
+  // reorder of the loaded pages only; paging and the cache stay untouched.
+  // `readCurrentItems` applies the same order, so J/K agrees with the view.
+  const importanceOrder = useUi((s) => s.importanceOrder);
+  const items: ArticleSummary[] = useMemo(() => {
+    const flat = browse.data?.pages.flat() ?? [];
+    if (
+      importanceOrder &&
+      importanceOrder.key === currentListKey(query, unreadOnly, sortOldest)
+    ) {
+      return applyIdOrder(flat, importanceOrder.ids);
+    }
+    return flat;
+  }, [browse.data, importanceOrder, query, unreadOnly, sortOldest]);
   // Global row offset of `items[0]` — the param of the earliest loaded page
   // (which can sit below the anchor once the user pages upward). Global index
   // of `items[k]` is `baseOffset + k`, the bridge between the virtual list's

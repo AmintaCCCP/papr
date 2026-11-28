@@ -325,6 +325,7 @@ pub fn run() {
             commands::ai_chat_delete_session,
             commands::ai_chat_get_messages,
             commands::ai_digest,
+            commands::ai_rate_articles,
             commands::ai_list_briefings,
             commands::ai_delete_briefing,
             commands::ai_generate_briefing,

@@ -2182,6 +2182,86 @@ pub async fn ai_ask(
     Ok(())
 }
 
+/// One article the importance sorter rates, as the webview holds it —
+/// summary fields only; the model never needs the full body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRateInput {
+    id: i64,
+    title: String,
+    feed_title: String,
+    snippet: String,
+}
+
+/// One returned importance score: 0-10, clamped to one decimal of sanity.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AiRating {
+    id: i64,
+    score: f64,
+}
+
+/// Rate article importance (0-10) for the reader's empty-state "sort by
+/// importance" quick action. One one-shot completion over the shared AI
+/// config ([`ai::complete_chat`]); the strict-JSON reply is parsed here so
+/// the frontend receives clean typed data and a coded error on garbage.
+/// Scores are not persisted — the ordering is a client-side view state.
+#[tauri::command]
+pub async fn ai_rate_articles(
+    state: State<'_, AppState>,
+    articles: Vec<AiRateInput>,
+) -> AppResult<Vec<AiRating>> {
+    if articles.is_empty() {
+        return Ok(vec![]);
+    }
+    let (cfg, lang) = {
+        let conn = state.read().await;
+        (load_ai_config(&conn)?, response_language(&conn))
+    };
+    let mut corpus = String::new();
+    for a in &articles {
+        corpus.push_str(&format!(
+            "- id={} | {} | {} | {}\n",
+            a.id,
+            a.feed_title,
+            a.title,
+            truncate(&a.snippet, 160)
+        ));
+    }
+    let system = format!(
+        "You rate how important articles are to the user of a personal \
+         RSS reader. Judge by substance: depth, originality, relevance \
+         to a thoughtful reader, lasting value — not clickbait or volume. \
+         Reply with ONLY a JSON array, one object per input article, each \
+         {{\"id\": <the given id>, \"score\": <0-10, one decimal>}}. No \
+         prose, no markdown fence.{lang}"
+    );
+    let user = format!("Rate these {} articles:\n\n{corpus}", articles.len());
+    let http = state.http();
+    let text = ai::complete_chat(&http, &cfg, &system, &user, ai::MAX_TOKENS).await?;
+    parse_ai_ratings(&text).ok_or_else(|| AppError::code("aiRateUnparseable"))
+}
+
+/// Extract the JSON rating array out of a model reply. Models occasionally
+/// wrap the array in a ```json fence or prepend a sentence, so slice from
+/// the first `[` to the last `]` before parsing; nonsense scores are clamped.
+fn parse_ai_ratings(text: &str) -> Option<Vec<AiRating>> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    let raw: Vec<AiRating> = serde_json::from_str(&text[start..=end]).ok()?;
+    Some(
+        raw.into_iter()
+            .filter(|r| r.score.is_finite())
+            .map(|r| AiRating {
+                id: r.id,
+                score: r.score.clamp(0.0, 10.0),
+            })
+            .collect(),
+    )
+}
+
 /// One prior turn of the article-chat conversation, as the webview holds it.
 /// `role` is `"user"` or `"assistant"`.
 #[derive(Debug, Deserialize)]

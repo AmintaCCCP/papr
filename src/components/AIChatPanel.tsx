@@ -196,6 +196,19 @@ export default function AIChatPanel({
     }
   }, [open, pinnedContexts.length]);
 
+  // A prompt queued by another surface (the reader's empty-state "summarize
+  // this timeline" action) is sent once, when the panel is open and idle.
+  // The queue (aiPendingPrompt in the store) survives until then, so a click
+  // that lands while a reply is still streaming fires as soon as it finishes.
+  // The guards are the real dependencies: consuming is one-shot, so re-runs
+  // on other renders only ever find an empty queue.
+  useEffect(() => {
+    if (!open || busy || loadingSession) return;
+    const pending = useUi.getState().consumeAiPendingPrompt();
+    if (pending) sendQuestion(pending);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, busy, loadingSession]);
+
   useEffect(() => {
     return () => {
       runRef.current = 0;

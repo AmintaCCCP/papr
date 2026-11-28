@@ -2125,6 +2125,44 @@ button { font-family: inherit; }
 .empty-retry:hover { background: var(--hover); color: var(--ink); }
 .empty-retry:disabled { opacity: 0.5; cursor: default; }
 
+/* Folo-style quick actions in the empty reader: a question as the title and
+   a vertical stack of icon + accent-text rows that jump-start the timeline
+   (summarize it with the AI assistant, or importance-sort it). Accent-ink on
+   the label with the plain accent on the glyph — "one accent, used rarely"
+   still holds: these rows are the only colour on the empty sheet. */
+.empty-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+.empty-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  margin-top: 2px;
+}
+.empty-action {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 20px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--accent-ink);
+  font-size: 13px;
+  font-weight: 550;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.empty-action svg { color: var(--accent); flex-shrink: 0; }
+.empty-action:hover { background: var(--hover); }
+.empty-action.on { color: var(--accent); }
+.empty-action:disabled { opacity: 0.6; cursor: default; }
+
 /* ====== Command palette ====== */
 .cp-backdrop {
   position: fixed;

@@ -188,6 +188,14 @@ interface UiState {
   aiPinnedContexts: AiContextRef[];
   /** Optional draft prompt handed to the AI composer (e.g. from selection). */
   aiPendingPrompt: string | null;
+  /** Client-side importance ordering for the article list — the reader's
+   *  empty-state "sort by importance" quick action. `key` is the
+   *  currentListKey() signature of the list the scores were computed for, so
+   *  the ordering applies only while that exact view/filter combination is
+   *  shown; switching feed or filters drops back to the default order. The
+   *  scored ids drive `applyIdOrder` in lib/currentList.ts; scores are
+   *  session-only and never persisted. */
+  importanceOrder: { key: string; ids: number[] } | null;
   /** Whether the reader shows the reading view or the article's original
    *  page (native child webview). Lives here, not in the reader component,
    *  so the keyboard / command-palette AI-summary toggle can return to the
@@ -241,6 +249,12 @@ interface UiState {
   consumeAiPendingPrompt: () => string | null;
   askAiAboutSelection: (articleId: number, title: string, quote: string) => void;
   askAiAboutBriefing: (briefing: AiBriefing) => void;
+  /** Open the AI assistant sidebar and auto-send a "summarize this timeline"
+   *  prompt (the reader's empty-state quick action). The prompt rides the
+   *  one-shot `aiPendingPrompt` queue; the composer sends it once it is open
+   *  and idle, with the current view/feed attached as its auto context. */
+  askAiSummarizeTimeline: () => void;
+  setImportanceOrder: (order: { key: string; ids: number[] } | null) => void;
   setReaderView: (v: "reader" | "web") => void;
   setModalOpen: (v: boolean) => void;
   setMenuOpen: (v: boolean) => void;
@@ -369,6 +383,7 @@ export const useUi = create<UiState>((set, get) => ({
   aiActiveSessionId: null,
   aiPinnedContexts: [],
   aiPendingPrompt: null,
+  importanceOrder: null,
   readerView: "reader",
   modalOpen: false,
   menuOpen: false,
@@ -499,6 +514,12 @@ export const useUi = create<UiState>((set, get) => ({
         aiPinnedContexts: [...filtered, nextCtx],
       };
     }),
+  askAiSummarizeTimeline: () =>
+    set({
+      aiChatOpen: true,
+      aiPendingPrompt: i18n.t("ai.summarizeTimelinePrompt"),
+    }),
+  setImportanceOrder: (importanceOrder) => set({ importanceOrder }),
   setReaderView: (readerView) => set({ readerView }),
   setModalOpen: (modalOpen) => set({ modalOpen }),
   setMenuOpen: (menuOpen) => set({ menuOpen }),
