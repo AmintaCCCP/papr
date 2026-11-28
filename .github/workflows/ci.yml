@@ -10,6 +10,7 @@ jobs:
   frontend:
     name: Type-check & build frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -36,6 +37,7 @@ jobs:
   rust:
     name: Check Rust (src-tauri)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -47,10 +49,13 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # rust-cache resolves the target dir as `<workspace>/target`; the Cargo
+      # workspace root is the repo root (./Cargo.toml), so pass "." — passing
+      # `src-tauri` caches a directory cargo never writes to.
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Check compile
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets

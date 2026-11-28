@@ -4,9 +4,22 @@ name: Retry runner-cancelled runs
 # the queue, runs zero steps, and is marked `cancelled` at exactly 15 minutes.
 # That turns a green build red without a line of code being wrong (see
 # actions/runner#4833). This workflow re-runs the failed jobs once when such a
-# zero-step cancellation is what took the run down. Genuine compile failures
-# never have a cancelled job, so they are left alone. `run_attempt < 2` caps
+# zero-step cancellation is what took the run down.
+#
+# The gate accepts `failure` as well as `cancelled`: a runner-acquisition
+# loss leaves the run-level conclusion `cancelled`, so a failure-only gate
+# never fires (this workflow sat skipped on every cancelled Build run).
+# Within the run, only cancelled jobs that executed zero steps count as
+# capacity losses — the jobs API returns an empty `steps` array for a job
+# that never got a runner, while a job cancelled mid-run (by `concurrency`
+# from a newer push, or by hand) still lists the steps it completed. Those
+# are deliberate cancellations and are left alone. The supersede check below
+# skips runs the branch has already moved past, and `run_attempt < 2` caps
 # this at a single automatic retry, so a retried run can never loop.
+#
+# NB: `on: workflow_run` always executes the version of this file that sits
+# on the default branch, not the one on the branch that produced the run —
+# changes here only take effect once merged to main.
 
 on:
   workflow_run:
@@ -20,7 +33,8 @@ permissions:
 jobs:
   retry-cancelled:
     if: >-
-      github.event.workflow_run.conclusion == 'failure' &&
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled') &&
       github.event.workflow_run.run_attempt < 2
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -46,12 +60,25 @@ jobs:
             exit 0
           fi
 
-          cancelled=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
-            --jq '[.jobs[] | select(.conclusion == "cancelled")] | length')
+          jobs=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")
+          # A job that never got a runner has an empty steps array; a job
+          # cancelled mid-run still lists the steps it completed before the
+          # cancellation landed. Only the former is a runner-acquisition loss
+          # worth retrying — the latter is concurrency or a manual cancel.
+          cancelled=$(echo "$jobs" | jq '[.jobs[] | select(.conclusion == "cancelled")] | length')
+          lost=$(echo "$jobs" | jq '
+            [.jobs[]
+             | select(.conclusion == "cancelled"
+                      and ([.steps[]? | select(.conclusion == "success")] | length) == 0)]
+            | length')
           if [ "$cancelled" -eq 0 ]; then
             echo "no cancelled jobs — real failure, not a runner acquisition loss"
             exit 0
           fi
-          echo "::notice::$cancelled job(s) cancelled without running; retrying failed jobs once"
+          if [ "$lost" -eq 0 ]; then
+            echo "::notice::$cancelled cancelled job(s) had executed steps — concurrency or manual cancellation, not a runner acquisition loss"
+            exit 0
+          fi
+          echo "::notice::$lost of $cancelled cancelled job(s) ran zero steps — runner never acquired; retrying failed jobs once"
           gh run rerun "$RUN_ID" --repo "$REPO" --failed \
             || gh run rerun "$RUN_ID" --repo "$REPO"
