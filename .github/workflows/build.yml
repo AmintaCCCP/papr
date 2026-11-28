@@ -154,7 +154,7 @@ jobs:
       # artifact unpacks to. The build below disables beforeBuildCommand so the
       # vendored dist is what gets bundled.
       - name: Download frontend dist
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: frontend-dist
           path: dist

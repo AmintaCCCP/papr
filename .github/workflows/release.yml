@@ -70,7 +70,7 @@ jobs:
       # tauri.conf.json points frontendDist at ../dist; the build below disables
       # beforeBuildCommand so this vendored copy is what gets bundled.
       - name: Download frontend dist
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: frontend-dist
           path: dist
