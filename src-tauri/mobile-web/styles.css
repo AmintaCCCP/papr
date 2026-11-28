@@ -570,6 +570,36 @@ body {
   color: var(--text-muted);
 }
 
+/* ── Reader prev / next floating shortcuts ──
+   Edge-anchored, vertically centered; 44px keeps the touch target at the
+   recommended minimum. Colours come from the theme vars, so dark mode
+   follows automatically; edges disable via the :disabled fade. */
+.reader-nav-btn {
+  position: absolute;
+  top: 50%;
+  z-index: 5;
+  width: 44px;
+  height: 44px;
+  margin-top: -22px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+.reader-nav-btn.is-prev { left: calc(10px + var(--safe-left)); }
+.reader-nav-btn.is-next { right: calc(10px + var(--safe-right)); }
+.reader-nav-btn:active { transform: scale(0.92); }
+.reader-nav-btn:disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
 /* ── Reader Bottom Action Bar ── */
 .reader-bottom-bar {
   display: grid;

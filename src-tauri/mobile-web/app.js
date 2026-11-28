@@ -28,6 +28,8 @@
       copyFail: "复制失败",
       open: "浏览器",
       share: "集成",
+      prevArticle: "上一篇",
+      nextArticle: "下一篇",
       openApp: "点击打开应用",
       noUrl: "该文章没有原文链接",
       markAllConfirm: "将当前分类全部标为已读？",
@@ -63,6 +65,8 @@
       copyFail: "Copy failed",
       open: "Browser",
       share: "Share",
+      prevArticle: "Previous article",
+      nextArticle: "Next article",
       openApp: "Open App",
       noUrl: "Article has no URL",
       markAllConfirm: "Mark all articles in this view as read?",
@@ -98,6 +102,8 @@
       copyFail: "コピーに失敗しました",
       open: "ブラウザ",
       share: "共有",
+      prevArticle: "前の記事",
+      nextArticle: "次の記事",
       openApp: "アプリを開く",
       noUrl: "記事のURLがありません",
       markAllConfirm: "この一覧をすべて既読にしますか？",
@@ -358,6 +364,14 @@
     $("search-input").placeholder = tr("searchPlaceholder");
     $("sheet-title").textContent = tr("shareTitle");
     $("sheet-cancel").textContent = tr("cancel");
+    for (const [id, key] of [
+      ["reader-prev-btn", "prevArticle"],
+      ["reader-next-btn", "nextArticle"],
+    ]) {
+      const el = $(id);
+      el.title = tr(key);
+      el.setAttribute("aria-label", tr(key));
+    }
     document.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.getAttribute("data-i18n");
       if (key) el.textContent = tr(key);
@@ -558,6 +572,8 @@
     starBtn.querySelector("span").textContent = a.isStarred
       ? tr("starredBtn")
       : tr("star");
+
+    updateReaderNav();
   }
 
   async function loadBootstrap(silent = false) {
@@ -642,6 +658,9 @@
       }
       state.hasMore = rows.length === count;
       renderArticleList();
+      // A reload can reshuffle (or filter out) the open article, which moves
+      // the prev/next window — keep the floating shortcuts honest.
+      updateReaderNav();
     } catch (e) {
       if (seq === listSeq) showToast(e.message);
     } finally {
@@ -696,6 +715,31 @@
       state.currentArticle = { ...state.currentArticle, ...patch };
     }
     renderArticleList();
+  }
+
+  // ── Reader prev / next shortcuts ──
+  // Adjacency walks the *filtered* list the user is reading
+  // (state.articles), so "next" honours the current category / unread filter.
+  // The open article is marked read exactly like a tap on a card (openArticle
+  // handles that), and the buttons disable at the loaded list's edges.
+  function adjacentArticleId(delta) {
+    const a = state.currentArticle;
+    if (!a) return null;
+    const idx = state.articles.findIndex((x) => x.id === a.id);
+    if (idx < 0) return null;
+    const target = state.articles[idx + delta];
+    return target ? target.id : null;
+  }
+
+  function updateReaderNav() {
+    $("reader-prev-btn").disabled = adjacentArticleId(-1) == null;
+    $("reader-next-btn").disabled = adjacentArticleId(1) == null;
+  }
+
+  function goAdjacentArticle(delta) {
+    const id = adjacentArticleId(delta);
+    if (id == null) return;
+    openArticle(id);
   }
 
   function closeReader() {
@@ -843,6 +887,38 @@
     });
 
     $("back-btn").addEventListener("click", closeReader);
+
+    $("reader-prev-btn").addEventListener("click", () => goAdjacentArticle(-1));
+    $("reader-next-btn").addEventListener("click", () => goAdjacentArticle(1));
+
+    // Horizontal swipe in the reading area mirrors the side shortcuts:
+    // swipe right → previous, swipe left → next. Only a decisive horizontal
+    // gesture fires (|dx| ≥ 64px and at least twice |dy|), so vertical
+    // scrolling and text selection are untouched.
+    let navTouch = null;
+    $("reader-scroll").addEventListener(
+      "touchstart",
+      (e) => {
+        if (e.touches.length !== 1) {
+          navTouch = null;
+          return;
+        }
+        navTouch = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      },
+      { passive: true },
+    );
+    $("reader-scroll").addEventListener(
+      "touchend",
+      (e) => {
+        if (!navTouch) return;
+        const dx = e.changedTouches[0].clientX - navTouch.x;
+        const dy = e.changedTouches[0].clientY - navTouch.y;
+        navTouch = null;
+        if (Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 2) return;
+        goAdjacentArticle(dx > 0 ? -1 : 1);
+      },
+      { passive: true },
+    );
 
     $("reader-read-btn").addEventListener("click", async () => {
       const a = state.currentArticle;
