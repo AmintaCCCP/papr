@@ -438,7 +438,14 @@ body {
   flex: 1;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  padding: 18px calc(18px + var(--safe-right)) 28px calc(18px + var(--safe-left));
+  /* Regular horizontal padding — the prev/next controls moved to a bottom
+     pill (see .reader-nav-pill), so no side reserve is needed any more. The
+     large bottom padding instead reserves room for that pill: it floats
+     12px above the action bar and stands 56px tall, covering the lowest
+     68px of the scroll viewport, so 88px keeps the article's last line
+     scrollable clear of it (safe-bottom rides along for headroom parity
+     with the bar and pill). */
+  padding: 18px calc(18px + var(--safe-right)) calc(88px + var(--safe-bottom)) calc(18px + var(--safe-left));
 }
 
 .reader-article {
@@ -509,6 +516,14 @@ body {
   margin-bottom: 0;
 }
 
+/* Match .reader-content a — AI-summary links were falling back to the
+   browser default blue with underline. */
+.ai-summary-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .ai-summary-body ul,
 .ai-summary-body ol {
   margin: 4px 0 8px;
@@ -570,8 +585,54 @@ body {
   color: var(--text-muted);
 }
 
+/* ── Reader prev / next floating shortcuts ──
+   A centered pill floating just above the bottom action bar: the pill is an
+   absolutely-positioned child of .reader-bottom-bar (position: relative
+   below), so `bottom: calc(100% + 12px)` clears the bar's height and its
+   safe-area inset automatically, whatever the bar ends up measuring. It is
+   out of the grid's flow (abs-positioned children create no tracks), and
+   `.reader-scroll`'s bottom padding keeps article text scrollable clear of
+   it. Each button keeps a 44px touch target; colours come from the theme
+   vars, so dark mode follows automatically; edges disable via the :disabled
+   fade. */
+.reader-nav-pill {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  gap: 10px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+}
+
+.reader-nav-btn {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.reader-nav-btn:active { transform: scale(0.92); }
+.reader-nav-btn:disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
 /* ── Reader Bottom Action Bar ── */
 .reader-bottom-bar {
+  /* Containing block for the floating nav pill above it (see .reader-nav-pill). */
+  position: relative;
   display: grid;
   grid-template-columns: repeat(6, 1fr);
   gap: 2px;

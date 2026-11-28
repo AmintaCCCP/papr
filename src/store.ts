@@ -133,6 +133,36 @@ const ls = {
     localStorage.setItem(k, typeof v === "boolean" ? (v ? "1" : "0") : String(v)),
 };
 
+/** A prompt queued by another surface (the reader's empty-state "summarize
+ *  this timeline" action) for the AI composer to send once it is open and
+ *  idle. Carries the AI contexts captured when it was queued: the queue holds
+ *  while a reply is still streaming, and the user may switch feed / folder /
+ *  tag in the meantime — the prompt must describe the timeline it was written
+ *  for, not whichever one is active when the send finally fires. */
+export interface AiPendingPrompt {
+  text: string;
+  contexts: AiContextRef[];
+}
+
+/** The AI auto context for the active timeline (no article open) — the same
+ *  mapping the composer derives for its own auto-context, kept in one place
+ *  so a queued prompt's snapshot and a live send label a timeline identically. */
+export function timelineContextRef(
+  query: ArticleQuery,
+  label: string,
+): AiContextRef {
+  if (query.kind === "feed") {
+    return { kind: "feed", feedId: query.value, title: label };
+  }
+  if (query.kind === "folder") {
+    return { kind: "folder", folderId: query.value, name: label };
+  }
+  if (query.kind === "tag") {
+    return { kind: "tag", tagId: query.value, name: label };
+  }
+  return { kind: "view", query, label };
+}
+
 interface UiState {
   /** The active sidebar selection driving the article list. */
   query: ArticleQuery;
@@ -186,8 +216,17 @@ interface UiState {
   aiActiveSessionId: string | null;
   /** Manually pinned / attached context chips in the global AI composer. */
   aiPinnedContexts: AiContextRef[];
-  /** Optional draft prompt handed to the AI composer (e.g. from selection). */
-  aiPendingPrompt: string | null;
+  /** Optional draft prompt handed to the AI composer (e.g. from the reader's
+   *  empty-state quick actions), with the AI contexts captured at queue time. */
+  aiPendingPrompt: AiPendingPrompt | null;
+  /** Client-side importance ordering for the article list — the reader's
+   *  empty-state "sort by importance" quick action. `key` is the
+   *  currentListKey() signature of the list the scores were computed for, so
+   *  the ordering applies only while that exact view/filter combination is
+   *  shown; switching feed or filters drops back to the default order. The
+   *  scored ids drive `applyIdOrder` in lib/currentList.ts; scores are
+   *  session-only and never persisted. */
+  importanceOrder: { key: string; ids: number[] } | null;
   /** Whether the reader shows the reading view or the article's original
    *  page (native child webview). Lives here, not in the reader component,
    *  so the keyboard / command-palette AI-summary toggle can return to the
@@ -204,6 +243,15 @@ interface UiState {
    *  original-page webview that floats above the DOM (issue #74), so the
    *  reader suspends that view while a menu is up. */
   menuOpen: boolean;
+  /** A background refresh (Rust scheduler / mobile sync) landed while the user
+   *  was parked on the current article list. The visible list is deliberately
+   *  NOT refetched then — a mid-read refetch would drop rows out from under
+   *  them (a just-opened article vanishing from an "unread only" view) — so
+   *  App.tsx queues the event here instead. ArticleList drains the backlog the
+   *  moment the list context actually changes (feed / filter / sort / anchor),
+   *  i.e. once the user has left the list that was being protected. A plain
+   *  boolean: repeat events collapse into one backlog, nothing accumulates. */
+  pendingListRefresh: boolean;
 
   select: (query: ArticleQuery, label: string) => void;
   openArticle: (id: number | null) => void;
@@ -229,12 +277,22 @@ interface UiState {
   addAiContext: (ctx: AiContextRef) => void;
   removeAiContext: (index: number) => void;
   clearAiContexts: () => void;
-  consumeAiPendingPrompt: () => string | null;
+  consumeAiPendingPrompt: () => AiPendingPrompt | null;
   askAiAboutSelection: (articleId: number, title: string, quote: string) => void;
   askAiAboutBriefing: (briefing: AiBriefing) => void;
+  /** Open the AI assistant sidebar and auto-send a "summarize this timeline"
+   *  prompt (the reader's empty-state quick action). The prompt rides the
+   *  one-shot `aiPendingPrompt` queue with the timeline context snapshotted
+   *  at click time; the composer sends it once it is open and idle, using
+   *  that snapshot — even if the user has switched feeds while a previous
+   *  reply was still streaming. */
+  askAiSummarizeTimeline: () => void;
+  setImportanceOrder: (order: { key: string; ids: number[] } | null) => void;
   setReaderView: (v: "reader" | "web") => void;
   setModalOpen: (v: boolean) => void;
   setMenuOpen: (v: boolean) => void;
+  markListRefreshPending: () => void;
+  consumePendingListRefresh: () => boolean;
 }
 
 const PREF_KEYS: (keyof Prefs)[] = [
@@ -358,9 +416,11 @@ export const useUi = create<UiState>((set, get) => ({
   aiActiveSessionId: null,
   aiPinnedContexts: [],
   aiPendingPrompt: null,
+  importanceOrder: null,
   readerView: "reader",
   modalOpen: false,
   menuOpen: false,
+  pendingListRefresh: false,
 
   select: (query, label) => {
     // Remember the selection so the "open on startup: last view" preference
@@ -487,9 +547,37 @@ export const useUi = create<UiState>((set, get) => ({
         aiPinnedContexts: [...filtered, nextCtx],
       };
     }),
+  askAiSummarizeTimeline: () =>
+    set((s) => {
+      // Snapshot the timeline context NOW — the click time. The prompt queues
+      // while a reply may still be streaming, and the user can switch feed /
+      // folder / tag before the composer goes idle; sending would otherwise
+      // attach the then-current timeline and mislabel the summary. Pinned
+      // chips ride along as they were at click time; a timeline that is
+      // already pinned is not prepended twice.
+      const timeline = timelineContextRef(s.query, s.queryLabel);
+      const key = JSON.stringify(timeline);
+      const contexts = s.aiPinnedContexts.some((c) => JSON.stringify(c) === key)
+        ? [...s.aiPinnedContexts]
+        : [timeline, ...s.aiPinnedContexts];
+      return {
+        aiChatOpen: true,
+        aiPendingPrompt: {
+          text: i18n.t("ai.summarizeTimelinePrompt"),
+          contexts,
+        },
+      };
+    }),
+  setImportanceOrder: (importanceOrder) => set({ importanceOrder }),
   setReaderView: (readerView) => set({ readerView }),
   setModalOpen: (modalOpen) => set({ modalOpen }),
   setMenuOpen: (menuOpen) => set({ menuOpen }),
+  markListRefreshPending: () => set({ pendingListRefresh: true }),
+  consumePendingListRefresh: () => {
+    if (!get().pendingListRefresh) return false;
+    set({ pendingListRefresh: false });
+    return true;
+  },
 }));
 
 // Seed the backend's appearance copy on startup so an existing install — whose

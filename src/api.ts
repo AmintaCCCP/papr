@@ -274,6 +274,26 @@ export const aiChatDeleteSession = (id: string) =>
 export const aiChatGetMessages = (sessionId: string) =>
   invoke<AiChatMessageRow[]>("ai_chat_get_messages", { sessionId });
 
+/** One article handed to the importance scorer — summary fields only. */
+export interface AiRateInput {
+  id: number;
+  title: string;
+  feedTitle: string;
+  snippet: string;
+}
+/** One returned importance score (0-10). `null` marks an id the model never
+ *  actually scored — the backend still covers every input id exactly once,
+ *  and the reader's `?? -1` fallback ranks unrated rows below real scores. */
+export interface AiRating {
+  id: number;
+  score: number | null;
+}
+/** Score article importance for the reader's empty-state "sort by
+ *  importance" quick action. One one-shot completion; the strict-JSON reply
+ *  is parsed backend-side so callers get clean typed data. */
+export const aiRateArticles = (articles: AiRateInput[]) =>
+  invoke<AiRating[]>("ai_rate_articles", { articles });
+
 export const aiListBriefings = () =>
   invoke<AiBriefing[]>("ai_list_briefings");
 export const aiDeleteBriefing = (id: number) =>

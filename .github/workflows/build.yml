@@ -154,7 +154,7 @@ jobs:
       # artifact unpacks to. The build below disables beforeBuildCommand so the
       # vendored dist is what gets bundled.
       - name: Download frontend dist
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: frontend-dist
           path: dist
@@ -181,10 +181,14 @@ jobs:
         with:
           targets: ${{ startsWith(matrix.platform, 'macos') && matrix.target || '' }}
 
+      # rust-cache resolves the target dir as `<workspace>/target`. The Cargo
+      # workspace root is the repo root (./Cargo.toml), so that path is
+      # ./target — passing `src-tauri` made it cache a directory cargo never
+      # writes, and every leg recompiled all crates from scratch.
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
           key: ${{ matrix.target }}
 
       # tauri-action shells out to `pnpm tauri build`, so node_modules must

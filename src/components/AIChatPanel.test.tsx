@@ -4,6 +4,8 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AIChatPanel from "./AIChatPanel";
 import { useUi } from "../store";
+import i18n from "../i18n";
+import type { AiContextRef } from "../types";
 
 const h = vi.hoisted(() => {
   if (
@@ -116,6 +118,7 @@ describe("AIChatPanel (Global)", () => {
       selectedArticleId: 7,
       aiActiveSessionId: null,
       aiPinnedContexts: [],
+      aiPendingPrompt: null,
     });
   });
   afterEach(() => cleanup());
@@ -223,5 +226,118 @@ describe("AIChatPanel (Global)", () => {
     expect(container.querySelector(".ai-chat")).toBeNull();
     const opened = renderPanel(true);
     expect(opened.container.querySelector(".ai-chat--docked")).not.toBeNull();
+  });
+
+  it("auto-sends a prompt queued while the panel is already open and idle", async () => {
+    // The reader's empty-state "summarize this timeline" action sets
+    // aiPendingPrompt without toggling open/busy — the queue itself must
+    // trigger the send, or the prompt would sit until some later interaction.
+    h.aiGlobalChat.mockResolvedValue(undefined);
+    const { container } = renderPanel(true);
+    await waitFor(() => expect(h.getArticle).toHaveBeenCalledWith(7));
+
+    const queuedContexts: AiContextRef[] = [
+      { kind: "view", query: { kind: "all" }, label: "All articles" },
+    ];
+    await act(async () => {
+      useUi.setState({
+        aiPendingPrompt: {
+          text: "Summarize this timeline",
+          contexts: queuedContexts,
+        },
+      });
+    });
+    await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalledTimes(1));
+    const [, , contexts, history, question] = h.aiGlobalChat.mock.calls[0];
+    expect(question).toBe("Summarize this timeline");
+    expect(history).toEqual([]);
+    // The queued item's contexts are sent verbatim — not the auto context of
+    // the render that happened to fire the send (an article is open here).
+    expect(contexts).toEqual(queuedContexts);
+    // Consuming is one-shot: the queue is empty afterwards.
+    expect(useUi.getState().aiPendingPrompt).toBeNull();
+    expect(container.textContent).toContain("Summarize this timeline");
+  });
+
+  it("sends a queued prompt with the context captured at queue time", async () => {
+    // The reader's empty-state action queues a timeline summary while a reply
+    // is still streaming; the user then switches to another feed. When the
+    // panel goes idle and the queued prompt finally sends, it must summarize
+    // the timeline it was queued on — the snapshot — not the switched-to feed.
+    let releaseFirst!: () => void;
+    const firstRun = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    // The hanging first exchange; every later call (the queued send) resolves.
+    h.aiGlobalChat.mockImplementationOnce(() => firstRun);
+    h.aiGlobalChat.mockResolvedValue(undefined);
+    useUi.setState({ selectedArticleId: null }); // no article → timeline context
+    const { container } = renderPanel(true);
+    await waitFor(() =>
+      expect(container.querySelector("textarea")).not.toBeNull(),
+    );
+
+    // The first exchange occupies the panel; the timeline summary is queued
+    // mid-run, while the "all" view is still active.
+    await ask("first question", container);
+    await act(async () => {
+      useUi.getState().askAiSummarizeTimeline();
+    });
+    // The user switches timeline while the first reply is streaming.
+    await act(async () => {
+      useUi.setState({
+        query: { kind: "feed", value: 3 },
+        queryLabel: "Other feed",
+      });
+    });
+    // First reply ends → the panel goes idle → the queued prompt sends.
+    await act(async () => {
+      releaseFirst();
+    });
+    await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalledTimes(2));
+    const [, , contexts, , question] = h.aiGlobalChat.mock.calls[1];
+    expect(question).toBe(i18n.t("ai.summarizeTimelinePrompt"));
+    // Queue-time snapshot: the "all" view, NOT the feed switched to after.
+    expect(contexts).toEqual([
+      {
+        kind: "view",
+        query: { kind: "all" },
+        label: i18n.t("smart.all"),
+      },
+    ]);
+    expect(useUi.getState().aiPendingPrompt).toBeNull();
+  });
+
+  it("keeps the composer draft on a queued auto-send; editor submit still clears it", async () => {
+    // Editor submission sends the draft itself, so it must clear the composer.
+    h.aiGlobalChat.mockResolvedValue(undefined);
+    const { container } = renderPanel(true);
+    await waitFor(() => expect(h.getArticle).toHaveBeenCalledWith(7));
+    const box = container.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "first typed question" } });
+    fireEvent.keyDown(box, { key: "Enter", shiftKey: false });
+    await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(box.value).toBe(""));
+
+    // A queued auto-send carries its own text, not the composer's — while a
+    // reply streams (or right after one ends) the user may already be typing
+    // the next question, and draining the queue must not wipe that draft.
+    fireEvent.change(box, { target: { value: "next question I am typing" } });
+    const queuedContexts: AiContextRef[] = [
+      { kind: "view", query: { kind: "all" }, label: "All articles" },
+    ];
+    await act(async () => {
+      useUi.setState({
+        aiPendingPrompt: {
+          text: "Summarize this timeline",
+          contexts: queuedContexts,
+        },
+      });
+    });
+    await waitFor(() => expect(h.aiGlobalChat).toHaveBeenCalledTimes(2));
+    expect(h.aiGlobalChat.mock.calls[1][4]).toBe("Summarize this timeline");
+    // The queued send left the user's half-typed question untouched.
+    expect(box.value).toBe("next question I am typing");
+    expect(useUi.getState().aiPendingPrompt).toBeNull();
   });
 });

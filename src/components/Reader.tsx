@@ -13,6 +13,7 @@ import { useAutoTranslateOnOpen } from "../hooks/useAutoTranslate";
 import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
+import { currentListKey, loadedListRows } from "../lib/currentList";
 import { isMac } from "../lib/platform";
 import { reportError, toast } from "../toast";
 import { tagColor } from "../lib/tagColors";
@@ -32,6 +33,12 @@ import Lightbox from "./Lightbox";
 interface Props {
   onToast: (msg: string) => void;
 }
+
+/** How many of the loaded window's rows the importance scorer rates per run —
+ *  the reply is one JSON object per row, so this bounds the completion's token
+ *  cost (the backend gives the call the 2048-token chat budget for it). Rows
+ *  beyond the scored slice keep their own relative order (applyIdOrder). */
+const IMPORTANCE_SCORE_LIMIT = 40;
 
 function youtubeId(url: string | null): string | null {
   if (!url) return null;
@@ -197,6 +204,15 @@ export default function Reader({ onToast }: Props) {
   const markReadOnScroll = useUi((s) => s.prefs.markReadOnScroll);
   const showReadingTime = useUi((s) => s.prefs.showReadingTime);
   const defaultOpenMode = useUi((s) => s.prefs.defaultOpenMode);
+  // List context + importance ordering — the empty-state quick actions below
+  // (Folo-style) act on the timeline the user just navigated to. The same
+  // fields drive the list's own rendering (ArticleList / readCurrentItems).
+  const query = useUi((s) => s.query);
+  const unreadOnly = useUi((s) => s.unreadOnly);
+  const sortOldest = useUi((s) => s.sortOldest);
+  const importanceOrder = useUi((s) => s.importanceOrder);
+  const setImportanceOrder = useUi((s) => s.setImportanceOrder);
+  const [importanceSorting, setImportanceSorting] = useState(false);
 
   const [scrolled, setScrolled] = useState(false);
   // Which body to show when an extraction exists follows the default open
@@ -951,6 +967,74 @@ export default function Reader({ onToast }: Props) {
     linkClick(e);
   };
 
+  // ── empty-state quick actions (Folo-style) ──
+  // Both act on the timeline currently selected in the sidebar; they only
+  // make sense with an explicit list context, which every query kind here is
+  // (all / unread / starred / readLater / feed / folder / tag).
+  const listKey = currentListKey(query, unreadOnly, sortOldest);
+  const importanceActive =
+    importanceOrder != null &&
+    importanceOrder.key === listKey &&
+    importanceOrder.ids.length > 0;
+
+  // Open the AI assistant and auto-send a timeline-summary prompt (queued via
+  // aiPendingPrompt; AIChatPanel sends it once open and idle, with the
+  // current view attached as its auto context).
+  const summarizeTimeline = () => {
+    useUi.getState().askAiSummarizeTimeline();
+  };
+
+  // Score the top of the loaded window for importance, then reorder the
+  // displayed window score-descending (client-side, via the store — ArticleList
+  // and J/K navigation both follow). Clicking the same entry again restores
+  // the default order. Scores are session-only; nothing is persisted.
+  const toggleImportanceSort = async () => {
+    if (importanceSorting) return;
+    if (importanceActive) {
+      setImportanceOrder(null);
+      return;
+    }
+    setImportanceSorting(true);
+    try {
+      // Rate the rows the user has actually loaded — the same cache slice
+      // ArticleList renders. The window's start is wherever the paging anchor
+      // sits (an article opened from search anchors the list at its page), so
+      // a fixed "first 40 of the timeline" could rate rows with no overlap
+      // with what's on screen. Rows beyond the scored slice stay in their own
+      // relative order via applyIdOrder.
+      const rows = loadedListRows(qc).slice(0, IMPORTANCE_SCORE_LIMIT);
+      if (rows.length === 0) {
+        toast.show(t("reader.emptyNoArticles"));
+        return;
+      }
+      const st = useUi.getState();
+      const ratings = await api.aiRateArticles(
+        rows.map((r) => ({
+          id: r.id,
+          title: r.title ?? "",
+          feedTitle: r.feedTitle ?? "",
+          snippet: r.snippet ?? "",
+        })),
+      );
+      const scoreById = new Map(ratings.map((r) => [r.id, r.score]));
+      // Scored articles by score desc (ties keep the feed's own order), then
+      // anything the model skipped, in the original order — applyIdOrder
+      // re-applies this shape against whatever pages are loaded.
+      const ranked = rows
+        .map((r, i) => ({ id: r.id, i, score: scoreById.get(r.id) ?? -1 }))
+        .sort((x, y) => y.score - x.score || x.i - y.i)
+        .map((e) => e.id);
+      setImportanceOrder({
+        key: currentListKey(st.query, st.unreadOnly, st.sortOldest),
+        ids: ranked,
+      });
+    } catch (e) {
+      reportError(e);
+    } finally {
+      setImportanceSorting(false);
+    }
+  };
+
   if (id == null) {
     const kbd = {
       fontFamily: "var(--mono)",
@@ -966,7 +1050,40 @@ export default function Reader({ onToast }: Props) {
           <div className="glyph">
             <Icon name="rss" size={22} />
           </div>
-          <div>{t("reader.emptySelectArticle")}</div>
+          <div className="empty-title">{t("reader.emptyStartTitle")}</div>
+          <div
+            className="empty-actions"
+            role="group"
+            aria-label={t("reader.emptyActionsLabel")}
+          >
+            <button
+              type="button"
+              className="empty-action"
+              onClick={summarizeTimeline}
+            >
+              <Icon name="sparkle" size={14} />
+              <span>{t("reader.emptySummarizeTimeline")}</span>
+            </button>
+            <button
+              type="button"
+              className={`empty-action${importanceActive ? " on" : ""}`}
+              onClick={() => void toggleImportanceSort()}
+              disabled={importanceSorting}
+            >
+              <Icon
+                name={importanceSorting ? "refresh" : importanceActive ? "check-all" : "sort"}
+                size={14}
+                className={importanceSorting ? "spinning" : undefined}
+              />
+              <span>
+                {importanceSorting
+                  ? t("common.loading")
+                  : importanceActive
+                    ? t("reader.emptyRestoreOrder")
+                    : t("reader.emptySortByImportance")}
+              </span>
+            </button>
+          </div>
           <div style={{ fontSize: 11.5, color: "var(--muted-2)" }}>
             {t("reader.emptyHintPrefix")} <kbd style={kbd}>J</kbd> /{" "}
             <kbd style={kbd}>K</kbd> {t("reader.emptyHintSuffix")}
