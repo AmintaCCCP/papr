@@ -752,6 +752,12 @@
   }
 
   function closeReader() {
+    // Invalidate any article request still in flight: it was fired before the
+    // close (e.g. "next" then immediately back), and letting it pass the seq
+    // check in openArticle would yank the user from the list back into the
+    // reader. Navigation inside an open reader is unaffected — every
+    // openArticle call bumps openSeq itself.
+    openSeq += 1;
     $("reader-view").classList.remove("active");
     state.currentArticle = null;
   }

@@ -6,9 +6,16 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../api";
 import { useUi } from "../store";
 import { useArticleActions } from "../hooks/articleActions";
+import { useViewportAnchor } from "../hooks/useViewportAnchor";
 import { listTranslationKey, useListTranslation } from "../listTranslation";
 import { resolveRowTranslation } from "../lib/rowTranslation";
-import { applyIdOrder, currentListKey } from "../lib/currentList";
+import {
+  applyIdOrder,
+  countNewRows,
+  currentListKey,
+  dedupeById,
+  scrollCompensation,
+} from "../lib/currentList";
 import { relTime } from "../lib/feedMeta";
 import { isMac, modCombo } from "../lib/platform";
 import { reportError, toast } from "../toast";
@@ -104,7 +111,11 @@ export default function ArticleList({ onToast }: Props) {
   // `readCurrentItems` applies the same order, so J/K agrees with the view.
   const importanceOrder = useUi((s) => s.importanceOrder);
   const items: ArticleSummary[] = useMemo(() => {
-    const flat = browse.data?.pages.flat() ?? [];
+    // Offset paging can return a row the cache already holds when a
+    // background refresh is parked and a later page is read against the live
+    // database (see dedupeById) — the view must show each article once, and
+    // J/K follows the same deduped order via readCurrentItems.
+    const flat = dedupeById(browse.data?.pages.flat() ?? []);
     if (
       importanceOrder &&
       importanceOrder.key === currentListKey(query, unreadOnly, sortOldest)
@@ -154,6 +165,26 @@ export default function ArticleList({ onToast }: Props) {
   // Load the previous (newer) page as the top approaches — only ever non-empty
   // when the list is anchored mid-feed (an article opened from search), so a
   // normal newest-first browse never triggers it.
+  // Ids the list holds *before* the fetch (see the scroll compensation below).
+  const prevPageIdsRef = useRef<readonly number[] | null>(null);
+  // The row under the viewport's top edge: captured at trigger time and
+  // re-captured on every scroll while the fetch is in flight (the user keeps
+  // scrolling before the page lands, so the trigger-time row may be far above
+  // the viewport by then). After the page lands, the compensation is this
+  // anchor's index shift in the recomputed order — not the raw count of new
+  // rows, which over-scrolls once the importance ordering is active (new
+  // unscored rows sort behind already-scored ones, leaving a scored top row
+  // exactly where it was).
+  const {
+    anchorRef: prevAnchorRef,
+    captureAnchor: capturePrevAnchor,
+    beginTracking: beginPrevTracking,
+  } = useViewportAnchor({
+    scrollRef,
+    virtualizer: virt,
+    items,
+    tracking: browse.isFetchingPreviousPage,
+  });
   useEffect(() => {
     const first = virt.getVirtualItems()[0];
     if (
@@ -162,17 +193,35 @@ export default function ArticleList({ onToast }: Props) {
       browse.hasPreviousPage &&
       !browse.isFetchingPreviousPage
     ) {
+      // The page that comes back can overlap these rows (OFFSET paging under
+      // a parked refresh — see dedupeById); the overlap is exactly what the
+      // compensation must not count as newly prepended rows.
+      prevPageIdsRef.current = (browse.data?.pages.flat() ?? []).map((a) => a.id);
+      // The row actually at the viewport's top edge — `first` can sit up to
+      // `overscan` rows above it. Left unset when unresolvable; the
+      // compensation then falls back to the overlap-aware row count. While
+      // the fetch is out, useViewportAnchor keeps re-capturing on scroll, so
+      // the compensation below uses the last row the user looked at.
+      capturePrevAnchor();
+      // Start the re-capture tracking synchronously, in this same tick —
+      // before the request — rather than waiting for the
+      // `isFetchingPreviousPage` flip's effect, which React commits only
+      // after the repaint. A scroll dispatched in that window would otherwise
+      // go uncaptured, and if it was the user's last one before the page
+      // landed, the compensation would compute from the stale trigger-time
+      // anchor instead of the row they ended up on.
+      beginPrevTracking();
       browse.fetchPreviousPage();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [virt.range?.startIndex, browse.hasPreviousPage, browse.isFetchingPreviousPage]);
 
-  // Prepending a newer page shifts every loaded row down by a page, so the
-  // viewport would jump. Before paint, nudge the scroll position down by the
-  // newly prepended rows' height to keep the article under the user's eyes put.
-  // Estimate-based (exact for the uniform list rows; a hair off for cards).
-  // Guarded by the list signature so a *new* list (feed switch, filter, anchor
-  // jump) — which also moves `baseOffset` — isn't mistaken for a prepend.
+  // Prepending a newer page shifts loaded rows down, so the viewport would
+  // jump. Before paint, nudge the scroll position down by the height the
+  // content above the viewport grew. Estimate-based (exact for the uniform
+  // list rows; a hair off for cards). Guarded by the list signature so a
+  // *new* list (feed switch, filter, anchor jump) — which also moves
+  // `baseOffset` — isn't mistaken for a prepend.
   const prevBaseRef = useRef(baseOffset);
   const listSigRef = useRef("");
   useLayoutEffect(() => {
@@ -181,13 +230,49 @@ export default function ArticleList({ onToast }: Props) {
     prevBaseRef.current = baseOffset;
     if (sig !== listSigRef.current) {
       listSigRef.current = sig;
+      // A new list context invalidates whatever was captured for the old one —
+      // drop the anchor and the id snapshot so a later prepend in this list
+      // can't consume stale capture.
+      prevAnchorRef.current = null;
+      prevPageIdsRef.current = null;
       return; // new list context — not a prepend, don't touch the scroll
     }
     if (baseOffset < prev) {
       const el = scrollRef.current;
-      if (el) el.scrollTop += (prev - baseOffset) * rowEstimate;
+      if (el) {
+        // Compensate by where the viewport's top anchor row actually moved in
+        // the recomputed display order (same dedupe + importance ordering the
+        // render uses, so the delta is measured against what the user sees).
+        // The anchor is the last one captured before the page landed —
+        // re-captured on every scroll while the fetch was in flight (see
+        // useViewportAnchor) — so it is the row under the viewport now, not
+        // the row that was there when the fetch triggered. Under the default
+        // ordering every genuinely new row is prepended
+        // above the anchor and the shift is exactly their count; with the
+        // importance ordering active, new unscored rows sort behind already
+        // scored ones, so a scored anchor doesn't move at all — nudging by
+        // the row count would over-scroll and jump the view. The overlap-
+        // aware row count (see dedupeById) stays as the fallback for a
+        // missing anchor.
+        const known = prevPageIdsRef.current;
+        const fallback = known
+          ? countNewRows(known, browse.data?.pages[0] ?? [])
+          : prev - baseOffset;
+        const anchor = prevAnchorRef.current;
+        const added = scrollCompensation(
+          anchor ? anchor.index : null,
+          anchor ? anchor.id : null,
+          items,
+          fallback,
+        );
+        prevPageIdsRef.current = null;
+        prevAnchorRef.current = null;
+        el.scrollTop += added * rowEstimate;
+      }
     }
-  }, [baseOffset, query, unreadOnly, sortOldest, listAnchor, rowEstimate]);
+    // `items` is read for the anchor lookup; it changes whenever `browse.data`
+    // does, so a landing prepend always sees the freshly recomputed order.
+  }, [baseOffset, items, query, unreadOnly, sortOldest, listAnchor, rowEstimate]);
 
   // The article we're keeping in view. A one-shot scroll lands on *estimated*
   // row heights when the list hasn't measured yet — fatal for long rows (an

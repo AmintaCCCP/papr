@@ -438,7 +438,17 @@ body {
   flex: 1;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  padding: 18px calc(18px + var(--safe-right)) 28px calc(18px + var(--safe-left));
+  /* Horizontal padding reserves the floating prev/next buttons' footprint
+     (44px wide + 10px inset — see .reader-nav-btn): body text and links must
+     never sit under the opaque circles or land in their hit areas. The
+     buttons hug the viewport edges, so any column margin below 54px can be
+     overlapped (narrow phones put the column edge at the padding; centered
+     viewports between 680 and ~788px still leave less than 54px). Symmetric
+     padding costs the wide layout nothing: `.reader-article` is centered
+     (max-width 680px, margin auto), and equal left/right padding keeps the
+     centered column at exactly the same position — only viewports where the
+     column fills the padded box (< ~788px, incl. safe insets) narrow. */
+  padding: 18px calc(54px + var(--safe-right)) 28px calc(54px + var(--safe-left));
 }
 
 .reader-article {

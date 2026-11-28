@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../api";
 import type { ChatTurn } from "../api";
-import { PANEL_BOUNDS, useUi } from "../store";
+import { PANEL_BOUNDS, timelineContextRef, useUi } from "../store";
 import { renderMarkdown } from "../lib/markdown";
 import { reportError, toast } from "../toast";
 import type { AiContextRef, AiToolTrace } from "../types";
@@ -163,16 +163,7 @@ export default function AIChatPanel({
         title: currentArticle.data.title,
       };
     }
-    if (query.kind === "feed") {
-      return { kind: "feed", feedId: query.value, title: queryLabel };
-    }
-    if (query.kind === "folder") {
-      return { kind: "folder", folderId: query.value, name: queryLabel };
-    }
-    if (query.kind === "tag") {
-      return { kind: "tag", tagId: query.value, name: queryLabel };
-    }
-    return { kind: "view", query, label: queryLabel };
+    return timelineContextRef(query, queryLabel);
   }, [selectedArticleId, currentArticle.data, query, queryLabel]);
 
   const autoKey = autoContext ? JSON.stringify(autoContext) : null;
@@ -203,14 +194,19 @@ export default function AIChatPanel({
   // this timeline" action) is sent once, when the panel is open and idle.
   // The queue (aiPendingPrompt in the store) survives until then, so a click
   // that lands while a reply is still streaming fires as soon as it finishes.
-  // `aiPendingPrompt` must be a dependency: when the panel is ALREADY open and
-  // idle, neither open/busy/loadingSession changes when a prompt is queued, and
-  // without it the queued prompt would sit unsent until some later interaction.
-  // Consuming is one-shot, so re-runs on other renders only find an empty queue.
+  // The queued item carries the contexts captured when it was queued — the
+  // user may have switched timeline meanwhile — and those are what get sent,
+  // not this render's effectiveContexts. `aiPendingPrompt` must be a
+  // dependency: when the panel is ALREADY open and idle, neither open/busy/
+  // loadingSession changes when a prompt is queued, and without it the queued
+  // prompt would sit unsent until some later interaction. Consuming is
+  // one-shot, so re-runs on other renders only find an empty queue.
   useEffect(() => {
     if (!open || busy || loadingSession) return;
     const pending = useUi.getState().consumeAiPendingPrompt();
-    if (pending) sendQuestion(pending);
+    // Queued auto-send: never touch the composer draft — the user may have
+    // typed the next question while the reply was streaming.
+    if (pending) sendQuestion(pending.text, pending.contexts, { clearDraft: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, busy, loadingSession, aiPendingPrompt]);
 
@@ -364,11 +360,22 @@ export default function AIChatPanel({
       });
   };
 
-  const sendQuestion = (rawQuestion: string) => {
+  // `contextOverride` is for queued prompts: they carry the contexts captured
+  // when they were queued, which must win over this render's effectiveContexts
+  // (the user may have switched timeline between queueing and sending).
+  // `clearDraft: false` is for queued prompts too: their text comes from the
+  // queue, not the composer, so auto-sending one after a reply must not wipe
+  // a question the user is still typing in the editor — only sends of the
+  // draft itself clear it.
+  const sendQuestion = (
+    rawQuestion: string,
+    contextOverride?: AiContextRef[],
+    { clearDraft = true }: { clearDraft?: boolean } = {},
+  ) => {
     const question = rawQuestion.trim();
     if (!question || busy || loadingSession) return;
     sessionLoadRef.current += 1;
-    setDraft("");
+    if (clearDraft) setDraft("");
     setPickerOpen(false);
     stickToBottomRef.current = true;
 
@@ -381,7 +388,9 @@ export default function AIChatPanel({
         role: m.role,
         content: m.content,
       }));
-    const ctxSnapshot = [...effectiveContexts];
+    const ctxSnapshot = contextOverride
+      ? [...contextOverride]
+      : [...effectiveContexts];
     // Clear one-shot selection quote after sending so follow-up turns stay clean.
     if (pinnedContexts.some((c) => c.kind === "selection")) {
       const idx = pinnedContexts.findIndex((c) => c.kind === "selection");

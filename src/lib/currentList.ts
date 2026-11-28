@@ -37,9 +37,81 @@ export function applyIdOrder<T extends { id: number }>(
     .map((entry) => entry.item);
 }
 
-export function readCurrentItems(qc: QueryClient): ArticleSummary[] {
-  const { query, unreadOnly, sortOldest, listAnchor, importanceOrder } =
-    useUi.getState();
+/** Flatten the cached pages of the current list into rows, deduplicated by
+ *  article id — first occurrence wins, order preserved. With offset paging a
+ *  row can genuinely land on two pages: while a background refresh is parked
+ *  (pendingListRefresh) the already-loaded pages stay cached, but a page
+ *  fetched later is read straight from the live database (`LIMIT ? OFFSET ?`),
+ *  and rows inserted before that page's offset shift it back onto cached
+ *  territory, so the same article comes back on both pages. Duplicates would
+ *  render twice and make J/K cross the same article twice, so every consumer
+ *  that stitches pages (ArticleList's `items` memo, `readCurrentItems`) goes
+ *  through here; the raw `data.pages` cache stays untouched. The mirror
+ *  defect — rows skipped when the same shift pushes them before the offset —
+ *  is inherent to OFFSET paging and predates the deferred refresh. */
+export function dedupeById<T extends { id: number }>(items: T[]): T[] {
+  const seen = new Set<number>();
+  const out: T[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    out.push(item);
+  }
+  return out;
+}
+
+/** How many rows of a freshly fetched page are genuinely new to the list —
+ *  ids absent from the `knownIds` snapshot of the rows already loaded. Under
+ *  OFFSET paging the fetched page can overlap the cached pages (see
+ *  dedupeById), so the view gains fewer rows than the page holds; this count,
+ *  not the raw page length, is the prepend size the scroll compensation in
+ *  ArticleList must nudge by to keep the viewport put. */
+export function countNewRows(
+  knownIds: readonly number[],
+  page: readonly { id: number }[],
+): number {
+  const known = new Set(knownIds);
+  const fresh = new Set<number>();
+  for (const row of page) {
+    if (!known.has(row.id)) fresh.add(row.id);
+  }
+  return fresh.size;
+}
+
+/** Scroll compensation, in rows, for a freshly prepended page: the shift of
+ *  the row that was under the viewport's top edge. `anchorId` and
+ *  `anchorIndexBefore` are that row's id and its index in the display order
+ *  captured just before the fetch; `displayItems` is the recomputed display
+ *  order after the page landed (the same dedupe + importance ordering the
+ *  render uses). Under the default ordering every genuinely new row is
+ *  prepended above the anchor, so the shift equals their count; with the
+ *  importance ordering active the new unscored rows sort *behind* the
+ *  already-scored ones, so a scored anchor doesn't move at all and a raw
+ *  new-row count would over-scroll. When the anchor wasn't captured or no
+ *  longer exists in the new order, fall back to `fallbackNewRows` (the
+ *  overlap-aware `countNewRows` figure). */
+export function scrollCompensation(
+  anchorIndexBefore: number | null,
+  anchorId: number | null,
+  displayItems: readonly { id: number }[],
+  fallbackNewRows: number,
+): number {
+  if (anchorId == null || anchorIndexBefore == null || anchorIndexBefore < 0) {
+    return fallbackNewRows;
+  }
+  const after = displayItems.findIndex((row) => row.id === anchorId);
+  if (after < 0) return fallbackNewRows;
+  return after - anchorIndexBefore;
+}
+
+/** The rows ArticleList currently has loaded for the store's list context, in
+ *  the backend's own order (no importance reorder applied). Reads the same
+ *  cache slice ArticleList renders — same query key, same pages — so actions
+ *  on "the visible window" (the reader's importance scorer) rate rows that
+ *  actually intersect what the user sees, never a fixed first page the
+ *  paging anchor has moved away from. */
+export function loadedListRows(qc: QueryClient): ArticleSummary[] {
+  const { query, unreadOnly, sortOldest, listAnchor } = useUi.getState();
   const inf = qc.getQueryData([
     "articles",
     query,
@@ -47,7 +119,12 @@ export function readCurrentItems(qc: QueryClient): ArticleSummary[] {
     sortOldest,
     listAnchor,
   ]) as { pages: ArticleSummary[][] } | undefined;
-  const items = inf?.pages.flat() ?? [];
+  return dedupeById(inf?.pages.flat() ?? []);
+}
+
+export function readCurrentItems(qc: QueryClient): ArticleSummary[] {
+  const { query, unreadOnly, sortOldest, importanceOrder } = useUi.getState();
+  const items = loadedListRows(qc);
   // J/K must follow what the user sees: when the importance ordering is
   // active for this list, navigation walks the reordered window too.
   if (

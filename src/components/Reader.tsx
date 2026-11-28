@@ -13,7 +13,7 @@ import { useAutoTranslateOnOpen } from "../hooks/useAutoTranslate";
 import { isParserSourceType, PARSER_META, type ParserKey } from "../lib/parsers";
 import { imageDataUrl } from "../lib/imageBytes";
 import { fullDate } from "../lib/feedMeta";
-import { currentListKey } from "../lib/currentList";
+import { currentListKey, loadedListRows } from "../lib/currentList";
 import { isMac } from "../lib/platform";
 import { reportError, toast } from "../toast";
 import { tagColor } from "../lib/tagColors";
@@ -33,6 +33,12 @@ import Lightbox from "./Lightbox";
 interface Props {
   onToast: (msg: string) => void;
 }
+
+/** How many of the loaded window's rows the importance scorer rates per run —
+ *  the reply is one JSON object per row, so this bounds the completion's token
+ *  cost (the backend gives the call the 2048-token chat budget for it). Rows
+ *  beyond the scored slice keep their own relative order (applyIdOrder). */
+const IMPORTANCE_SCORE_LIMIT = 40;
 
 function youtubeId(url: string | null): string | null {
   if (!url) return null;
@@ -978,7 +984,7 @@ export default function Reader({ onToast }: Props) {
     useUi.getState().askAiSummarizeTimeline();
   };
 
-  // Score the top of the current timeline for importance, then reorder the
+  // Score the top of the loaded window for importance, then reorder the
   // displayed window score-descending (client-side, via the store — ArticleList
   // and J/K navigation both follow). Clicking the same entry again restores
   // the default order. Scores are session-only; nothing is persisted.
@@ -990,19 +996,18 @@ export default function Reader({ onToast }: Props) {
     }
     setImportanceSorting(true);
     try {
-      const st = useUi.getState();
-      const rows = await api.listArticles(
-        st.query,
-        st.unreadOnly,
-        null,
-        st.sortOldest,
-        40,
-        0,
-      );
+      // Rate the rows the user has actually loaded — the same cache slice
+      // ArticleList renders. The window's start is wherever the paging anchor
+      // sits (an article opened from search anchors the list at its page), so
+      // a fixed "first 40 of the timeline" could rate rows with no overlap
+      // with what's on screen. Rows beyond the scored slice stay in their own
+      // relative order via applyIdOrder.
+      const rows = loadedListRows(qc).slice(0, IMPORTANCE_SCORE_LIMIT);
       if (rows.length === 0) {
         toast.show(t("reader.emptyNoArticles"));
         return;
       }
+      const st = useUi.getState();
       const ratings = await api.aiRateArticles(
         rows.map((r) => ({
           id: r.id,
