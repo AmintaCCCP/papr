@@ -204,6 +204,15 @@ interface UiState {
    *  original-page webview that floats above the DOM (issue #74), so the
    *  reader suspends that view while a menu is up. */
   menuOpen: boolean;
+  /** A background refresh (Rust scheduler / mobile sync) landed while the user
+   *  was parked on the current article list. The visible list is deliberately
+   *  NOT refetched then — a mid-read refetch would drop rows out from under
+   *  them (a just-opened article vanishing from an "unread only" view) — so
+   *  App.tsx queues the event here instead. ArticleList drains the backlog the
+   *  moment the list context actually changes (feed / filter / sort / anchor),
+   *  i.e. once the user has left the list that was being protected. A plain
+   *  boolean: repeat events collapse into one backlog, nothing accumulates. */
+  pendingListRefresh: boolean;
 
   select: (query: ArticleQuery, label: string) => void;
   openArticle: (id: number | null) => void;
@@ -235,6 +244,8 @@ interface UiState {
   setReaderView: (v: "reader" | "web") => void;
   setModalOpen: (v: boolean) => void;
   setMenuOpen: (v: boolean) => void;
+  markListRefreshPending: () => void;
+  consumePendingListRefresh: () => boolean;
 }
 
 const PREF_KEYS: (keyof Prefs)[] = [
@@ -361,6 +372,7 @@ export const useUi = create<UiState>((set, get) => ({
   readerView: "reader",
   modalOpen: false,
   menuOpen: false,
+  pendingListRefresh: false,
 
   select: (query, label) => {
     // Remember the selection so the "open on startup: last view" preference
@@ -490,6 +502,12 @@ export const useUi = create<UiState>((set, get) => ({
   setReaderView: (readerView) => set({ readerView }),
   setModalOpen: (modalOpen) => set({ modalOpen }),
   setMenuOpen: (menuOpen) => set({ menuOpen }),
+  markListRefreshPending: () => set({ pendingListRefresh: true }),
+  consumePendingListRefresh: () => {
+    if (!get().pendingListRefresh) return false;
+    set({ pendingListRefresh: false });
+    return true;
+  },
 }));
 
 // Seed the backend's appearance copy on startup so an existing install — whose

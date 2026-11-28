@@ -284,6 +284,24 @@ export default function ArticleList({ onToast }: Props) {
     setLocate(null);
   }, [query, unreadOnly, sortOldest]);
 
+  // Drain a background-refresh backlog (see `pendingListRefresh` in the store
+  // and the listeners in App.tsx). While the user stays parked on one list the
+  // backlog is ignored — refetching mid-read would yank the rows they're
+  // looking at. The moment the list context changes (feed / folder / tag /
+  // filter / sort / anchor) — or the pane remounts — they have left the list
+  // that was being protected, so the queued invalidate fires and the fresh
+  // data is there for the new list. The signature ref (not state) guards
+  // against StrictMode's double effect run consuming it twice.
+  const listKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const sig = `${JSON.stringify(query)}|${unreadOnly}|${sortOldest}|${listAnchor}`;
+    if (listKeyRef.current === sig) return;
+    listKeyRef.current = sig;
+    if (useUi.getState().consumePendingListRefresh()) {
+      qc.invalidateQueries({ queryKey: ["articles"] });
+    }
+  }, [query, unreadOnly, sortOldest, listAnchor, qc]);
+
   useEffect(() => () => window.clearTimeout(hoverTimer.current), []);
 
   // Dismiss any hover preview (shown or still pending) when the list contents

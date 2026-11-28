@@ -257,16 +257,25 @@ export default function App() {
   const actions = useArticleActions(toastApi.error);
 
   // ── background refresh events from the Rust scheduler & mobile web client ──
+  // Feeds / counts refresh immediately (live sidebar numbers are harmless),
+  // but the visible article list is NOT refetched here: the user may be parked
+  // on it mid-read, and a refetch would drop rows out from under them — with
+  // "unread only" on, the article they just opened goes read and vanishes,
+  // losing their place. Those events queue behind `pendingListRefresh`
+  // instead; ArticleList drains the backlog when the list context changes
+  // (feed / folder / tag / filter / sort / anchor), i.e. once the user has
+  // left the list that was being protected. User-initiated refreshes (⌘R,
+  // mark-all-read) still refetch immediately — explicit intent.
   useEffect(() => {
     const un1 = listen("feeds-updated", () => {
       qc.invalidateQueries({ queryKey: ["feeds"] });
       qc.invalidateQueries({ queryKey: ["counts"] });
-      qc.invalidateQueries({ queryKey: ["articles"] });
+      useUi.getState().markListRefreshPending();
     });
     const un2 = listen("mobile-sync", () => {
       qc.invalidateQueries({ queryKey: ["feeds"] });
       qc.invalidateQueries({ queryKey: ["counts"] });
-      qc.invalidateQueries({ queryKey: ["articles"] });
+      useUi.getState().markListRefreshPending();
       qc.invalidateQueries({ queryKey: ["article"] });
       qc.invalidateQueries({ queryKey: ["cp-search"] });
     });
