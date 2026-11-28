@@ -438,17 +438,14 @@ body {
   flex: 1;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  /* Horizontal padding reserves the floating prev/next buttons' footprint
-     (44px wide + 10px inset — see .reader-nav-btn): body text and links must
-     never sit under the opaque circles or land in their hit areas. The
-     buttons hug the viewport edges, so any column margin below 54px can be
-     overlapped (narrow phones put the column edge at the padding; centered
-     viewports between 680 and ~788px still leave less than 54px). Symmetric
-     padding costs the wide layout nothing: `.reader-article` is centered
-     (max-width 680px, margin auto), and equal left/right padding keeps the
-     centered column at exactly the same position — only viewports where the
-     column fills the padded box (< ~788px, incl. safe insets) narrow. */
-  padding: 18px calc(54px + var(--safe-right)) 28px calc(54px + var(--safe-left));
+  /* Regular horizontal padding — the prev/next controls moved to a bottom
+     pill (see .reader-nav-pill), so no side reserve is needed any more. The
+     large bottom padding instead reserves room for that pill: it floats
+     12px above the action bar and stands 56px tall, covering the lowest
+     68px of the scroll viewport, so 88px keeps the article's last line
+     scrollable clear of it (safe-bottom rides along for headroom parity
+     with the bar and pill). */
+  padding: 18px calc(18px + var(--safe-right)) calc(88px + var(--safe-bottom)) calc(18px + var(--safe-left));
 }
 
 .reader-article {
@@ -589,29 +586,43 @@ body {
 }
 
 /* ── Reader prev / next floating shortcuts ──
-   Edge-anchored, vertically centered; 44px keeps the touch target at the
-   recommended minimum. Colours come from the theme vars, so dark mode
-   follows automatically; edges disable via the :disabled fade. */
-.reader-nav-btn {
+   A centered pill floating just above the bottom action bar: the pill is an
+   absolutely-positioned child of .reader-bottom-bar (position: relative
+   below), so `bottom: calc(100% + 12px)` clears the bar's height and its
+   safe-area inset automatically, whatever the bar ends up measuring. It is
+   out of the grid's flow (abs-positioned children create no tracks), and
+   `.reader-scroll`'s bottom padding keeps article text scrollable clear of
+   it. Each button keeps a 44px touch target; colours come from the theme
+   vars, so dark mode follows automatically; edges disable via the :disabled
+   fade. */
+.reader-nav-pill {
   position: absolute;
-  top: 50%;
+  bottom: calc(100% + 12px);
+  left: 50%;
+  transform: translateX(-50%);
   z-index: 5;
+  display: flex;
+  gap: 10px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+}
+
+.reader-nav-btn {
   width: 44px;
   height: 44px;
-  margin-top: -22px;
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border);
+  border: none;
   border-radius: 999px;
-  background: var(--bg-elevated);
+  background: transparent;
   color: var(--text-muted);
-  box-shadow: var(--shadow);
   cursor: pointer;
 }
-.reader-nav-btn.is-prev { left: calc(10px + var(--safe-left)); }
-.reader-nav-btn.is-next { right: calc(10px + var(--safe-right)); }
 .reader-nav-btn:active { transform: scale(0.92); }
 .reader-nav-btn:disabled {
   opacity: 0.3;
@@ -620,6 +631,8 @@ body {
 
 /* ── Reader Bottom Action Bar ── */
 .reader-bottom-bar {
+  /* Containing block for the floating nav pill above it (see .reader-nav-pill). */
+  position: relative;
   display: grid;
   grid-template-columns: repeat(6, 1fr);
   gap: 2px;
